@@ -204,3 +204,43 @@ def test_safe_workspace_path_rejects_escape(tmp_path):
 def test_safe_workspace_path_accepts_relative(tmp_path):
     assert _safe_workspace_path(tmp_path, "a.md") is not None
     assert _safe_workspace_path(tmp_path, "sub/b.py") is not None
+
+
+# ── B.3.3: task-scoped workspaces via ContextVar ───────────────────────────
+
+from alfred_coo.tools import (
+    get_current_task_id,
+    reset_current_task_id,
+    set_current_task_id,
+)
+
+
+def test_current_task_id_default_is_none():
+    assert get_current_task_id() is None
+
+
+def test_current_task_id_set_and_reset_roundtrip():
+    token = set_current_task_id("task-123")
+    try:
+        assert get_current_task_id() == "task-123"
+    finally:
+        reset_current_task_id(token)
+    assert get_current_task_id() is None
+
+
+@pytest.mark.asyncio
+async def test_current_task_id_isolated_per_task():
+    """Concurrent 'tasks' each see their own task_id via asyncio context isolation."""
+    async def task_body(tid: str) -> str:
+        token = set_current_task_id(tid)
+        try:
+            await asyncio.sleep(0.01)  # yield so the scheduler interleaves both
+            return get_current_task_id()
+        finally:
+            reset_current_task_id(token)
+
+    a, b = await asyncio.gather(task_body("A"), task_body("B"))
+    assert a == "A"
+    assert b == "B"
+    # And after both finished, the outer context is still clean.
+    assert get_current_task_id() is None

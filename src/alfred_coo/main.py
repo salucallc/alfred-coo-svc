@@ -18,7 +18,7 @@ from .persona import get_persona
 from .dispatch import Dispatcher
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
-from .tools import resolve_tools
+from .tools import resolve_tools, set_current_task_id, reset_current_task_id
 
 
 logger = logging.getLogger(__name__)
@@ -143,13 +143,17 @@ async def main() -> None:
 
                 try:
                     if tool_specs:
-                        result = await dispatcher.call_with_tools(
-                            model,
-                            system_prompt,
-                            task.get("description") or task.get("title", "") or "(no content)",
-                            tools=tool_specs,
-                            fallback_model=persona.fallback_model,
-                        )
+                        ctx_token = set_current_task_id(task["id"])
+                        try:
+                            result = await dispatcher.call_with_tools(
+                                model,
+                                system_prompt,
+                                task.get("description") or task.get("title", "") or "(no content)",
+                                tools=tool_specs,
+                                fallback_model=persona.fallback_model,
+                            )
+                        finally:
+                            reset_current_task_id(ctx_token)
                     else:
                         result = await dispatcher.call(
                             model,
