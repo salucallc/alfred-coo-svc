@@ -354,24 +354,40 @@ async def propose_pr(
     if rc != 0:
         return {"error": "git push failed", "stderr": err[:500]}
 
-    rc, out, err = await _run(
-        [
-            "gh", "pr", "create",
-            "--repo", f"{owner}/{repo}",
-            "--base", base_branch,
-            "--head", branch,
-            "--title", title,
-            "--body", body or "(no body)",
-        ],
-        cwd=workspace,
-        env=env,
+    # Open the PR via GitHub REST API (avoids gh CLI, which needs a writable
+    # $HOME for its config — the daemon runs with systemd ProtectHome=true).
+    pr_payload = json.dumps({
+        "title": title,
+        "body": body or "(no body)",
+        "head": branch,
+        "base": base_branch,
+    }).encode()
+    pr_req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        data=pr_payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="POST",
     )
-    if rc != 0:
-        return {"error": "gh pr create failed", "stderr": err[:500], "stdout": out[:500]}
+    try:
+        with urllib.request.urlopen(pr_req, timeout=30) as r:
+            pr_body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {
+            "error": f"github pulls http {e.code}",
+            "response": e.read().decode()[:500],
+        }
+    except Exception as e:
+        return {"error": f"github api transport: {type(e).__name__}: {e}"}
 
-    pr_url = out.strip().split("\n")[-1]
     return {
-        "pr_url": pr_url,
+        "pr_url": pr_body.get("html_url"),
+        "pr_number": pr_body.get("number"),
         "branch": branch,
         "files_written": written,
         "commit_message": msg.split("\n")[0],
