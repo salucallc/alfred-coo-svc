@@ -1,0 +1,28 @@
+[Unit]
+Description=Headless Alfred COO daemon (alfred-coo-svc)
+Documentation=https://github.com/salucallc/alfred-coo-svc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=alfredcoo
+Group=alfredcoo
+WorkingDirectory=/opt/alfred-coo
+EnvironmentFile=/etc/alfred-coo/.env
+ExecStart=/opt/alfred-coo/venv/bin/python -m alfred_coo
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alfred-coo
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/alfred-coo /var/lib/alfred-coo
+
+[Install]
+WantedBy=multi-user.target
