@@ -29,3 +29,7 @@ ENV/
 .coverage
 htmlcov/
 *.log
+.testvenv/
+__pycache__/
+*.egg-info/
+.pytest_cache/

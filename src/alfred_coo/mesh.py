@@ -53,10 +53,20 @@ class MeshClient:
         data = {"session_id": session_id, "node_id": node_id}
         return await self._make_request("PATCH", url, headers=headers, json=data)
 
-    async def complete(self, task_id: str, result: dict) -> dict:
+    async def complete(
+        self,
+        task_id: str,
+        session_id: str,
+        result: dict,
+        status: str = "completed",
+    ) -> dict:
         url = f"/v1/mesh/tasks/{task_id}/complete"
         headers = self._get_auth_header()
-        data = {"result": result}
+        data = {
+            "session_id": session_id,
+            "status": status,
+            "result": result,
+        }
         return await self._make_request("PATCH", url, headers=headers, json=data)
     
     async def heartbeat(self, session_id: str, node_id: str, harness: str, current_task: str = "", metadata: dict | None = None) -> dict:
