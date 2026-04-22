@@ -108,3 +108,99 @@ async def test_execute_tool_catches_argument_mismatch():
     assert "error" in body
     # Either TypeError from missing title OR the missing-key error after falling through
     assert "title" in body["error"].lower() or "LINEAR_API_KEY" in body["error"]
+
+
+# ── B.3.2: mesh_task_create + propose_pr ────────────────────────────────────
+
+from alfred_coo.tools import mesh_task_create, propose_pr, _safe_workspace_path
+
+
+@pytest.mark.asyncio
+async def test_mesh_task_create_missing_key_returns_error(monkeypatch):
+    monkeypatch.delenv("SOUL_API_KEY", raising=False)
+    result = await mesh_task_create(title="test")
+    assert "error" in result
+    assert "SOUL_API_KEY" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_mesh_task_create_new_tool_registered():
+    assert "mesh_task_create" in BUILTIN_TOOLS
+    assert "propose_pr" in BUILTIN_TOOLS
+    schema = openai_tool_schema(BUILTIN_TOOLS["propose_pr"])
+    required = schema["function"]["parameters"]["required"]
+    for key in ("owner", "repo", "branch", "title", "body", "files"):
+        assert key in required
+
+
+@pytest.mark.asyncio
+async def test_propose_pr_rejects_bad_owner(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await propose_pr(
+        owner="evil-org",
+        repo="hack",
+        branch="x",
+        title="x",
+        body="x",
+        files={"a.md": "hi"},
+    )
+    assert "error" in result
+    assert "allowlist" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_propose_pr_rejects_missing_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    result = await propose_pr(
+        owner="salucallc",
+        repo="x",
+        branch="b",
+        title="t",
+        body="b",
+        files={"a.md": "hi"},
+    )
+    assert "error" in result
+    assert "GITHUB_TOKEN" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_propose_pr_rejects_empty_files(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await propose_pr(
+        owner="salucallc",
+        repo="x",
+        branch="b",
+        title="t",
+        body="b",
+        files={},
+    )
+    assert "error" in result
+    assert "files" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_propose_pr_rejects_invalid_branch(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await propose_pr(
+        owner="salucallc",
+        repo="x",
+        branch="bad branch name with space",
+        title="t",
+        body="b",
+        files={"a.md": "hi"},
+    )
+    assert "error" in result
+    assert "branch" in result["error"]
+
+
+def test_safe_workspace_path_rejects_escape(tmp_path):
+    assert _safe_workspace_path(tmp_path, "../escape.md") is None
+    assert _safe_workspace_path(tmp_path, "/absolute.md") is None
+    assert _safe_workspace_path(tmp_path, "C:/drive.md") is None
+    assert _safe_workspace_path(tmp_path, "") is None
+    assert _safe_workspace_path(tmp_path, None) is None  # type: ignore[arg-type]
+
+
+def test_safe_workspace_path_accepts_relative(tmp_path):
+    assert _safe_workspace_path(tmp_path, "a.md") is not None
+    assert _safe_workspace_path(tmp_path, "sub/b.py") is not None

@@ -52,11 +52,11 @@ def test_all_pm_personas_have_topics():
 
 
 def test_alfred_coo_a_has_b3_tools():
-    """B.3.1: alfred-coo-a opts into tool-use with Linear + Slack."""
+    """B.3.1+B.3.2: alfred-coo-a opts into tool-use with all four tools."""
     p = get_persona("alfred-coo-a")
     assert p.tools, "alfred-coo-a should have tool-use enabled"
-    assert "linear_create_issue" in p.tools
-    assert "slack_post" in p.tools
+    for expected in ("linear_create_issue", "slack_post", "mesh_task_create", "propose_pr"):
+        assert expected in p.tools, f"alfred-coo-a missing tool: {expected}"
 
 
 def test_default_persona_has_no_tools():
