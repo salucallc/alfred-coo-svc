@@ -1,10 +1,14 @@
-"""
-Configuration module for Alfred Coo service settings.
+"""Configuration module for alfred-coo-svc.
+
+Loads from environment (/etc/alfred-coo/.env on Oracle, .env locally) via
+pydantic-settings. Lists are accepted as either JSON arrays or as
+comma-separated strings (friendlier for env files).
 """
 
 from functools import lru_cache
 from typing import List
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,7 +16,7 @@ class Settings(BaseSettings):
     soul_api_url: str = "http://100.105.27.63:8080"
     soul_api_urls: List[str] = [
         "http://100.105.27.63:8080",
-        "https://soul-svc-1006583428928.us-central1.run.app"
+        "https://soul-svc-1006583428928.us-central1.run.app",
     ]
     soul_api_key: str = ""
     soul_session_id: str = "alfred-coo"
@@ -33,13 +37,17 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
-        case_sensitive=False
+        case_sensitive=False,
     )
 
+    @field_validator("soul_api_urls", mode="before")
+    @classmethod
+    def _split_urls(cls, v):
+        if isinstance(v, str):
+            return [u.strip() for u in v.split(",") if u.strip()]
+        return v
 
-@lru_cache()
+
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-
-
-settings = get_settings()
