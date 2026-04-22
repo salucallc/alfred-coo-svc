@@ -18,6 +18,7 @@ from .persona import get_persona
 from .dispatch import Dispatcher
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
+from .tools import resolve_tools
 
 
 logger = logging.getLogger(__name__)
@@ -133,16 +134,29 @@ async def main() -> None:
                 )
 
                 model = dispatch.select_model(task, persona)
+                tool_specs = resolve_tools(persona.tools or [])
                 logger.info("dispatching",
-                            extra={"task_id": task.get("id"), "model": model})
+                            extra={"task_id": task.get("id"),
+                                   "model": model,
+                                   "tools_enabled": len(tool_specs) > 0,
+                                   "tool_count": len(tool_specs)})
 
                 try:
-                    result = await dispatcher.call(
-                        model,
-                        system_prompt,
-                        task.get("description") or task.get("title", "") or "(no content)",
-                        fallback_model=persona.fallback_model,
-                    )
+                    if tool_specs:
+                        result = await dispatcher.call_with_tools(
+                            model,
+                            system_prompt,
+                            task.get("description") or task.get("title", "") or "(no content)",
+                            tools=tool_specs,
+                            fallback_model=persona.fallback_model,
+                        )
+                    else:
+                        result = await dispatcher.call(
+                            model,
+                            system_prompt,
+                            task.get("description") or task.get("title", "") or "(no content)",
+                            fallback_model=persona.fallback_model,
+                        )
                 except Exception as e:
                     logger.exception("dispatch failed for task %s", task.get("id"))
                     # Best-effort mark the task as failed so it doesn't sit claimed forever.
@@ -189,6 +203,10 @@ async def main() -> None:
                     else:
                         # Unstructured fallback — persist full raw text so nothing is lost.
                         complete_result["content"] = raw_content
+                    # Tool-use metadata (present when persona.tools is non-empty and model invoked tools)
+                    if result.get("tool_calls"):
+                        complete_result["tool_calls"] = result.get("tool_calls")
+                        complete_result["tool_iterations"] = result.get("iterations")
                     await mesh.complete(
                         task["id"],
                         session_id=settings.soul_session_id,

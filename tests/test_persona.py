@@ -49,3 +49,17 @@ def test_all_pm_personas_have_topics():
         p = get_persona(name)
         assert p.name == name, f"{name} did not resolve"
         assert p.topics, f"{name} has empty topics list"
+
+
+def test_alfred_coo_a_has_b3_tools():
+    """B.3.1: alfred-coo-a opts into tool-use with Linear + Slack."""
+    p = get_persona("alfred-coo-a")
+    assert p.tools, "alfred-coo-a should have tool-use enabled"
+    assert "linear_create_issue" in p.tools
+    assert "slack_post" in p.tools
+
+
+def test_default_persona_has_no_tools():
+    """Safety: default persona must NOT auto-invoke tools."""
+    p = get_persona("default")
+    assert p.tools == []
