@@ -23,14 +23,21 @@ class Dispatcher:
         self.openrouter_key = openrouter_key
         self.timeout = timeout
 
-    async def call(self, model: str, system: str, prompt: str) -> dict:
+    async def call(
+        self,
+        model: str,
+        system: str,
+        prompt: str,
+        fallback_model: str | None = None,
+    ) -> dict:
         try:
-            result = await self._call_model(model, system, prompt)
-            return result
+            return await self._call_model(model, system, prompt)
         except Exception:
-            fallback_model = "deepseek-v3.2:cloud"
-            result = await self._call_model(fallback_model, system, prompt)
-            result["model_used"] = f"{model} -> {fallback_model}"
+            fb = fallback_model or "deepseek-v3.2:cloud"
+            if fb == model:
+                raise
+            result = await self._call_model(fb, system, prompt)
+            result["model_used"] = f"{model} -> {fb}"
             return result
 
     async def _call_model(self, model: str, system: str, prompt: str) -> dict:

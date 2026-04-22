@@ -106,9 +106,12 @@ async def main() -> None:
                                    "persona": persona.name,
                                    "title": title[:120]})
 
-                # Context load (non-fatal on error).
+                # Context load (non-fatal on error). Scoped by persona topics.
                 try:
-                    recent = await soul.recent_memories(limit=20)
+                    recent = await soul.recent_memories(
+                        limit=20,
+                        topics=persona.topics or None,
+                    )
                 except Exception as e:
                     logger.warning("recent_memories failed, continuing with empty context: %s", e)
                     recent = []
@@ -135,6 +138,7 @@ async def main() -> None:
                         model,
                         system_prompt,
                         task.get("description") or task.get("title", "") or "(no content)",
+                        fallback_model=persona.fallback_model,
                     )
                 except Exception as e:
                     logger.exception("dispatch failed for task %s", task.get("id"))
