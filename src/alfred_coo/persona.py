@@ -22,6 +22,9 @@ class Persona:
     fallback_model: Optional[str] = None
     topics: List[str] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    # Tool names from alfred_coo.tools.BUILTIN_TOOLS that this persona may invoke.
+    # Empty = B.2 structured-output path; non-empty = B.3 tool-use loop.
+    tools: List[str] = field(default_factory=list)
 
 
 BUILTIN_PERSONAS: Dict[str, Persona] = {
@@ -34,13 +37,17 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
     ),
 
     # COO / executive strategy. Maps [persona:alfred-coo-a].
+    # Tool-enabled: can open Linear tickets and post Slack status.
     "alfred-coo-a": Persona(
         name="alfred-coo-a",
         system_prompt=(
             "You are Alfred, COO of Saluca LLC. Dry, competent, concise. "
             "Drive decisions forward; flag blockers; cite file paths and memory "
             "ids when grounding claims. Output only what is needed for the task; "
-            "no preamble, no summary unless asked."
+            "no preamble, no summary unless asked. When you need to record "
+            "follow-up work, use the linear_create_issue tool rather than "
+            "writing it into the summary. For escalations or status that "
+            "Cristian should see live, use slack_post (defaults to batcave)."
         ),
         preferred_model="deepseek-v3.2:cloud",
         fallback_model="qwen3-coder:480b-cloud",
@@ -51,6 +58,7 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "mission-control",
             "autonomous-ops",
         ],
+        tools=["linear_create_issue", "slack_post"],
     ),
 
     # PQ / security / sovereign crypto review. Maps [persona:mr-terrific-a].
