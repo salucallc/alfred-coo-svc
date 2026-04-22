@@ -16,6 +16,8 @@ from .mesh import MeshClient, parse_persona_tag
 from .soul import SoulClient
 from .persona import get_persona
 from .dispatch import Dispatcher
+from .structured import OUTPUT_CONTRACT, parse_envelope
+from .artifacts import write_artifacts
 
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,7 @@ async def main() -> None:
                     persona.system_prompt
                     + "\n\nRECENT CONTEXT:\n"
                     + context_str
+                    + OUTPUT_CONTRACT
                 )
 
                 model = dispatch.select_model(task, persona)
@@ -156,28 +159,57 @@ async def main() -> None:
                         pass
                     continue
 
+                raw_content = result.get("content", "") or ""
+                envelope = parse_envelope(raw_content)
+                artifact_paths: list[str] = []
+                if envelope is not None:
+                    try:
+                        artifact_paths = write_artifacts(
+                            task_id=task["id"],
+                            artifacts=envelope.artifacts,
+                        )
+                    except Exception:
+                        logger.exception("artifact write pass failed for task %s",
+                                         task.get("id"))
+
                 try:
+                    complete_result: dict = {
+                        "model": result.get("model_used"),
+                        "tokens": {
+                            "in": result.get("tokens_in"),
+                            "out": result.get("tokens_out"),
+                        },
+                        "structured": envelope is not None,
+                    }
+                    if envelope is not None:
+                        complete_result["summary"] = envelope.summary
+                        complete_result["artifact_paths"] = artifact_paths
+                        if envelope.follow_up_tasks:
+                            complete_result["follow_up_tasks"] = envelope.follow_up_tasks
+                    else:
+                        # Unstructured fallback — persist full raw text so nothing is lost.
+                        complete_result["content"] = raw_content
                     await mesh.complete(
                         task["id"],
                         session_id=settings.soul_session_id,
-                        result={
-                            "content": result.get("content", ""),
-                            "model": result.get("model_used"),
-                            "tokens": {
-                                "in": result.get("tokens_in"),
-                                "out": result.get("tokens_out"),
-                            },
-                        },
+                        result=complete_result,
                     )
                 except Exception:
                     logger.exception("complete failed for task %s", task.get("id"))
                     continue
 
+                # Soul memory summary entry.
+                mem_summary = (
+                    envelope.summary if envelope is not None
+                    else raw_content[:500]
+                )
+                mem_topics = ["coo-daemon", "task-complete"] + list(persona.topics or [])
                 try:
                     await soul.write_memory(
-                        f"COO daemon completed task {task['id']}: "
-                        f"{(result.get('content', '') or '')[:500]}",
-                        topics=["coo-daemon", "task-complete"],
+                        f"COO daemon completed task {task['id']} ({persona.name}): "
+                        f"{mem_summary}"
+                        + (f" | artifacts: {', '.join(artifact_paths)}" if artifact_paths else ""),
+                        topics=mem_topics,
                     )
                 except Exception as e:
                     logger.warning("soul write_memory failed (non-fatal): %s", e)
