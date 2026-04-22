@@ -58,7 +58,7 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "mission-control",
             "autonomous-ops",
         ],
-        tools=["linear_create_issue", "slack_post", "mesh_task_create", "propose_pr"],
+        tools=["linear_create_issue", "slack_post", "mesh_task_create", "propose_pr", "http_get"],
     ),
 
     # PQ / security / sovereign crypto review. Maps [persona:mr-terrific-a].

@@ -416,6 +416,127 @@ async def propose_pr(
     }
 
 
+# ── http_get ────────────────────────────────────────────────────────────────
+
+# Maximum body bytes we'll read into a tool result. Larger responses are
+# truncated with a marker — the model gets the head + a note. Keeps tool
+# results from blowing up the context window.
+HTTP_GET_MAX_BYTES = 256 * 1024  # 256 KB
+HTTP_GET_TIMEOUT_SEC = 15.0
+
+# Content types we hand back as text. Anything else is rejected — we don't
+# want the model to see base64 binaries or binary blobs.
+_ALLOWED_CONTENT_TYPE_PREFIXES = (
+    "text/",
+    "application/json",
+    "application/xml",
+    "application/yaml",
+    "application/x-yaml",
+)
+
+
+def _is_allowed_http_url(url: str) -> tuple[bool, str]:
+    """Strict allowlist for http_get. Returns (ok, reason-if-not)."""
+    if not url or not isinstance(url, str):
+        return False, "url must be a non-empty string"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False, "only http:// and https:// schemes are allowed"
+    # Parse host + path without the stdlib dep (keeps this pure).
+    scheme_sep = url.index("://") + 3
+    path_sep = url.find("/", scheme_sep)
+    host_port = url[scheme_sep:path_sep] if path_sep != -1 else url[scheme_sep:]
+    path = url[path_sep:] if path_sep != -1 else "/"
+    # Strip user@ and :port; normalise lowercase host.
+    if "@" in host_port:
+        host_port = host_port.split("@", 1)[1]
+    host = host_port.split(":", 1)[0].lower()
+    if not host:
+        return False, "empty host"
+
+    # GitHub sources — restrict to Saluca-owned paths.
+    if host == "github.com":
+        for prefix in ("/salucallc/", "/saluca-labs/", "/cristianxruvalcaba-coder/"):
+            if path.startswith(prefix):
+                return True, ""
+        return False, f"github.com path not in Saluca allowlist: {path[:60]}"
+    if host == "raw.githubusercontent.com":
+        for prefix in ("/salucallc/", "/saluca-labs/", "/cristianxruvalcaba-coder/"):
+            if path.startswith(prefix):
+                return True, ""
+        return False, f"raw.githubusercontent.com path not in Saluca allowlist: {path[:60]}"
+    if host == "api.github.com":
+        return True, ""  # token-gated by GitHub itself; we pass no auth, so read-only public
+
+    # Saluca-owned domains — any subdomain.
+    for suffix in (".saluca.com", ".tiresias.network", ".asphodel.ai"):
+        if host == suffix[1:] or host.endswith(suffix):
+            return True, ""
+
+    # Research + docs — narrow list, expand later if needed.
+    if host in {
+        "arxiv.org",
+        "www.arxiv.org",
+        "docs.anthropic.com",
+        "docs.python.org",
+        "docs.github.com",
+    }:
+        return True, ""
+
+    return False, f"host {host!r} not in allowlist"
+
+
+async def http_get(url: str) -> Dict[str, Any]:
+    """Read-only GET against an allowlisted URL.
+
+    Returns {status, headers, body, truncated, bytes_read}. The body is clamped
+    to HTTP_GET_MAX_BYTES; larger responses arrive truncated with an explicit
+    marker. Only text-ish content types are accepted. No auth header is sent
+    (the GitHub REST API endpoints reachable here are the public ones).
+    """
+    ok, reason = _is_allowed_http_url(url)
+    if not ok:
+        return {"error": f"url rejected: {reason}"}
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "saluca-alfred/1.0 (http_get tool)",
+            "Accept": "text/*, application/json;q=0.9, */*;q=0.1",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_GET_TIMEOUT_SEC) as resp:
+            status = resp.status
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            # Guard against binary blobs — even inside the allowlist some endpoints serve PDFs.
+            if not any(ctype.startswith(p) for p in _ALLOWED_CONTENT_TYPE_PREFIXES):
+                return {
+                    "error": f"content-type not allowed: {ctype or '(missing)'}",
+                    "status": status,
+                }
+            body_bytes = resp.read(HTTP_GET_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        return {"error": f"http {e.code}", "response": e.read().decode(errors="replace")[:500]}
+    except Exception as e:
+        return {"error": f"transport: {type(e).__name__}: {e}"}
+
+    truncated = len(body_bytes) > HTTP_GET_MAX_BYTES
+    if truncated:
+        body_bytes = body_bytes[:HTTP_GET_MAX_BYTES]
+    body = body_bytes.decode("utf-8", errors="replace")
+    if truncated:
+        body += "\n\n[... response truncated at {} bytes ...]".format(HTTP_GET_MAX_BYTES)
+
+    return {
+        "status": status,
+        "content_type": ctype,
+        "body": body,
+        "truncated": truncated,
+        "bytes_read": len(body_bytes),
+    }
+
+
 # ── Registry ────────────────────────────────────────────────────────────────
 
 BUILTIN_TOOLS: Dict[str, ToolSpec] = {
@@ -498,6 +619,30 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=mesh_task_create,
+    ),
+    "http_get": ToolSpec(
+        name="http_get",
+        description=(
+            "GET an allowlisted URL. Read-only; no POST/PUT/DELETE. Useful for "
+            "pulling file content from Saluca GitHub repos (github.com/salucallc, "
+            "saluca-labs, cristianxruvalcaba-coder/...), raw.githubusercontent.com "
+            "files, Saluca domains (*.saluca.com, *.tiresias.network, *.asphodel.ai), "
+            "arxiv papers, and canonical docs (anthropic, python, github). "
+            "Response body is capped at 256 KB and truncated with a marker if "
+            "larger; only text/json/xml/yaml content types are returned."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Absolute http(s) URL. Must be in the allowlist.",
+                },
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        handler=http_get,
     ),
     "propose_pr": ToolSpec(
         name="propose_pr",
