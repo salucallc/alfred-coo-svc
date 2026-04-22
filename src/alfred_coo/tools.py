@@ -20,6 +20,7 @@ the dispatch loop.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -30,6 +31,27 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional
+
+
+# Current-task context for tool handlers. main.py sets this around
+# call_with_tools so handlers that need task scoping (e.g. propose_pr
+# workspaces) pick up the real task id without the model having to pass it.
+_current_task_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "alfred_coo_current_task_id", default=None
+)
+
+
+def get_current_task_id() -> Optional[str]:
+    return _current_task_id.get()
+
+
+def set_current_task_id(task_id: Optional[str]):
+    """Returns a token for resetting via _current_task_id.reset(token)."""
+    return _current_task_id.set(task_id)
+
+
+def reset_current_task_id(token) -> None:
+    _current_task_id.reset(token)
 
 
 logger = logging.getLogger("alfred_coo.tools")
@@ -304,7 +326,7 @@ async def propose_pr(
     if not isinstance(files, dict) or not files:
         return {"error": "files must be a non-empty dict of relpath -> content"}
 
-    workspace_id = task_id or f"ad-hoc-{os.getpid()}"
+    workspace_id = task_id or get_current_task_id() or f"ad-hoc-{os.getpid()}"
     workspace = WORKSPACE_ROOT / workspace_id / repo
     # Fresh clone for determinism. If re-running the same task, wipe prior state.
     if workspace.exists():
