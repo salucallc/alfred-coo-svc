@@ -39,21 +39,25 @@ class MeshClient:
         raise last_exception
     
     async def list_pending(self, limit: int = 50) -> list[dict]:
+        # soul-svc returns {"tasks": [...], "count": N}; unwrap here.
         url = f"/v1/mesh/tasks?status=pending&limit={limit}"
         headers = self._get_auth_header()
-        return await self._make_request("GET", url, headers=headers)
-    
+        resp = await self._make_request("GET", url, headers=headers)
+        if isinstance(resp, dict):
+            return resp.get("tasks", [])
+        return resp
+
     async def claim(self, task_id: str, session_id: str, node_id: str) -> dict:
         url = f"/v1/mesh/tasks/{task_id}/claim"
         headers = self._get_auth_header()
         data = {"session_id": session_id, "node_id": node_id}
-        return await self._make_request("POST", url, headers=headers, json=data)
-    
+        return await self._make_request("PATCH", url, headers=headers, json=data)
+
     async def complete(self, task_id: str, result: dict) -> dict:
         url = f"/v1/mesh/tasks/{task_id}/complete"
         headers = self._get_auth_header()
         data = {"result": result}
-        return await self._make_request("POST", url, headers=headers, json=data)
+        return await self._make_request("PATCH", url, headers=headers, json=data)
     
     async def heartbeat(self, session_id: str, node_id: str, harness: str, current_task: str = "", metadata: dict | None = None) -> dict:
         url = "/v1/mesh/heartbeat"

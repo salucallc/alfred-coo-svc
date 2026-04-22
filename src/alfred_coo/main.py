@@ -1,101 +1,191 @@
-"""
-Main async loop for the Alfred COO daemon v0.
-Handles polling mesh for tasks, claiming relevant ones, processing them via persona+dispatcher,
-and maintaining health status.
+"""Main async loop for alfred-coo-svc v0.
+
+Polls soul-svc mesh_tasks, claims tasks with [persona:xxx] or [unified-plan-wave-1]
+markers, loads recent soul memory as context, dispatches to the selected cloud
+model, writes result + memory back, heartbeats, sleeps, repeats. Surviving error
+handler on the loop body so one bad task never kills the daemon.
 """
 
 import asyncio
 import logging
 
-from . import config, log
-from .mesh import MeshClient
+import uvicorn
+
+from . import config, log, dispatch, health
+from .mesh import MeshClient, parse_persona_tag
 from .soul import SoulClient
 from .persona import get_persona
 from .dispatch import Dispatcher
-from .health import HealthApp
-
-import uvicorn
-from fastapi import FastAPI
 
 
 logger = logging.getLogger(__name__)
 
 
+async def _run_health_server(app, port: int) -> None:
+    cfg = uvicorn.Config(app, host="0.0.0.0", port=port,
+                         log_level="warning", access_log=False)
+    server = uvicorn.Server(cfg)
+    await server.serve()
+
+
+def _fallback_urls(settings) -> list[str] | None:
+    urls = list(settings.soul_api_urls or [])
+    primary = settings.soul_api_url.rstrip("/")
+    extras = [u.rstrip("/") for u in urls if u.rstrip("/") != primary]
+    return extras or None
+
+
 async def main() -> None:
     settings = config.get_settings()
     log.setup_logging(settings.log_level, settings.log_format)
+    logger.info("alfred-coo v0 starting",
+                extra={"session_id": settings.soul_session_id,
+                       "node_id": settings.soul_node_id})
 
-    logger.info("Starting Alfred COO daemon")
+    fallback = _fallback_urls(settings)
 
-    mesh = MeshClient(base_url=settings.mesh_url, node_id=settings.node_id, session_id=settings.session_id)
-    soul = SoulClient(base_url=settings.soul_url)
-    dispatcher = Dispatcher()
+    mesh = MeshClient(
+        base_url=settings.soul_api_url,
+        api_key=settings.soul_api_key,
+        fallback_urls=fallback,
+    )
+    soul = SoulClient(
+        base_url=settings.soul_api_url,
+        api_key=settings.soul_api_key,
+        session_id=settings.soul_session_id,
+        fallback_urls=fallback,
+    )
+    dispatcher = Dispatcher(
+        ollama_url=settings.ollama_url,
+        anthropic_key=settings.anthropic_api_key,
+        openrouter_key=settings.openrouter_api_key,
+    )
 
-    # Start health app
-    health_app = HealthApp()
-    config_uvicorn = uvicorn.Config(health_app.app, host="0.0.0.0", port=settings.health_port, log_level="error")
-    server = uvicorn.Server(config_uvicorn)
-    asyncio.create_task(server.serve())
+    # Health endpoint in a background task.
+    app = health.make_app()
+    asyncio.create_task(_run_health_server(app, settings.health_port))
+    health.mark_alive()
 
-    await mesh.heartbeat()
+    # Initial heartbeat (non-fatal if it fails).
+    try:
+        await mesh.heartbeat(
+            session_id=settings.soul_session_id,
+            node_id=settings.soul_node_id,
+            harness=settings.soul_harness,
+            current_task="v0 daemon boot",
+        )
+        logger.info("initial heartbeat ok")
+    except Exception as e:
+        logger.warning("initial heartbeat failed (continuing): %s", e)
 
     while True:
         try:
-            pending_tasks = await mesh.list_pending(limit=10)
+            pending = await mesh.list_pending(limit=10)
             claimed = []
-
-            for task in pending_tasks:
-                title = task.get("title", "")
-                claimable = False
-                parsed_persona_name = None
-
-                if title.startswith("[unified-plan-wave-1]"):
-                    claimable = True
-                    parsed_persona_name = "default"
-                else:
-                    parsed_persona_name = mesh.parse_persona_tag(title)
-                    if parsed_persona_name:
-                        claimable = True
-
-                if not claimable:
+            for task in pending:
+                title = task.get("title", "") or ""
+                persona_name = parse_persona_tag(title)
+                is_unified = "[unified-plan-wave-1]" in title
+                if not (persona_name or is_unified):
                     continue
 
-                success = await mesh.claim(task["id"], settings.session_id, settings.node_id)
-                if success:
-                    logger.info(f"Claimed task {task['id']} with persona '{parsed_persona_name}'")
-                    claimed.append(task)
+                # Try to claim. Claim returns the updated task record, or raises.
+                try:
+                    await mesh.claim(
+                        task["id"], settings.soul_session_id, settings.soul_node_id
+                    )
+                except Exception as e:
+                    logger.debug("claim skipped for %s (likely already claimed): %s",
+                                 task.get("id"), e)
+                    continue
 
-                    persona = get_persona(parsed_persona_name)
+                claimed.append(task["id"])
+                persona = get_persona(persona_name or "default")
+                logger.info("claimed task",
+                            extra={"task_id": task.get("id"),
+                                   "persona": persona.name,
+                                   "title": title[:120]})
+
+                # Context load (non-fatal on error).
+                try:
                     recent = await soul.recent_memories(limit=20)
-                    context_str = "\n".join(m.get("content", "")[:500] for m in recent[:10])
-                    system_prompt = persona.system_prompt + "\n\nRECENT CONTEXT:\n" + context_str
+                except Exception as e:
+                    logger.warning("recent_memories failed, continuing with empty context: %s", e)
+                    recent = []
 
-                    model = dispatcher.select_model(task, persona)
-                    logger.debug(f"Dispatching to model {model}")
+                if isinstance(recent, dict):
+                    recent = recent.get("memories", [])
+                context_str = "\n".join(
+                    (m.get("content", "") or "")[:500]
+                    for m in (recent or [])[:10]
+                    if isinstance(m, dict)
+                )
+                system_prompt = (
+                    persona.system_prompt
+                    + "\n\nRECENT CONTEXT:\n"
+                    + context_str
+                )
 
-                    result = await dispatcher.call(model, system_prompt, task["description"] or task["title"])
+                model = dispatch.select_model(task, persona)
+                logger.info("dispatching",
+                            extra={"task_id": task.get("id"), "model": model})
 
-                    await mesh.complete(
-                        task["id"],
-                        {
-                            "content": result["content"],
-                            "model": result["model_used"],
-                            "tokens": {"in": result["tokens_in"], "out": result["tokens_out"]},
+                try:
+                    result = await dispatcher.call(
+                        model,
+                        system_prompt,
+                        task.get("description") or task.get("title", "") or "(no content)",
+                    )
+                except Exception as e:
+                    logger.exception("dispatch failed for task %s", task.get("id"))
+                    # Best-effort mark the task complete with the error so it doesn't sit claimed forever.
+                    try:
+                        await mesh.complete(task["id"], {
+                            "error": f"dispatch failure: {type(e).__name__}: {str(e)[:500]}"
+                        })
+                    except Exception:
+                        pass
+                    continue
+
+                try:
+                    await mesh.complete(task["id"], {
+                        "content": result.get("content", ""),
+                        "model": result.get("model_used"),
+                        "tokens": {
+                            "in": result.get("tokens_in"),
+                            "out": result.get("tokens_out"),
                         },
-                    )
+                    })
+                except Exception:
+                    logger.exception("complete failed for task %s", task.get("id"))
+                    continue
 
+                try:
                     await soul.write_memory(
-                        f"COO daemon completed task {task['id']}: {result['content'][:500]}",
-                        topics=["coo-daemon", "task-complete"]
+                        f"COO daemon completed task {task['id']}: "
+                        f"{(result.get('content', '') or '')[:500]}",
+                        topics=["coo-daemon", "task-complete"],
                     )
+                except Exception as e:
+                    logger.warning("soul write_memory failed (non-fatal): %s", e)
 
-            health_app.mark_alive()
-            await mesh.heartbeat(current_task=f"polled, claimed {len(claimed)}")
+            health.mark_alive()
+
+            try:
+                await mesh.heartbeat(
+                    session_id=settings.soul_session_id,
+                    node_id=settings.soul_node_id,
+                    harness=settings.soul_harness,
+                    current_task=f"polled; claimed {len(claimed)}",
+                )
+            except Exception as e:
+                logger.warning("periodic heartbeat failed: %s", e)
+
             await asyncio.sleep(settings.mesh_poll_interval_seconds)
 
-        except Exception as e:
-            logger.exception("Error in main loop: %s", e)
-            health_app.mark_alive()
+        except Exception:
+            logger.exception("unhandled error in main loop; continuing")
+            health.mark_alive()
             await asyncio.sleep(settings.mesh_poll_interval_seconds)
 
 
