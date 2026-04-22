@@ -206,6 +206,81 @@ def test_safe_workspace_path_accepts_relative(tmp_path):
     assert _safe_workspace_path(tmp_path, "sub/b.py") is not None
 
 
+# ── B.3.4: http_get allowlist ───────────────────────────────────────────────
+
+from alfred_coo.tools import _is_allowed_http_url, http_get
+
+
+def test_http_allowlist_accepts_saluca_github():
+    for url in (
+        "https://github.com/salucallc/soul-svc/blob/main/README.md",
+        "https://github.com/saluca-labs/tiresias-core",
+        "https://github.com/cristianxruvalcaba-coder/alfred-portal",
+        "https://raw.githubusercontent.com/salucallc/mcp-gateway/main/README.md",
+        "https://api.github.com/repos/salucallc/soul-svc/contents/README.md",
+    ):
+        ok, reason = _is_allowed_http_url(url)
+        assert ok, f"expected allowed: {url} ({reason})"
+
+
+def test_http_allowlist_accepts_saluca_domains():
+    for url in (
+        "https://saluca.com/",
+        "https://www.saluca.com/pricing",
+        "https://asphodel.ai/docs",
+        "https://platform.tiresias.network/api",
+    ):
+        ok, reason = _is_allowed_http_url(url)
+        assert ok, f"expected allowed: {url} ({reason})"
+
+
+def test_http_allowlist_accepts_docs_and_arxiv():
+    for url in (
+        "https://arxiv.org/abs/2024.12345",
+        "https://docs.anthropic.com/en/api",
+        "https://docs.python.org/3/library/contextvars.html",
+    ):
+        ok, reason = _is_allowed_http_url(url)
+        assert ok, f"expected allowed: {url} ({reason})"
+
+
+def test_http_allowlist_rejects_arbitrary_github_user():
+    ok, reason = _is_allowed_http_url("https://github.com/some-random-user/repo")
+    assert not ok
+    assert "not in Saluca allowlist" in reason
+
+
+def test_http_allowlist_rejects_arbitrary_host():
+    ok, reason = _is_allowed_http_url("https://malicious.example.com/payload")
+    assert not ok
+    assert "not in allowlist" in reason
+
+
+def test_http_allowlist_rejects_non_http_schemes():
+    for url in ("file:///etc/passwd", "ftp://example.com/x", "javascript:alert(1)", ""):
+        ok, _ = _is_allowed_http_url(url)
+        assert not ok
+
+
+def test_http_allowlist_normalises_case_and_strips_userinfo():
+    ok, _ = _is_allowed_http_url("https://user@GitHub.com/salucallc/soul-svc")
+    assert ok
+
+
+def test_http_allowlist_rejects_wrong_github_subdomain():
+    # gist.github.com isn't in the allowlist even though it looks adjacent.
+    ok, reason = _is_allowed_http_url("https://gist.github.com/salucallc/123")
+    assert not ok
+
+
+@pytest.mark.asyncio
+async def test_http_get_rejects_before_network_call():
+    # No network at all if the URL isn't allowed — immediate error return.
+    result = await http_get("https://example.com/")
+    assert "error" in result
+    assert "allowlist" in result["error"]
+
+
 # ── B.3.3: task-scoped workspaces via ContextVar ───────────────────────────
 
 from alfred_coo.tools import (
