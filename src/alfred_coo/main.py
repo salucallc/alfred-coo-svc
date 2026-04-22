@@ -142,24 +142,33 @@ async def main() -> None:
                     )
                 except Exception as e:
                     logger.exception("dispatch failed for task %s", task.get("id"))
-                    # Best-effort mark the task complete with the error so it doesn't sit claimed forever.
+                    # Best-effort mark the task as failed so it doesn't sit claimed forever.
                     try:
-                        await mesh.complete(task["id"], {
-                            "error": f"dispatch failure: {type(e).__name__}: {str(e)[:500]}"
-                        })
+                        await mesh.complete(
+                            task["id"],
+                            session_id=settings.soul_session_id,
+                            status="failed",
+                            result={
+                                "error": f"dispatch failure: {type(e).__name__}: {str(e)[:500]}"
+                            },
+                        )
                     except Exception:
                         pass
                     continue
 
                 try:
-                    await mesh.complete(task["id"], {
-                        "content": result.get("content", ""),
-                        "model": result.get("model_used"),
-                        "tokens": {
-                            "in": result.get("tokens_in"),
-                            "out": result.get("tokens_out"),
+                    await mesh.complete(
+                        task["id"],
+                        session_id=settings.soul_session_id,
+                        result={
+                            "content": result.get("content", ""),
+                            "model": result.get("model_used"),
+                            "tokens": {
+                                "in": result.get("tokens_in"),
+                                "out": result.get("tokens_out"),
+                            },
                         },
-                    })
+                    )
                 except Exception:
                     logger.exception("complete failed for task %s", task.get("id"))
                     continue
