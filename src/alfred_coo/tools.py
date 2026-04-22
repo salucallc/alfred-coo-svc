@@ -19,12 +19,17 @@ the dispatch loop.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional
 
 
 logger = logging.getLogger("alfred_coo.tools")
@@ -147,6 +152,232 @@ async def slack_post(
     return {"ts": body.get("ts"), "channel": body.get("channel")}
 
 
+# ── mesh_task_create ────────────────────────────────────────────────────────
+
+SOUL_API_URL_DEFAULT = "http://100.105.27.63:8080"
+
+
+async def mesh_task_create(
+    title: str,
+    description: str = "",
+    persona: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create a mesh task that other daemon personas can claim.
+
+    If `persona` is given we prepend [persona:<name>] to the title so the daemon
+    parser routes it to that persona on claim. Extra free-form tags become
+    bracketed prefixes as well.
+    """
+    soul_url = (os.environ.get("SOUL_API_URL") or SOUL_API_URL_DEFAULT).rstrip("/")
+    soul_key = os.environ.get("SOUL_API_KEY")
+    session_id = os.environ.get("SOUL_SESSION_ID") or "alfred-coo"
+    if not soul_key:
+        return {"error": "SOUL_API_KEY not configured"}
+
+    prefixes = []
+    if persona:
+        prefixes.append(f"[persona:{persona}]")
+    for t in tags or []:
+        if t and not t.startswith("["):
+            prefixes.append(f"[{t}]")
+    full_title = (" ".join(prefixes) + (" " if prefixes else "") + title).strip()
+
+    payload = json.dumps({
+        "from_session_id": session_id,
+        "title": full_title,
+        "description": description or "",
+    }).encode()
+    req = urllib.request.Request(
+        f"{soul_url}/v1/mesh/tasks",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {soul_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "saluca-alfred/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"error": f"soul-svc http {e.code}: {e.read().decode()[:300]}"}
+    except Exception as e:
+        return {"error": f"mesh transport: {type(e).__name__}: {e}"}
+
+    return {
+        "id": body.get("id"),
+        "title": body.get("title"),
+        "status": body.get("status"),
+    }
+
+
+# ── propose_pr ──────────────────────────────────────────────────────────────
+
+WORKSPACE_ROOT = Path(os.environ.get("ALFRED_WORKSPACES_ROOT") or "/var/lib/alfred-coo/workspaces")
+_VALID_OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,38}$")
+_VALID_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_VALID_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
+_ALLOWED_ORGS = frozenset({"salucallc", "saluca-labs", "cristianxruvalcaba-coder"})
+
+
+def _git_env() -> Dict[str, str]:
+    """Environment for git subprocess calls — identity + token-embedded URL support."""
+    env = os.environ.copy()
+    env.setdefault("GIT_AUTHOR_NAME", "Alfred COO Daemon")
+    env.setdefault("GIT_AUTHOR_EMAIL", "alfred-coo@saluca.com")
+    env.setdefault("GIT_COMMITTER_NAME", "Alfred COO Daemon")
+    env.setdefault("GIT_COMMITTER_EMAIL", "alfred-coo@saluca.com")
+    return env
+
+
+async def _run(
+    cmd: List[str],
+    cwd: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[int, str, str]:
+    """Await a subprocess, return (returncode, stdout, stderr). Never raises on non-zero."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd) if cwd else None,
+        env=dict(env) if env else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    return (
+        proc.returncode or 0,
+        out.decode("utf-8", errors="replace"),
+        err.decode("utf-8", errors="replace"),
+    )
+
+
+def _safe_workspace_path(workspace: Path, rel_path: str) -> Optional[Path]:
+    if not rel_path or not isinstance(rel_path, str):
+        return None
+    p = rel_path.strip().replace("\\", "/")
+    if not p or p.startswith("/") or (len(p) >= 2 and p[1] == ":"):
+        return None
+    parts = [seg for seg in p.split("/") if seg and seg != "."]
+    if not parts or any(s == ".." for s in parts):
+        return None
+    target = workspace / Path(*parts)
+    try:
+        target.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+async def propose_pr(
+    owner: str,
+    repo: str,
+    branch: str,
+    title: str,
+    body: str,
+    files: Dict[str, str],
+    base_branch: str = "main",
+    commit_message: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Atomic: clone → branch → write files → commit → push → open PR.
+
+    Only repos under a known Saluca org are allowed. All file paths must be
+    relative and inside the workspace — absolute paths and `..` escape are
+    rejected. If any step fails the PR is not opened and the error surfaces
+    in the return dict.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return {"error": "GITHUB_TOKEN not configured"}
+    if owner not in _ALLOWED_ORGS:
+        return {"error": f"owner {owner!r} not in allowlist {sorted(_ALLOWED_ORGS)}"}
+    if not _VALID_OWNER_RE.match(owner):
+        return {"error": "invalid owner name"}
+    if not _VALID_REPO_RE.match(repo):
+        return {"error": "invalid repo name"}
+    if not _VALID_BRANCH_RE.match(branch):
+        return {"error": "invalid branch name"}
+    if not _VALID_BRANCH_RE.match(base_branch):
+        return {"error": "invalid base_branch name"}
+    if not isinstance(files, dict) or not files:
+        return {"error": "files must be a non-empty dict of relpath -> content"}
+
+    workspace_id = task_id or f"ad-hoc-{os.getpid()}"
+    workspace = WORKSPACE_ROOT / workspace_id / repo
+    # Fresh clone for determinism. If re-running the same task, wipe prior state.
+    if workspace.exists():
+        shutil.rmtree(workspace, ignore_errors=True)
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+
+    clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+
+    env = _git_env()
+
+    rc, out, err = await _run(
+        ["git", "clone", "--depth", "50", "--branch", base_branch, clone_url, str(workspace)],
+        env=env,
+    )
+    if rc != 0:
+        return {"error": "git clone failed", "stderr": err[:500]}
+
+    rc, _, err = await _run(
+        ["git", "checkout", "-B", branch], cwd=workspace, env=env,
+    )
+    if rc != 0:
+        return {"error": "git checkout -B failed", "stderr": err[:500]}
+
+    written: List[str] = []
+    for rel_path, content in files.items():
+        target = _safe_workspace_path(workspace, rel_path)
+        if target is None:
+            return {"error": f"unsafe path: {rel_path!r}"}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8", newline="\n")
+        written.append(rel_path)
+
+    rc, _, err = await _run(["git", "add", *written], cwd=workspace, env=env)
+    if rc != 0:
+        return {"error": "git add failed", "stderr": err[:500]}
+
+    msg = commit_message or f"{title}\n\nAuthored by Alfred COO daemon."
+    rc, _, err = await _run(
+        ["git", "commit", "-m", msg], cwd=workspace, env=env,
+    )
+    if rc != 0:
+        return {"error": "git commit failed", "stderr": err[:500]}
+
+    rc, _, err = await _run(
+        ["git", "push", "-u", "origin", branch], cwd=workspace, env=env,
+    )
+    if rc != 0:
+        return {"error": "git push failed", "stderr": err[:500]}
+
+    rc, out, err = await _run(
+        [
+            "gh", "pr", "create",
+            "--repo", f"{owner}/{repo}",
+            "--base", base_branch,
+            "--head", branch,
+            "--title", title,
+            "--body", body or "(no body)",
+        ],
+        cwd=workspace,
+        env=env,
+    )
+    if rc != 0:
+        return {"error": "gh pr create failed", "stderr": err[:500], "stdout": out[:500]}
+
+    pr_url = out.strip().split("\n")[-1]
+    return {
+        "pr_url": pr_url,
+        "branch": branch,
+        "files_written": written,
+        "commit_message": msg.split("\n")[0],
+    }
+
+
 # ── Registry ────────────────────────────────────────────────────────────────
 
 BUILTIN_TOOLS: Dict[str, ToolSpec] = {
@@ -201,6 +432,73 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=slack_post,
+    ),
+    "mesh_task_create": ToolSpec(
+        name="mesh_task_create",
+        description=(
+            "Create a new mesh task that any daemon persona can claim. Use to "
+            "fan out work to specialist personas (e.g. delegate a PQ review to "
+            "mr-terrific-a, or a revenue question to revenue-pm). The `persona` "
+            "argument routes the task; tags are optional free-form labels."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short task title"},
+                "description": {"type": "string", "description": "Full task description + context"},
+                "persona": {
+                    "type": "string",
+                    "description": "Persona to route the task to (e.g. 'mr-terrific-a', 'revenue-pm'). Optional.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional bracketed tags to prepend to the title (e.g. ['unified-plan-wave-2']).",
+                },
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+        handler=mesh_task_create,
+    ),
+    "propose_pr": ToolSpec(
+        name="propose_pr",
+        description=(
+            "Atomic repo modification: clone the target repo, create a branch, "
+            "write the given files, commit + push, and open a pull request. "
+            "Returns the PR URL on success. Only Saluca-owned repos are allowed "
+            "(salucallc, saluca-labs, cristianxruvalcaba-coder). File paths must "
+            "be relative. This is the primary tool for autonomous code changes."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "owner": {
+                    "type": "string",
+                    "description": "GitHub org/user. Must be salucallc, saluca-labs, or cristianxruvalcaba-coder.",
+                },
+                "repo": {"type": "string", "description": "Repo name"},
+                "branch": {"type": "string", "description": "Feature branch to create (e.g. 'feature/my-change')"},
+                "base_branch": {
+                    "type": "string",
+                    "description": "Base branch, typically 'main'.",
+                },
+                "title": {"type": "string", "description": "PR title"},
+                "body": {"type": "string", "description": "PR body (markdown)"},
+                "files": {
+                    "type": "object",
+                    "description": "Mapping of relative-path -> file-content. Each file is written, added, committed, and pushed.",
+                    "additionalProperties": {"type": "string"},
+                },
+                "commit_message": {
+                    "type": "string",
+                    "description": "Commit message (defaults to the PR title if omitted).",
+                },
+            },
+            "required": ["owner", "repo", "branch", "title", "body", "files"],
+            "additionalProperties": False,
+        },
+        handler=propose_pr,
     ),
 }
 
