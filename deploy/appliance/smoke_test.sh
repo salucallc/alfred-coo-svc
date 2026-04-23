@@ -19,7 +19,7 @@ probe() {
   local expect_status="${3:-200}"
   printf "  %-26s " "$name"
   local status
-  status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" || true)
+  status=$(curl -skL -o /dev/null -w "%{http_code}" --max-time 5 "$url" || true)
   if [[ "$status" == "$expect_status" ]]; then
     printf "${GREEN}PASS${NC} (%s)\n" "$status"
   elif [[ -z "$status" || "$status" == "000" ]]; then
