@@ -1,78 +1,95 @@
-Here's the full `07_PUBLIC_README.md` following all constraints:
+# alfred-coo-svc
 
-```markdown
-# Mission Control
-Persistent, persona-aware COO daemon for autonomous mesh-task execution.
+Headless COO daemon that claims tasks from the Saluca mesh, routes them by persona to Ollama Cloud models, runs a multi-turn OpenAI-compatible tool-use loop for tool-enabled personas, and writes back structured envelopes to `/v1/mesh/tasks/{id}/complete`.
 
-[![License](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/salucallc/mission-control/ci.yml?branch=main)](https://github.com/salucallc/mission-control/actions)
-[![Version](https://img.shields.io/github/v/release/salucallc/mission-control)](https://github.com/salucallc/mission-control/releases)
+## Architecture
 
-## What it is
+- `src/alfred_coo/main.py` — poll → claim → dispatch → complete loop; loads persona-scoped soul memory as context; persists artifact paths + tool-call log on completion.
+- `src/alfred_coo/persona.py` — `BUILTIN_PERSONAS` registry; each entry bundles system prompt, preferred + fallback model, topic scope, and opt-in tool list.
+- `src/alfred_coo/dispatch.py` — model-agnostic caller; `select_model` resolves `[tag:code]` / `[tag:strategy]` overrides; `call_with_tools` runs the multi-turn tool loop (max 8 iterations) against Ollama or OpenRouter OpenAI-compatible endpoints.
+- `src/alfred_coo/tools.py` — five built-in tools (`linear_create_issue`, `slack_post`, `mesh_task_create`, `propose_pr`, `http_get`); each is an async handler with a JSON schema rendered to OpenAI function form.
+- `src/alfred_coo/artifacts.py` — path-safe artifact writer: structured envelope entries land on disk under the task workspace with `..`-escape rejected.
 
-Mission Control is a headless service that manages autonomous task execution across distributed AI personas. It polls a task mesh, routes tasks to appropriate model tiers based on persona profiles, dispatches to cloud or local inference endpoints, validates outputs for consistency and drift, and writes results back to shared memory. The daemon runs as a systemd service or in Docker, with structured logging and health endpoints for observability.
+## Tool inventory
 
-Unlike generic agent runners, Mission Control enforces persona discipline through Cedar policies, implements governance-as-git for operator procedures, and provides hand-back triggers that escalate tasks to human operators rather than failing silently. Each task tag maps to a specific model tier and system prompt, with cost caps and rate limits per persona. The system includes a plugin architecture for declarative extension of personas, tools, workflows, and model adapters.
+| Name | Purpose | Required env | Notes |
+|---|---|---|---|
+| `linear_create_issue` | Open issue in Saluca SAL team | `LINEAR_API_KEY` or `ALFRED_OPS_LINEAR_API_KEY` | Priority 0-4 (default 3); optional `due_date` (YYYY-MM-DD). |
+| `slack_post` | Post message to Slack | `SLACK_BOT_TOKEN` or `SLACK_BOT_TOKEN_ALFRED` | Defaults to `#batcave` (`C0ASAKFTR1C`); override via `SLACK_BATCAVE_CHANNEL` or per-call `channel`. |
+| `mesh_task_create` | Queue new mesh task for another persona | `SOUL_API_KEY` | Prepends `[persona:<name>]` + free-form tags to the title so the daemon parser routes on claim. |
+| `propose_pr` | Atomic clone → branch → commit → push → open PR | `GITHUB_TOKEN` | Org allowlist: `salucallc`, `saluca-labs`, `cristianxruvalcaba-coder`. Uses GitHub REST API directly (no `gh` CLI dependency). Workspaces keyed by task_id via ContextVar. |
+| `http_get` | Allowlisted read-only GET | none | 256 KB cap; text/json/xml/yaml only; hosts: Saluca GitHub paths, `*.saluca.com`, `*.tiresias.network`, `*.asphodel.ai`, arxiv, canonical docs. |
 
-The default deployment pairs with a task mesh service (soul-svc or compatible), a memory service (soul-memory or compatible), and any MCP-compliant tool server. The reference stack launches with a single `docker compose up` command, though Kubernetes and bare-metal deployments are supported through documented configuration paths.
+## Personas
 
-## Why it exists
+| Name | Preferred | Fallback | Tools | Topics |
+|---|---|---|---|---|
+| `default` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | (none) |
+| `alfred-coo-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | all five | coo-daemon, unified-plan, gap-closure, mission-control, autonomous-ops |
+| `mr-terrific-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | (none) | pq, sovereign-pq, security, karolin-sovereign-pq, crypto |
+| `innovation-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | twin-rho, mnemosyne, hypnos, ahi, innovation, research |
+| `revenue-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | stripe, pricing, onboarding, revenue, funnel, billing |
+| `ventures-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | impulse, ventures, arb-bot, trading |
+| `investment-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | patent, fundraising, investor, investment, ip |
+| `operations-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | audit, pipeline, operations, deploy, runbook |
 
-Agent frameworks excel at single-shot reasoning but often fail in long-running, unattended operation. Tasks accumulate, personas drift from their intended behavior, costs escalate unpredictably, and sensitive data leaks into logs. Mission Control addresses these operational concerns with built-in governance: persona discipline through policy enforcement, cost controls, escalation triggers, and sovereign execution boundaries.
+`alfred-coo-a` prefers `qwen3-coder:480b-cloud` (deepseek as fallback) because `deepseek-v3.2:cloud` intermittently emits Anthropic-style `<function_calls>` XML in the content field instead of the OpenAI `tool_calls` field once the tool schema exceeds ~4 tools. See the comment above the persona definition and `reference_deepseek_tool_use_quirk.md` in soul memory.
 
-The system is designed for deployments where AI agents must operate autonomously for extended periods without human supervision. It provides the operational layer that maintains consistency, controls costs, and ensures safe escalation paths when agents encounter edge cases beyond their design parameters.
+`alfred-coo` is kept as a legacy alias for `alfred-coo-a`.
 
-## Install
+## Task routing
 
-The fastest path to evaluation is Docker Compose. For Kubernetes or bare-metal deployments, see `INSTALL.md`.
+Task titles are parsed for routing markers in this order:
+
+1. `[persona:<name>]` — exact persona match against `BUILTIN_PERSONAS`.
+2. `[unified-plan-wave-1]` — special-case claim marker; routes to `default` persona unless a `[persona:...]` tag is also present.
+3. `[tag:code]` — overrides model selection to `qwen3-coder:480b-cloud` regardless of persona preference.
+4. `[tag:strategy]` — overrides model selection to `deepseek-v3.2:cloud`.
+5. Unknown persona name falls back to `default`.
+
+## Running it
+
+Local dev:
 
 ```bash
-git clone https://github.com/salucallc/mission-control.git
-cd mission-control
-cp .env.sample .env   # fill in SOUL_API_KEY and model provider keys
-docker compose up -d
+pip install -e .
+python -m alfred_coo.main
 ```
 
-## 30-second tour
+Required env vars:
 
-1. The health endpoint at `/health` returns 200 OK within seconds of startup.
-2. The daemon heartbeat appears in the task mesh within one minute.
-3. A synthetic test task is claimed and completed automatically, visible in logs.
-4. Logs are structured JSON with consistent fields for filtering and analysis.
-5. The optional web UI renders agent tiles showing persona status and recent activity.
+- `SOUL_API_KEY` — soul-svc bearer token for mesh + memory.
+- `OLLAMA_API_KEY` — Ollama Cloud auth (set on the `OLLAMA_URL` endpoint).
+- `LINEAR_API_KEY` (or `ALFRED_OPS_LINEAR_API_KEY`) — for `linear_create_issue`.
+- `SLACK_BOT_TOKEN` (or `SLACK_BOT_TOKEN_ALFRED`) — for `slack_post`.
+- `GITHUB_TOKEN` — for `propose_pr`.
 
-## Plugin extensibility
+See `deploy/.env.template` for the full set and defaults.
 
-Mission Control includes a declarative plugin system with six extension points: personas, MCP tools, workflows, connectors, policies, and model adapters. Plugins are hot-reloadable, Cedar-sandboxed, and version-pinned with SemVer. To add a plugin, drop a file into `/opt/mission-control/plugins/<type>/<id>/` and send SIGHUP to the daemon. The full plugin contract is documented in `docs/plugin-architecture.md`.
+## Testing
 
-## License summary
-
-Mission Control is dual-licensed. Source code is available under PolyForm-Noncommercial-1.0.0, which permits personal, research, evaluation, and other noncommercial use. Commercial use, including production deployments and revenue-generating applications, requires a separate commercial license.
-
-Commercial licenses are available from Saluca LLC in four tiers: Hobbyist (free for individual noncommercial use, same as PolyForm default), Team (self-serve via Stripe checkout for small production deployments), Enterprise (for multi-tenant and regulated environments), and Custom/OEM (for redistribution rights). Contact `info@saluca.com` for Enterprise and OEM inquiries; self-serve tiers are available at `https://saluca.com/mission-control/pricing`.
-
-```
-License: PolyForm-Noncommercial-1.0.0 (source) + commercial track (Saluca LLC)
-Commercial: info@saluca.com | https://saluca.com/mission-control/pricing
+```bash
+pytest tests/
 ```
 
-## Contributing
+59 tests across `test_persona.py`, `test_tools.py`, `test_artifacts.py`, `test_structured.py`.
 
-Contributions are welcome via pull request. All changes to operator procedures, personas, and plugins follow a governance-as-git model: proposed changes are submitted as PRs, validated by CI (schema checks, Cedar policy compilation, persona-drift tests), and merged by maintainers. External contributors must sign a CLA, available in `CLA.md`. Telemetry is disabled by default; contributors may enable it locally for debugging purposes.
+## Status
 
-Quick contribution paths:
-- Add a new persona: drop a markdown file in `plugins/personas/`, open a PR
-- Add a new MCP tool: drop a YAML manifest in `plugins/tools/`, open a PR
-- Fix a bug or add a feature: branch from main, submit a PR, pass CI, request review
+Shipped:
 
-## Links to in-depth docs
+- v0 scaffold: claim/dispatch/complete loop with fallback URL chain.
+- B.1: persona registry + model fallback + topic-scoped memory loading.
+- B.2: structured envelope contract + path-safe artifact writer.
+- B.3.1-4: OpenAI-compatible tool-use dispatch; `linear_create_issue`, `slack_post`, `mesh_task_create`, `propose_pr` (REST, no `gh` CLI), task-scoped workspaces via ContextVar, `http_get` with strict allowlist.
 
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/plugin-architecture.md`](docs/plugin-architecture.md)
-- [`docs/deploy.md`](docs/deploy.md)
-- [`docs/license.md`](docs/license.md)
-- [`docs/governance.md`](docs/governance.md)
-- [`docs/security.md`](docs/security.md)
+Phase B-next:
 
-The project is maintained by Saluca LLC and contributors. Community discussion is available at [https://saluca.com/community](https://saluca.com/community).
-```
+- Anthropic-native tool-use adapter (sidestep the deepseek XML drift).
+- Adler breakout validator (detect persona drift vs seasoning on outputs).
+- Per-task cost tracker against `DAILY_BUDGET_USD`.
+- In-flight recovery (reclaim tasks orphaned mid-dispatch on restart).
+
+## License
+
+PolyForm-Noncommercial-1.0.0. Commercial licensing: `info@saluca.com`.
