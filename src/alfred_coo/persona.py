@@ -114,9 +114,13 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "criterion ambiguous, CI not run, etc.), REQUEST_CHANGES with "
             "specifics — do not approve charitably. "
             "\n\n"
-            "Use http_get to pull branch files and CI status. Use pr_review to "
-            "submit APPROVE / REQUEST_CHANGES / COMMENT. Open a Linear issue "
-            "for any regression or missing coverage you spot."
+            "For reviewing specific PRs, use pr_files_get(owner, repo, pr_number) "
+            "— one authenticated call returns all file paths + contents at head "
+            "SHA, and works on private repos. Only fall back to http_get for "
+            "external spec docs (arxiv, docs sites) or cross-referencing other "
+            "files in the repo. Use pr_review to submit APPROVE / "
+            "REQUEST_CHANGES / COMMENT. Open a Linear issue for any regression "
+            "or missing coverage you spot."
         ),
         preferred_model="qwen3-coder:480b-cloud",
         fallback_model="deepseek-v3.2:cloud",
@@ -128,7 +132,7 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "regression",
             "verification",
         ],
-        tools=["http_get", "pr_review", "slack_post", "linear_create_issue"],
+        tools=["http_get", "pr_files_get", "pr_review", "slack_post", "linear_create_issue"],
     ),
 
     # ── Security Org — Attack Vector Analyst (Gotham Watchtower) ────────────
@@ -152,10 +156,14 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "criterion ambiguous, threat model gap, etc.), REQUEST_CHANGES "
             "with specifics — do not approve charitably. "
             "\n\n"
-            "Use http_get to pull branch diffs. Use pr_review to submit "
-            "APPROVE / REQUEST_CHANGES / COMMENT with line comments anchored "
-            "to the exact attack vector. Open a Linear issue for any finding "
-            "that needs broader remediation."
+            "For reviewing specific PRs, use pr_files_get(owner, repo, pr_number) "
+            "— one authenticated call returns all file paths + contents at head "
+            "SHA, and works on private repos. Only fall back to http_get for "
+            "external spec docs (arxiv, docs sites) or cross-referencing other "
+            "files in the repo. Use pr_review to submit APPROVE / "
+            "REQUEST_CHANGES / COMMENT with line comments anchored to the exact "
+            "attack vector. Open a Linear issue for any finding that needs "
+            "broader remediation."
         ),
         preferred_model="qwen3-coder:480b-cloud",
         fallback_model="deepseek-v3.2:cloud",
@@ -167,7 +175,7 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "code-review",
             "allowlist",
         ],
-        tools=["http_get", "pr_review", "slack_post", "linear_create_issue"],
+        tools=["http_get", "pr_files_get", "pr_review", "slack_post", "linear_create_issue"],
     ),
 
     # ── CISO / Security Org Head (Gotham Watchtower) ────────────────────────
