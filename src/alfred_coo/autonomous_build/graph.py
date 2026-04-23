@@ -91,6 +91,16 @@ class Ticket:
     pr_url: Optional[str] = None
     # Number of hawkman-qa-a REQUEST_CHANGES cycles seen so far.
     review_cycles: int = 0
+    # AB-08: mesh task id of the most recent review dispatched for this
+    # ticket. Populated by orchestrator._dispatch_review and consumed by
+    # _poll_reviews to look up the verdict in the completed-tasks batch.
+    review_task_id: Optional[str] = None
+    # AB-08: number of times the review task completed with no readable
+    # verdict (silent). Orchestrator retries once by re-firing the review,
+    # then marks FAILED. Counter resets whenever a new child is respawned
+    # after REQUEST_CHANGES so the retry budget only applies per review
+    # attempt.
+    silent_review_retries: int = 0
     # Raw Linear state name for debugging / resume logic.
     linear_state: str = ""
 

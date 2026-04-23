@@ -68,6 +68,22 @@ DEFAULT_STALL_THRESHOLD_SEC = 30 * 60
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
+# AB-08: hard cap on REQUEST_CHANGES → respawn cycles. Tickets that blow the
+# cap are marked FAILED; the wave gate's existing critical-path + soft-green
+# logic handles the rest.
+MAX_REVIEW_CYCLES = 3
+
+# AB-08: compiled regexes for verdict extraction. Uppercase-only keywords
+# keep false positives low (hawkman prompt spec: shout the verdict, not
+# "we approve of this idea in prose").
+_VERDICT_APPROVE_RE = re.compile(r"\bAPPROVE\b")
+_VERDICT_REQUEST_CHANGES_RE = re.compile(r"\bREQUEST_CHANGES\b")
+
+# Placeholder used when a REQUEST_CHANGES review body is empty/missing.
+_NO_REVIEW_BODY_NOTE = (
+    "(no review body captured; see the review task record in soul memory)"
+)
+
 
 class AutonomousBuildOrchestrator:
     """See module docstring."""
@@ -138,6 +154,10 @@ class AutonomousBuildOrchestrator:
         # read by `_check_budget` to tally token spend without re-querying
         # the mesh.
         self._last_completed_records: List[Dict[str, Any]] = []
+        # AB-08: same batch indexed by mesh task id so `_poll_reviews` can
+        # look up review task records without a second `list_tasks` round
+        # trip. Populated by `_poll_children` on every tick.
+        self._last_completed_by_id: Dict[str, Dict[str, Any]] = {}
         # Overridable via payload (for tests that want a shorter threshold).
         self.stall_threshold_sec: int = DEFAULT_STALL_THRESHOLD_SEC
 
@@ -361,6 +381,14 @@ class AutonomousBuildOrchestrator:
             cycles = (self.state.review_cycles or {}).get(uuid)
             if isinstance(cycles, int) and cycles > 0:
                 node.review_cycles = cycles
+            # AB-08: restore the pending review task id so `_poll_reviews`
+            # can resume polling after a daemon restart. Merge verdict
+            # into state only — there's no matching field on the Ticket
+            # (the verdict is transient; once handled it drives a
+            # status transition).
+            rtid = (self.state.review_task_ids or {}).get(uuid)
+            if rtid:
+                node.review_task_id = rtid
 
     def _snapshot_graph_into_state(self) -> None:
         """Copy current ticket statuses + child ids onto `self.state` before
@@ -384,6 +412,11 @@ class AutonomousBuildOrchestrator:
                 self.state.pr_urls[uuid] = ticket.pr_url
             if ticket.review_cycles:
                 self.state.review_cycles[uuid] = ticket.review_cycles
+            # AB-08: mirror pending review task ids into state so a restart
+            # after a review was dispatched (but before its verdict landed)
+            # still finds the task id on resume.
+            if ticket.review_task_id:
+                self.state.review_task_ids[uuid] = ticket.review_task_id
 
     # ── dispatch ────────────────────────────────────────────────────────────
 
@@ -432,6 +465,18 @@ class AutonomousBuildOrchestrator:
                 await self._poll_children()
             except Exception:
                 logger.exception("poll_children failed; will retry next tick")
+
+            # ── poll reviews (AB-08) ────────────────────────────────────
+            # Must run AFTER _poll_children (which populates
+            # `_last_completed_by_id`) and BEFORE _check_budget so review
+            # task completion events land in the same spend-tally window
+            # as child completions. Silent retries inside _poll_reviews
+            # may re-fire review dispatches; that's fine — the new review
+            # shows up next tick.
+            try:
+                await self._poll_reviews()
+            except Exception:
+                logger.exception("poll_reviews failed; will retry next tick")
 
             # ── periodic hooks ──────────────────────────────────────────
             await self._check_budget()
@@ -630,6 +675,12 @@ class AutonomousBuildOrchestrator:
             for t in in_flight
             if t.child_task_id in by_id
         ]
+        # AB-08: stash the full by_id dict so `_poll_reviews` can look up
+        # review-task records without a second `list_tasks` round trip.
+        # The list_tasks call above is not ticket-scoped, so this dict
+        # covers child tasks AND review tasks in one batch. Safe to expose
+        # in full; unrelated entries are ignored by the review poller.
+        self._last_completed_by_id = dict(by_id)
 
         updated: List[Ticket] = []
         for ticket in in_flight:
@@ -742,12 +793,21 @@ class AutonomousBuildOrchestrator:
         return None
 
     async def _dispatch_review(self, ticket: Ticket) -> None:
-        """Fire a `[persona:hawkman-qa-a]` child task to review the PR."""
-        ticket.review_cycles += 1
+        """Fire a `[persona:hawkman-qa-a]` child task to review the PR.
+
+        AB-08: stashes the new mesh task id on `ticket.review_task_id` +
+        `state.review_task_ids` BEFORE returning so `_poll_reviews` can
+        pick up the verdict on the next tick. Does NOT bump
+        `review_cycles` — that counter is the number of REQUEST_CHANGES
+        cycles already observed, managed by the verdict handler.
+        """
+        # Human-readable cycle number for the title: 1-indexed, so the
+        # first review is "cycle #1".
+        cycle_display = ticket.review_cycles + 1
         title = (
             f"[persona:hawkman-qa-a] [wave-{ticket.wave}] [{ticket.epic}] "
             f"review {ticket.identifier} {ticket.code} "
-            f"(cycle #{ticket.review_cycles})"
+            f"(cycle #{cycle_display})"
         )
         body = (
             f"Independent APE/V review of PR for {ticket.identifier}.\n"
@@ -763,12 +823,506 @@ class AutonomousBuildOrchestrator:
             from_session_id=self.settings.soul_session_id,
         )
         if isinstance(resp, dict):
+            review_task_id = resp.get("id")
+            if review_task_id:
+                # AB-08: stash the id on the ticket + state BEFORE the
+                # orchestrator transitions to REVIEWING so a checkpoint
+                # taken mid-tick contains the pending review pointer.
+                ticket.review_task_id = str(review_task_id)
+                self.state.review_task_ids[ticket.id] = str(review_task_id)
             self.state.record_event(
                 "review_dispatched",
                 identifier=ticket.identifier,
-                review_task_id=resp.get("id"),
-                cycle=ticket.review_cycles,
+                review_task_id=review_task_id,
+                cycle=cycle_display,
             )
+
+    # ── AB-08: review verdict loop ──────────────────────────────────────────
+
+    @staticmethod
+    def _extract_verdict(result: Dict[str, Any]) -> Optional[str]:
+        """Mine a verdict out of the review task's `result` envelope.
+
+        Priority (matches AB-08 design doc §4):
+
+        1. ``result.tool_calls[*].result.state`` where the tool was
+           ``pr_review`` (values: ``APPROVE`` / ``REQUEST_CHANGES`` /
+           ``COMMENT`` / ``COMMENTED_FALLBACK``).
+        2. Regex ``\\bAPPROVE\\b`` / ``\\bREQUEST_CHANGES\\b`` on
+           ``result.summary``.
+        3. Same regex on ``result.follow_up_tasks`` (string or
+           list-of-strings).
+
+        Returns ``None`` when nothing parseable is found — caller treats
+        that as silent and retries once.
+        """
+        if not isinstance(result, dict):
+            return None
+
+        # Priority 1: structured tool-call result.
+        tc = result.get("tool_calls") or []
+        if isinstance(tc, list):
+            for call in tc:
+                if not isinstance(call, dict):
+                    continue
+                if (call.get("name") or "").lower() != "pr_review":
+                    continue
+                out = call.get("result") or call.get("output") or {}
+                if not isinstance(out, dict):
+                    continue
+                state = out.get("state")
+                if isinstance(state, str) and state:
+                    return state.upper()
+
+        # Priority 2: summary regex.
+        summary = result.get("summary")
+        if isinstance(summary, str) and summary:
+            if _VERDICT_REQUEST_CHANGES_RE.search(summary):
+                return "REQUEST_CHANGES"
+            if _VERDICT_APPROVE_RE.search(summary):
+                return "APPROVE"
+
+        # Priority 3: follow_up_tasks scan.
+        follow = result.get("follow_up_tasks")
+        follow_strs: List[str] = []
+        if isinstance(follow, str):
+            follow_strs.append(follow)
+        elif isinstance(follow, list):
+            for f in follow:
+                if isinstance(f, str):
+                    follow_strs.append(f)
+                elif isinstance(f, dict):
+                    # Accept common shapes {"summary": "..."} / {"title": "..."}.
+                    for key in ("summary", "title", "text"):
+                        v = f.get(key)
+                        if isinstance(v, str) and v:
+                            follow_strs.append(v)
+        for blob in follow_strs:
+            if _VERDICT_REQUEST_CHANGES_RE.search(blob):
+                return "REQUEST_CHANGES"
+            if _VERDICT_APPROVE_RE.search(blob):
+                return "APPROVE"
+
+        return None
+
+    @staticmethod
+    def _parse_fallback_verdict(rec: Dict[str, Any]) -> Optional[str]:
+        """Extract the ``intended_event`` from a ``COMMENTED_FALLBACK``
+        ``pr_review`` tool-call payload.
+
+        When ``pr_review`` can't submit a real PR review (422 self-
+        authored fallback, tools.py:500-512) it still returns
+        ``intended_event`` with the verdict the reviewer tried to land.
+        This helper plucks that out so the orchestrator can treat it as
+        a real verdict. Returns None if the fallback payload is missing
+        or ambiguous — caller treats that as silent.
+        """
+        result = rec.get("result") if isinstance(rec, dict) else None
+        if not isinstance(result, dict):
+            return None
+        tc = result.get("tool_calls") or []
+        if not isinstance(tc, list):
+            return None
+        for call in tc:
+            if not isinstance(call, dict):
+                continue
+            if (call.get("name") or "").lower() != "pr_review":
+                continue
+            out = call.get("result") or call.get("output") or {}
+            if not isinstance(out, dict):
+                continue
+            if (out.get("state") or "").upper() != "COMMENTED_FALLBACK":
+                continue
+            intended = out.get("intended_event")
+            if isinstance(intended, str) and intended:
+                return intended.upper()
+        return None
+
+    async def _poll_reviews(self) -> List[Ticket]:
+        """Walk REVIEWING tickets; drive each toward MERGED_GREEN or FAILED.
+
+        Consumes ``self._last_completed_by_id`` (populated by
+        ``_poll_children`` on the same tick). Review tasks still in
+        flight are skipped; completed ones have their verdict extracted
+        and acted on:
+
+        - **APPROVE** → mark MERGE_REQUESTED, call ``_merge_pr``. On
+          success: MERGED_GREEN + Linear Done. On failure: FAILED.
+        - **REQUEST_CHANGES** → check cap; if under the cap, increment
+          ``review_cycles`` and ``_respawn_child_with_fixes``; else FAILED.
+        - **COMMENTED_FALLBACK** → parse ``intended_event``; recurse into
+          the matching branch or fall through to silent.
+        - **None (silent)** → bump ``silent_review_retries``; retry once
+          by re-firing ``_dispatch_review``. Second silent → FAILED.
+
+        Returns tickets whose status changed this tick (useful for
+        tests + cadence diffing).
+        """
+        by_id = self._last_completed_by_id or {}
+        reviewing = [
+            t for t in self.graph.nodes.values()
+            if t.status == TicketStatus.REVIEWING and t.review_task_id
+        ]
+        if not reviewing:
+            return []
+
+        updated: List[Ticket] = []
+        for ticket in reviewing:
+            rec = by_id.get(ticket.review_task_id)
+            if rec is None:
+                # Review still in flight — skip this tick.
+                continue
+            result = rec.get("result") or {}
+            verdict = self._extract_verdict(result)
+            await self._handle_review_verdict(ticket, rec, verdict, updated)
+        return updated
+
+    async def _handle_review_verdict(
+        self,
+        ticket: Ticket,
+        rec: Dict[str, Any],
+        verdict: Optional[str],
+        updated: List[Ticket],
+    ) -> None:
+        """Dispatch one review verdict. Broken out of ``_poll_reviews`` so
+        the COMMENTED_FALLBACK branch can recurse cleanly with a parsed
+        verdict without reshaping the caller's loop.
+        """
+        result = rec.get("result") or {}
+
+        # Record the extracted verdict (best-effort — None = silent).
+        if verdict:
+            self.state.review_verdicts[ticket.id] = verdict
+
+        if verdict == "APPROVE":
+            ticket.status = TicketStatus.MERGE_REQUESTED
+            merged = await self._merge_pr(ticket)
+            if merged:
+                ticket.status = TicketStatus.MERGED_GREEN
+                self.state.record_event(
+                    "ticket_merged",
+                    identifier=ticket.identifier,
+                    pr_url=ticket.pr_url,
+                    sha=self.state.merged_pr_urls.get(ticket.id),
+                )
+                await self._update_linear_state(ticket, "Done")
+            else:
+                ticket.status = TicketStatus.FAILED
+                self.state.record_event(
+                    "ticket_merge_failed",
+                    identifier=ticket.identifier,
+                    pr_url=ticket.pr_url,
+                )
+                await self._update_linear_state(ticket, "Backlog")
+            updated.append(ticket)
+            return
+
+        if verdict == "REQUEST_CHANGES":
+            if ticket.review_cycles >= MAX_REVIEW_CYCLES:
+                ticket.status = TicketStatus.FAILED
+                self.state.record_event(
+                    "review_max_cycles",
+                    identifier=ticket.identifier,
+                    cycles=ticket.review_cycles,
+                )
+                await self._update_linear_state(ticket, "Backlog")
+                updated.append(ticket)
+                return
+            # Under cap — spawn a fresh child with the review feedback.
+            review_body = self._extract_review_body(result)
+            ticket.review_cycles += 1
+            # Clear the stale review task pointer so the next PR_OPEN can
+            # cleanly seed a fresh review round via `_dispatch_review`.
+            ticket.review_task_id = None
+            self.state.review_task_ids.pop(ticket.id, None)
+            await self._respawn_child_with_fixes(ticket, review_body)
+            ticket.status = TicketStatus.DISPATCHED
+            self.state.record_event(
+                "ticket_respawned",
+                identifier=ticket.identifier,
+                cycle=ticket.review_cycles,
+                child_task_id=ticket.child_task_id,
+            )
+            updated.append(ticket)
+            return
+
+        if verdict == "COMMENTED_FALLBACK":
+            parsed = self._parse_fallback_verdict(rec)
+            if parsed in ("APPROVE", "REQUEST_CHANGES"):
+                # Trust intended_event — recurse with the parsed verdict.
+                await self._handle_review_verdict(
+                    ticket, rec, parsed, updated
+                )
+                return
+            # COMMENT-ish fallback with no actionable intent → silent path.
+            verdict = None
+
+        # Silent / ambiguous branch.
+        ticket.silent_review_retries += 1
+        if ticket.silent_review_retries > 1:
+            ticket.status = TicketStatus.FAILED
+            self.state.record_event(
+                "review_silent_failed",
+                identifier=ticket.identifier,
+                retries=ticket.silent_review_retries,
+            )
+            await self._update_linear_state(ticket, "Backlog")
+            updated.append(ticket)
+            return
+        # First silent miss → re-fire the review.
+        self.state.record_event(
+            "review_silent_retry",
+            identifier=ticket.identifier,
+            retries=ticket.silent_review_retries,
+        )
+        # Clear the stale task id first so the new dispatch overwrites it.
+        ticket.review_task_id = None
+        self.state.review_task_ids.pop(ticket.id, None)
+        try:
+            await self._dispatch_review(ticket)
+            # _dispatch_review doesn't flip status; keep it REVIEWING so
+            # the next tick sees the new review_task_id and re-checks.
+            ticket.status = TicketStatus.REVIEWING
+        except Exception:
+            logger.exception(
+                "silent-retry _dispatch_review failed for %s",
+                ticket.identifier,
+            )
+        updated.append(ticket)
+
+    @staticmethod
+    def _extract_review_body(result: Dict[str, Any]) -> str:
+        """Mine the review's textual feedback out of the result envelope.
+
+        Looks at tool_calls[pr_review].result.body / .html_url first, then
+        ``summary``, then ``follow_up_tasks``. Returns an empty string
+        when nothing useful is present (respawn still fires, just without
+        an embedded review excerpt).
+        """
+        if not isinstance(result, dict):
+            return ""
+        # Tool-call body.
+        tc = result.get("tool_calls") or []
+        if isinstance(tc, list):
+            for call in tc:
+                if not isinstance(call, dict):
+                    continue
+                if (call.get("name") or "").lower() != "pr_review":
+                    continue
+                out = call.get("result") or call.get("output") or {}
+                if isinstance(out, dict):
+                    for key in ("body", "review_body", "html_url"):
+                        v = out.get(key)
+                        if isinstance(v, str) and v.strip():
+                            return v
+        # Summary.
+        summary = result.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary
+        # follow_up_tasks fallback.
+        follow = result.get("follow_up_tasks") or []
+        if isinstance(follow, list):
+            parts: List[str] = []
+            for f in follow:
+                if isinstance(f, str):
+                    parts.append(f)
+                elif isinstance(f, dict):
+                    for key in ("summary", "title", "text"):
+                        v = f.get(key)
+                        if isinstance(v, str) and v:
+                            parts.append(v)
+            if parts:
+                return "\n".join(parts)
+        return ""
+
+    async def _merge_pr(self, ticket: Ticket) -> bool:
+        """Merge `ticket.pr_url` via the AB-10 ``github_merge_pr`` tool.
+
+        Returns True on success (including the double-merge guard hit);
+        False otherwise. Stashes the merge SHA on
+        ``state.merged_pr_urls[ticket.id]`` for idempotency on restart.
+
+        Double-merge guard: if the ticket is already MERGED_GREEN or
+        already has an entry in ``merged_pr_urls``, short-circuit True
+        without calling GitHub. This makes restart-resume idempotent:
+        a daemon that died between the GitHub PUT and the status
+        transition will see the entry on restore and skip the re-merge.
+        """
+        # Double-merge guard — restart-idempotent.
+        if (
+            ticket.status == TicketStatus.MERGED_GREEN
+            or ticket.id in self.state.merged_pr_urls
+        ):
+            logger.info(
+                "skipping re-merge for %s (already merged, sha=%s)",
+                ticket.identifier,
+                self.state.merged_pr_urls.get(ticket.id),
+            )
+            return True
+
+        if not ticket.pr_url:
+            logger.warning(
+                "cannot merge %s: no pr_url on ticket",
+                ticket.identifier,
+            )
+            return False
+
+        m = _PR_URL_RE.search(ticket.pr_url)
+        if not m:
+            logger.warning(
+                "cannot merge %s: pr_url %r does not match expected format",
+                ticket.identifier, ticket.pr_url,
+            )
+            return False
+
+        # _PR_URL_RE is the broad orchestrator version; parse owner/repo/num
+        # from the matched URL with a tighter regex so we get the groups.
+        parsed = re.match(
+            r"https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)",
+            m.group(0),
+        )
+        if parsed is None:
+            logger.warning(
+                "cannot merge %s: pr_url parse failed", ticket.identifier,
+            )
+            return False
+        owner, repo, pr_num_str = parsed.group(1), parsed.group(2), parsed.group(3)
+        try:
+            pr_num = int(pr_num_str)
+        except (TypeError, ValueError):
+            logger.warning(
+                "cannot merge %s: pr number %r not int",
+                ticket.identifier, pr_num_str,
+            )
+            return False
+
+        try:
+            from alfred_coo.tools import BUILTIN_TOOLS
+        except Exception:
+            logger.exception("tools not importable; cannot merge")
+            return False
+        spec = BUILTIN_TOOLS.get("github_merge_pr")
+        if spec is None:
+            logger.error(
+                "github_merge_pr missing from BUILTIN_TOOLS; "
+                "cannot merge %s",
+                ticket.identifier,
+            )
+            return False
+
+        try:
+            resp = await spec.handler(
+                owner=owner, repo=repo, pr_number=pr_num,
+                merge_method="squash",
+            )
+        except Exception:
+            logger.exception(
+                "github_merge_pr raised for %s (%s)",
+                ticket.identifier, ticket.pr_url,
+            )
+            return False
+
+        if not isinstance(resp, dict):
+            logger.warning(
+                "github_merge_pr returned non-dict for %s: %r",
+                ticket.identifier, resp,
+            )
+            return False
+
+        if not resp.get("ok"):
+            logger.warning(
+                "github_merge_pr failed for %s: %r",
+                ticket.identifier, resp,
+            )
+            return False
+
+        sha = resp.get("sha")
+        self.state.merged_pr_urls[ticket.id] = (
+            str(sha) if sha else str(ticket.pr_url)
+        )
+        return True
+
+    async def _respawn_child_with_fixes(
+        self,
+        ticket: Ticket,
+        review_body: str,
+    ) -> None:
+        """Create a fresh alfred-coo-a child task seeded with review feedback.
+
+        The new child is expected to push fixes to the SAME branch so the
+        existing PR picks them up automatically (no new PR). The reviewer
+        bot re-reviews on the next tick once the new child completes and
+        `_poll_children` re-enters PR_OPEN → REVIEWING.
+
+        Also resets ``ticket.silent_review_retries`` because that counter
+        is scoped to one review attempt, not the whole build cycle.
+        """
+        # Truncate to keep the body reasonable — hawkman feedback can be
+        # verbose. Keep the first 4KB; the full review is still in soul
+        # memory / the mesh task record if the builder needs more.
+        max_body_chars = 4096
+        review_excerpt = (review_body or "").strip()
+        if len(review_excerpt) > max_body_chars:
+            review_excerpt = (
+                review_excerpt[:max_body_chars]
+                + f"\n[...truncated {len(review_excerpt) - max_body_chars} "
+                + "chars; see review task for full content]"
+            )
+
+        short_title = (ticket.title or "")[:80].rstrip()
+        code = f" {ticket.code}" if ticket.code else ""
+        # `review_cycles` is already incremented by the verdict handler
+        # before this respawn fires, so it is the round number of THIS
+        # fix attempt (1 = first fix after the initial review).
+        round_num = ticket.review_cycles
+        title = (
+            f"[persona:alfred-coo-a] [wave-{ticket.wave}] [{ticket.epic}] "
+            f"{ticket.identifier}{code} — fix: round {round_num} "
+            f"({short_title})"
+        )[:220]  # mesh task title practical cap
+
+        plan_doc = self._plan_doc_for_epic(ticket.epic)
+        cp_line = " CRITICAL-PATH" if ticket.is_critical_path else ""
+        body = (
+            f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
+            f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
+            f"Wave: {ticket.wave}\n"
+            f"Epic: {ticket.epic}\n"
+            f"Parent autonomous_build kickoff: {self.task_id}\n"
+            f"Previous PR: {ticket.pr_url}\n"
+            f"Review round: {round_num} of {MAX_REVIEW_CYCLES}\n"
+            f"\n"
+            f"## Acceptance (APE/V)\n"
+            f"- [ ] Address every point in the review feedback below.\n"
+            f"- [ ] Tests still green (`ruff` + `pytest`).\n"
+            f"- [ ] Push fixes to the EXISTING branch for {ticket.pr_url}; "
+            f"do NOT open a new PR. The reviewer bot will re-review "
+            f"automatically once your new commit lands.\n"
+            f"\n"
+            f"## Review feedback\n"
+            f"{review_excerpt or _NO_REVIEW_BODY_NOTE}\n"
+            f"\n"
+            f"## Plan doc context\n"
+            f"{plan_doc}\n"
+            f"\n"
+            f"## Instructions\n"
+            f"Push fixes to existing branch; do NOT open a new PR. "
+            f"The reviewer bot will re-review automatically.\n"
+        )
+
+        resp = await self.mesh.create_task(
+            title=title,
+            description=body,
+            from_session_id=self.settings.soul_session_id,
+        )
+        if not isinstance(resp, dict) or not resp.get("id"):
+            raise RuntimeError(
+                f"mesh create_task returned no id for respawn: {resp!r}"
+            )
+        ticket.child_task_id = str(resp["id"])
+        # Silent-retry counter is per-review-attempt, not per-ticket. A
+        # fresh child gets a fresh silent-retry budget.
+        ticket.silent_review_retries = 0
 
     # ── wave gate ───────────────────────────────────────────────────────────
 
