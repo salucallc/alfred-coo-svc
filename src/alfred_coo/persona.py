@@ -24,6 +24,13 @@ class Persona:
     # Tool names from alfred_coo.tools.BUILTIN_TOOLS that this persona may invoke.
     # Empty = B.2 structured-output path; non-empty = B.3 tool-use loop.
     tools: List[str] = field(default_factory=list)
+    # Optional long-running orchestrator class name. When set, claiming a task
+    # for this persona spawns the named class as a detached asyncio.Task instead
+    # of running the one-shot dispatch path. The class is resolved dynamically
+    # from alfred_coo.autonomous_build.orchestrator (and siblings) at spawn
+    # time so registry entries can land before the orchestrator implementation
+    # exists. See plan Z:/_planning/v1-ga/F_autonomous_build_persona.md §1.
+    handler: Optional[str] = None
 
 
 BUILTIN_PERSONAS: Dict[str, Persona] = {
@@ -62,6 +69,48 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "autonomous-ops",
         ],
         tools=["linear_create_issue", "slack_post", "mesh_task_create", "propose_pr", "http_get"],
+    ),
+
+    # ── Autonomous Build Orchestrator (Mission Control v1.0 GA) ─────────────
+    # Long-running program controller. Claims a single kickoff task then runs
+    # for hours/days, dispatching per-ticket child tasks through
+    # alfred-coo-a (see plan F §1 Q2: orchestrator routes PRs through children,
+    # not its own bot identity). The `handler` field opts this persona out of
+    # the one-shot dispatch path; main.py spawns the named class as a detached
+    # asyncio.Task. Orchestrator class itself lands in AB-04 (SAL-2681); until
+    # then the spawn hook catches ImportError and marks the task failed with a
+    # clear message. Maps [persona:autonomous-build-a].
+    "autonomous-build-a": Persona(
+        name="autonomous-build-a",
+        system_prompt=(
+            "You are the autonomous_build program controller for Saluca's "
+            "Mission Control v1.0 GA effort. You claim one kickoff task and "
+            "run for hours or days: parse the kickoff payload, build the "
+            "ticket dependency graph from Linear, dispatch per-ticket child "
+            "tasks through the alfred-coo-a persona in waves, poll for "
+            "completion, gate wave transitions on all-green, and enforce the "
+            "$30 hard budget stop. You do not write code yourself; you "
+            "orchestrate builders. Post 20-minute cadence updates to "
+            "#batcave and fire critical-path pings when a labelled ticket "
+            "stalls. On budget hard-stop, let in-flight children drain, "
+            "block new dispatch, and mark the kickoff task failed with a "
+            "state dump. Persist wave/ticket state to soul memory every "
+            "tick so a daemon restart can resume. Full spec: "
+            "Z:/_planning/v1-ga/F_autonomous_build_persona.md."
+        ),
+        preferred_model="qwen3-coder:480b-cloud",
+        fallback_model="qwen3-coder:30b-a3b-q4_K_M",
+        topics=[
+            "autonomous_build",
+            "mission-control-v1-ga",
+        ],
+        tools=[
+            "linear_create_issue",
+            "slack_post",
+            "mesh_task_create",
+            "http_get",
+        ],
+        handler="AutonomousBuildOrchestrator",
     ),
 
     # ── R&D Cybersecurity — Cryptography (Atlantis, under Red Hood) ─────────

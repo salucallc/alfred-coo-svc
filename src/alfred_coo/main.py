@@ -4,9 +4,16 @@ Polls soul-svc mesh_tasks, claims tasks with [persona:xxx] or [unified-plan-wave
 markers, loads recent soul memory as context, dispatches to the selected cloud
 model, writes result + memory back, heartbeats, sleeps, repeats. Surviving error
 handler on the loop body so one bad task never kills the daemon.
+
+Long-running orchestrators: a persona with `handler` set opts out of the
+one-shot dispatch path. After a successful claim we resolve the handler class
+from `alfred_coo.autonomous_build.orchestrator` (and siblings), instantiate it,
+spawn it as a detached asyncio.Task, and continue polling. See plan
+Z:/_planning/v1-ga/F_autonomous_build_persona.md §1.
 """
 
 import asyncio
+import importlib
 import logging
 
 import uvicorn
@@ -14,7 +21,7 @@ import uvicorn
 from . import config, log, dispatch, health
 from .mesh import MeshClient, parse_persona_tag
 from .soul import SoulClient
-from .persona import get_persona
+from .persona import Persona, get_persona
 from .dispatch import Dispatcher
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
@@ -22,6 +29,136 @@ from .tools import resolve_tools, set_current_task_id, reset_current_task_id
 
 
 logger = logging.getLogger(__name__)
+
+
+# Module-level registry of long-running orchestrator tasks, keyed by the mesh
+# task id that triggered the spawn. Exposed for tests + ops introspection.
+# Entries are not cleaned up automatically in v0; on daemon restart the
+# orchestrator is expected to reconcile from soul memory state (plan F §2 R2).
+_running_orchestrators: dict[str, asyncio.Task] = {}
+
+
+# Candidate modules searched by `_resolve_handler`. Order matters: first match
+# wins. Kept as a list so future long-running handlers (e.g. a different
+# persona class) can slot in without touching the resolver.
+_HANDLER_MODULES: tuple[str, ...] = (
+    "alfred_coo.autonomous_build.orchestrator",
+)
+
+
+def _resolve_handler(handler_name: str):
+    """Resolve a handler class by name across the registered handler modules.
+
+    Returns the class object or raises ImportError/AttributeError if no
+    module in `_HANDLER_MODULES` defines an attribute matching `handler_name`.
+    Kept sync + small so the spawn path stays trivial to test.
+    """
+    last_err: Exception | None = None
+    for mod_name in _HANDLER_MODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError as e:
+            last_err = e
+            continue
+        cls = getattr(mod, handler_name, None)
+        if cls is not None:
+            return cls
+        last_err = AttributeError(
+            f"module {mod_name!r} has no attribute {handler_name!r}"
+        )
+    if last_err is None:
+        last_err = ImportError(
+            f"no handler module available for {handler_name!r}"
+        )
+    raise last_err
+
+
+async def _spawn_long_running_handler(
+    task: dict,
+    persona: Persona,
+    mesh: MeshClient,
+    soul: SoulClient,
+    dispatcher: Dispatcher,
+    settings,
+) -> bool:
+    """Attempt to spawn `persona.handler` as a detached asyncio.Task.
+
+    Returns True if the task was spawned (and stashed in
+    `_running_orchestrators`), False if the handler could not be resolved
+    (in which case the mesh task is marked failed here and the caller should
+    skip the one-shot dispatch path).
+    """
+    handler_name = persona.handler or ""
+    task_id = task["id"]
+    try:
+        cls = _resolve_handler(handler_name)
+    except (ImportError, AttributeError) as e:
+        logger.warning(
+            "handler %s not yet implemented for task %s: %s",
+            handler_name, task_id, e,
+        )
+        try:
+            await mesh.complete(
+                task_id,
+                session_id=settings.soul_session_id,
+                status="failed",
+                result={
+                    "error": (
+                        f"handler {handler_name} not yet implemented; "
+                        f"see AB-04"
+                    ),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "failed to mark task %s failed after handler resolution error",
+                task_id,
+            )
+        return False
+
+    try:
+        orch = cls(
+            task=task,
+            persona=persona,
+            mesh=mesh,
+            soul=soul,
+            dispatcher=dispatcher,
+            settings=settings,
+        )
+    except Exception:
+        logger.exception(
+            "handler %s instantiation failed for task %s",
+            handler_name, task_id,
+        )
+        try:
+            await mesh.complete(
+                task_id,
+                session_id=settings.soul_session_id,
+                status="failed",
+                result={
+                    "error": (
+                        f"handler {handler_name} instantiation raised; "
+                        f"see logs"
+                    ),
+                },
+            )
+        except Exception:
+            pass
+        return False
+
+    orch_task = asyncio.create_task(
+        orch.run(), name=f"orchestrator-{handler_name}-{task_id}"
+    )
+    _running_orchestrators[task_id] = orch_task
+    logger.info(
+        "spawned long-running handler",
+        extra={
+            "task_id": task_id,
+            "handler": handler_name,
+            "persona": persona.name,
+        },
+    )
+    return True
 
 
 async def _run_health_server(app, port: int) -> None:
@@ -108,6 +245,22 @@ async def main() -> None:
                             extra={"task_id": task.get("id"),
                                    "persona": persona.name,
                                    "title": title[:120]})
+
+                # Long-running handler fork. If the persona declares a
+                # handler class, spawn it as a detached asyncio.Task and
+                # continue polling — main loop keeps servicing other
+                # personas in parallel. Heartbeat inside the orchestrator
+                # keeps this task's liveness fresh. See plan F §1.
+                if persona.handler:
+                    await _spawn_long_running_handler(
+                        task=task,
+                        persona=persona,
+                        mesh=mesh,
+                        soul=soul,
+                        dispatcher=dispatcher,
+                        settings=settings,
+                    )
+                    continue
 
                 # Context load (non-fatal on error). Scoped by persona topics.
                 try:
