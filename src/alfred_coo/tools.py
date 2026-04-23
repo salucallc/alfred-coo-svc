@@ -733,6 +733,103 @@ async def pr_files_get(
     }
 
 
+# ── github_merge_pr ──────────────────────────────────────────────────────────────
+
+_PR_MERGE_METHODS = frozenset({"squash", "merge", "rebase"})
+
+
+async def github_merge_pr(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    merge_method: str = "squash",
+    commit_title: Optional[str] = None,
+    commit_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Merge a pull request on a Saluca-owned repo.
+
+    Posts PUT https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge
+    with `{merge_method, commit_title?, commit_message?}`. `merge_method` must
+    be one of squash, merge, rebase. Used by the autonomous_build orchestrator
+    after a QA persona has landed an APPROVE review. Only Saluca-owned orgs
+    are allowed. Returns `{ok, merged, sha, message}` on success; structured
+    error dict on 405 (not mergeable), 409 (stale head), 422 (unprocessable),
+    or other failure.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return {"error": "missing GITHUB_TOKEN"}
+    if owner not in _ALLOWED_ORGS:
+        return {"error": f"owner {owner!r} not in allowlist {sorted(_ALLOWED_ORGS)}"}
+    if not _VALID_OWNER_RE.match(owner):
+        return {"error": "invalid owner name"}
+    if not _VALID_REPO_RE.match(repo):
+        return {"error": "invalid repo name"}
+    if merge_method not in _PR_MERGE_METHODS:
+        return {
+            "error": f"merge_method {merge_method!r} not in {sorted(_PR_MERGE_METHODS)}"
+        }
+    try:
+        pr_num = int(pr_number)
+    except (TypeError, ValueError):
+        return {"error": "pr_number must be an integer"}
+    if pr_num <= 0:
+        return {"error": "pr_number must be positive"}
+
+    body: Dict[str, Any] = {"merge_method": merge_method}
+    if commit_title is not None:
+        body["commit_title"] = commit_title
+    if commit_message is not None:
+        body["commit_message"] = commit_message
+
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/merge",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        err_text = e.read().decode(errors="replace")[:500]
+        if e.code == 405:
+            return {"error": "not_mergeable", "status": 405, "body": err_text}
+        if e.code == 409:
+            return {"error": "stale_head", "status": 409, "body": err_text}
+        if e.code == 422:
+            # Surface GitHub's own message when it's JSON; otherwise the raw body.
+            try:
+                err_json = json.loads(err_text)
+            except ValueError:
+                err_json = None
+            msg = None
+            if isinstance(err_json, dict):
+                msg = err_json.get("message")
+            return {
+                "error": msg or "unprocessable",
+                "status": 422,
+                "body": err_json if err_json is not None else err_text,
+            }
+        return {"error": f"github merge http {e.code}", "status": e.code, "body": err_text}
+    except Exception as e:
+        return {"error": f"github api transport: {type(e).__name__}: {e}"}
+
+    return {
+        "ok": True,
+        "merged": bool(resp.get("merged", True)),
+        "sha": resp.get("sha"),
+        "message": resp.get("message"),
+    }
+
+
 # ── http_get ────────────────────────────────────────────────────────────────
 
 # Maximum body bytes we'll read into a tool result. Larger responses are
@@ -1521,6 +1618,48 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=pr_files_get,
+    ),
+    "github_merge_pr": ToolSpec(
+        name="github_merge_pr",
+        description=(
+            "Merge a pull request on a Saluca-owned repo. Posts PUT to the "
+            "GitHub merge endpoint with merge_method (squash, merge, or "
+            "rebase) and optional commit_title/commit_message. Only Saluca-"
+            "owned orgs are allowed (salucallc, saluca-labs, cristianxruvalcaba-"
+            "coder). Used by the autonomous_build orchestrator after a QA "
+            "persona has APPROVE'd the PR. Structured errors on 405 "
+            "(not_mergeable), 409 (stale_head), 422 (unprocessable)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "owner": {
+                    "type": "string",
+                    "description": "GitHub org/user. Must be salucallc, saluca-labs, or cristianxruvalcaba-coder.",
+                },
+                "repo": {"type": "string", "description": "Repo name"},
+                "pr_number": {
+                    "type": "integer",
+                    "description": "Pull request number (positive integer).",
+                },
+                "merge_method": {
+                    "type": "string",
+                    "description": "GitHub merge strategy. Default squash.",
+                    "enum": ["squash", "merge", "rebase"],
+                },
+                "commit_title": {
+                    "type": "string",
+                    "description": "Optional override for the merge commit title.",
+                },
+                "commit_message": {
+                    "type": "string",
+                    "description": "Optional override for the merge commit body.",
+                },
+            },
+            "required": ["owner", "repo", "pr_number"],
+            "additionalProperties": False,
+        },
+        handler=github_merge_pr,
     ),
     "slack_ack_poll": ToolSpec(
         name="slack_ack_poll",
