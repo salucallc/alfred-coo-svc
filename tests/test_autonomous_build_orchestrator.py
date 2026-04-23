@@ -447,6 +447,50 @@ async def test_run_integration_dry_run_harness(monkeypatch):
     assert soul.writes, "state checkpoint never ran"
 
 
+def test_child_task_body_uses_repo_raw_plan_url():
+    """Regression: child task bodies must reference plan docs via
+    https://raw.githubusercontent.com/salucallc/alfred-coo-svc/main/plans/v1-ga/...
+    NOT a minipc-local ``Z:/_planning/...`` path. Children run on Oracle
+    and can't see the Windows share, so Z:/ references caused them to
+    escalate to #batcave with "plan doc not found" errors (2026-04-23).
+    """
+    expected_by_epic = {
+        "tiresias": "A_tiresias_in_appliance.md",
+        "aletheia": "B_aletheia_daemon.md",
+        "fleet": "C_fleet_mode_endpoint.md",
+        "ops": "D_ops_layer.md",
+        "soul-gap": "E_soul_svc_gaps.md",
+    }
+    base = (
+        "https://raw.githubusercontent.com/salucallc/alfred-coo-svc/main/"
+        "plans/v1-ga"
+    )
+    orch = _mk_orchestrator()
+    for epic, filename in expected_by_epic.items():
+        ticket = _t(f"u-{epic}", f"SAL-{epic}", f"{epic.upper()}-01", 1, epic)
+        body = orch._child_task_body(ticket)
+        expected_url = f"{base}/{filename}"
+        assert expected_url in body, (
+            f"epic={epic}: expected {expected_url!r} in child body, got:\n"
+            f"{body}"
+        )
+        assert "Z:/_planning" not in body, (
+            f"epic={epic}: child body still references minipc-only "
+            f"Z:/_planning path:\n{body}"
+        )
+        assert "raw.githubusercontent.com" in body
+        assert "http_get" in body, (
+            "child body should instruct the sub to fetch the plan via "
+            "http_get"
+        )
+
+    # Unknown epic falls back to the autonomous_build gap-closer plan (G),
+    # which is safer than a 404 fallback.
+    unknown = _t("u-x", "SAL-X", "X-01", 1, "not-a-real-epic")
+    body = orch._child_task_body(unknown)
+    assert f"{base}/G_autonomous_build_gap_closers.md" in body
+
+
 async def test_run_missing_linear_project_id_fails_kickoff():
     """Payload without linear_project_id → orchestrator fails the kickoff
     cleanly instead of crashing."""
