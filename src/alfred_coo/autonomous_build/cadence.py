@@ -67,7 +67,14 @@ class SlackCadence:
         if not channel or not isinstance(channel, str):
             raise ValueError(f"channel must be a non-empty string (got {channel!r})")
         self.channel: str = channel
-        self.interval_minutes: int = max(1, int(interval_minutes or DEFAULT_INTERVAL_MIN))
+        # Clamp to >=1 so zero/negative values can't disable the rate limit.
+        # Note: we deliberately don't use `or DEFAULT` here — passing 0 must
+        # still clamp to 1 min, not jump to the 20-min default.
+        try:
+            raw = int(interval_minutes) if interval_minutes is not None else DEFAULT_INTERVAL_MIN
+        except (TypeError, ValueError):
+            raw = DEFAULT_INTERVAL_MIN
+        self.interval_minutes: int = max(1, raw)
         # Resolve lazily; tests inject a fake, production uses BUILTIN_TOOLS.
         self._slack_post_fn: Optional[SlackPostFn] = slack_post_fn
         self._last_tick_ts: float = 0.0

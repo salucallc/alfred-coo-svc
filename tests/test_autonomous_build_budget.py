@@ -11,7 +11,6 @@ import pytest
 from alfred_coo.autonomous_build.budget import (
     BudgetTracker,
     FALLBACK_PRICE,
-    PRICE_PER_MTOK,
     estimate_cost,
     make_tracker,
 )
