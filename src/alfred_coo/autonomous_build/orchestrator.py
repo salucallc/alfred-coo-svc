@@ -581,7 +581,9 @@ class AutonomousBuildOrchestrator:
             f"`summary` or `follow_up_tasks`.\n"
             f"\n"
             f"## Plan doc context\n"
-            f"{plan_doc}\n"
+            f"Plan doc (fetch via http_get): {plan_doc}\n"
+            f"Pay attention to the section matching ticket code "
+            f"{ticket.code or ticket.identifier}.\n"
             f"\n"
             f"## Deliverable\n"
             f"Open ONE PR to the target Saluca repo on a feature branch named "
@@ -589,16 +591,37 @@ class AutonomousBuildOrchestrator:
             f"APE/V block above. Keep the diff scoped to this ticket.\n"
         )
 
-    @staticmethod
-    def _plan_doc_for_epic(epic: str) -> str:
-        mapping = {
-            "tiresias": "Z:/_planning/v1-ga/A_tiresias_in_appliance.md",
-            "aletheia": "Z:/_planning/v1-ga/B_aletheia_daemon.md",
-            "fleet": "Z:/_planning/v1-ga/C_fleet_mode_endpoint.md",
-            "ops": "Z:/_planning/v1-ga/D_ops_layer.md",
-            "soul-gap": "Z:/_planning/v1-ga/E_soul_svc_gaps.md",
-        }
-        return mapping.get(epic, "Z:/_planning/v1-ga/HANDOFF_V1_GA_MASTER_2026-04-23.md")
+    #: Base URL where v1-GA plan docs live in the alfred-coo-svc repo.
+    #: Children run on Oracle and can't see minipc's Z:/ drive, so we emit
+    #: repo-raw URLs they can fetch with `http_get`.
+    _PLAN_DOC_BASE_URL = (
+        "https://raw.githubusercontent.com/salucallc/alfred-coo-svc/main/"
+        "plans/v1-ga"
+    )
+
+    #: Epic -> plan doc filename. Five v1-GA epics map to A..E; anything
+    #: else falls back to the autonomous-build self-reference docs F and G.
+    _EPIC_TO_PLAN_FILE = {
+        "tiresias": "A_tiresias_in_appliance.md",
+        "aletheia": "B_aletheia_daemon.md",
+        "fleet": "C_fleet_mode_endpoint.md",
+        "ops": "D_ops_layer.md",
+        "soul-gap": "E_soul_svc_gaps.md",
+    }
+
+    @classmethod
+    def _plan_doc_for_epic(cls, epic: str) -> str:
+        """Return a raw.githubusercontent.com URL for the plan doc that
+        matches this ticket's epic. Child alfred-coo-a tasks run on Oracle
+        and must fetch the plan via `http_get`, so paths like
+        ``Z:/_planning/v1-ga/*.md`` (minipc-only) won't resolve. Fallback
+        for unknown epics points at the autonomous_build gap-closer plan
+        (G), which lists orchestrator-side fixes — safer than a 404.
+        """
+        filename = cls._EPIC_TO_PLAN_FILE.get(
+            epic, "G_autonomous_build_gap_closers.md"
+        )
+        return f"{cls._PLAN_DOC_BASE_URL}/{filename}"
 
     # ── child polling + state transitions ───────────────────────────────────
 
