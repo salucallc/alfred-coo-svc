@@ -1271,7 +1271,10 @@ class AutonomousBuildOrchestrator:
 
         short_title = (ticket.title or "")[:80].rstrip()
         code = f" {ticket.code}" if ticket.code else ""
-        round_num = ticket.review_cycles + 1
+        # `review_cycles` is already incremented by the verdict handler
+        # before this respawn fires, so it is the round number of THIS
+        # fix attempt (1 = first fix after the initial review).
+        round_num = ticket.review_cycles
         title = (
             f"[persona:alfred-coo-a] [wave-{ticket.wave}] [{ticket.epic}] "
             f"{ticket.identifier}{code} — fix: round {round_num} "
