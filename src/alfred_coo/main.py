@@ -14,7 +14,9 @@ Z:/_planning/v1-ga/F_autonomous_build_persona.md §1.
 
 import asyncio
 import importlib
+import json
 import logging
+from typing import Optional
 
 import uvicorn
 
@@ -38,12 +40,52 @@ logger = logging.getLogger(__name__)
 _running_orchestrators: dict[str, asyncio.Task] = {}
 
 
+# AB-09: Layer-2 zombie guard. Maps linear_project_id -> mesh_task_id for any
+# orchestrator currently running in THIS daemon. Prevents two orchestrators
+# from spawning against the same Linear project when the daemon restarts and
+# re-claims a kickoff whose server-side claim lease has expired.
+#
+# Layer 1 (soul-svc claim heartbeat / idempotent re-claim) is deferred to
+# AB-11; G3 verified 2026-04-23 that soul-svc's claim endpoint returns 409
+# on same-holder re-claim rather than refreshing the lease, so this local
+# guard is the only defence until that server-side fix lands.
+_orchestrators_by_project: dict[str, str] = {}
+
+
 # Candidate modules searched by `_resolve_handler`. Order matters: first match
 # wins. Kept as a list so future long-running handlers (e.g. a different
 # persona class) can slot in without touching the resolver.
 _HANDLER_MODULES: tuple[str, ...] = (
     "alfred_coo.autonomous_build.orchestrator",
 )
+
+
+def _peek_kickoff_project_id(task: dict) -> Optional[str]:
+    """Best-effort extraction of `linear_project_id` from a kickoff task's
+    description. Returns None if the description is missing, not JSON, or
+    the key is absent. Never raises: a malformed payload must not crash the
+    spawn path — it just falls back to the per-task-id tracking that was in
+    place before AB-09.
+    """
+    desc = task.get("description") or ""
+    if not desc:
+        return None
+    try:
+        payload = json.loads(desc)
+    except (ValueError, TypeError) as e:
+        logger.debug(
+            "kickoff description is not JSON; skipping project-id peek "
+            "(task=%s, err=%s)",
+            task.get("id"),
+            e,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pid = payload.get("linear_project_id")
+    if pid is None:
+        return None
+    return str(pid)
 
 
 def _resolve_handler(handler_name: str):
@@ -146,16 +188,71 @@ async def _spawn_long_running_handler(
             pass
         return False
 
+    # AB-09 Layer-2 zombie guard: if we already have a running orchestrator
+    # for this linear_project_id, reject the new kickoff instead of racing
+    # a second one. Layer 1 (server-side claim refresh) is deferred to AB-11
+    # — until that lands, this in-process check is the safety net.
+    project_id = _peek_kickoff_project_id(task)
+    if project_id:
+        existing_task_id = _orchestrators_by_project.get(project_id)
+        if existing_task_id:
+            existing_task = _running_orchestrators.get(existing_task_id)
+            if existing_task is not None and not existing_task.done():
+                logger.warning(
+                    "rejected duplicate kickoff for project=%s "
+                    "(existing task=%s)",
+                    project_id,
+                    existing_task_id,
+                )
+                try:
+                    await mesh.complete(
+                        task_id,
+                        session_id=settings.soul_session_id,
+                        status="failed",
+                        result={
+                            "error": (
+                                f"duplicate_kickoff: existing orchestrator "
+                                f"task={existing_task_id} running for "
+                                f"project={project_id}"
+                            ),
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to mark duplicate-kickoff task %s failed",
+                        task_id,
+                    )
+                return False
+        # No live orchestrator for this project — claim the slot before we
+        # create the asyncio.Task so a second concurrent spawn in the same
+        # event-loop tick can't squeeze past.
+        _orchestrators_by_project[project_id] = task_id
+
     orch_task = asyncio.create_task(
         orch.run(), name=f"orchestrator-{handler_name}-{task_id}"
     )
     _running_orchestrators[task_id] = orch_task
+    if project_id:
+        # Clear the project slot when the orchestrator task finishes (any
+        # terminal state: success, exception, or cancellation). Scoped to
+        # the specific project_id + task_id captured at spawn time so a
+        # later spawn for the same project won't be clobbered.
+        def _clear_project_slot(
+            _t: asyncio.Task,
+            pid: str = project_id,
+            tid: str = task_id,
+        ) -> None:
+            if _orchestrators_by_project.get(pid) == tid:
+                _orchestrators_by_project.pop(pid, None)
+
+        orch_task.add_done_callback(_clear_project_slot)
     logger.info(
         "spawned long-running handler",
         extra={
             "task_id": task_id,
             "handler": handler_name,
             "persona": persona.name,
+            "linear_project_id": project_id,
         },
     )
     return True
