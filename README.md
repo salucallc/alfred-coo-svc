@@ -20,6 +20,22 @@ Headless COO daemon that claims tasks from the Saluca mesh, routes them by perso
 | `propose_pr` | Atomic clone → branch → commit → push → open PR | `GITHUB_TOKEN` | Org allowlist: `salucallc`, `saluca-labs`, `cristianxruvalcaba-coder`. Uses GitHub REST API directly (no `gh` CLI dependency). Workspaces keyed by task_id via ContextVar. |
 | `http_get` | Allowlisted read-only GET | none | 256 KB cap; text/json/xml/yaml only; hosts: Saluca GitHub paths, `*.saluca.com`, `*.tiresias.network`, `*.asphodel.ai`, arxiv, canonical docs. |
 | `pr_review` | Submit PR review (APPROVE / REQUEST_CHANGES / COMMENT) | `GITHUB_TOKEN` | Org allowlist (same as `propose_pr`). Supports overall body + optional inline line comments. Used by verifier personas (`hawkman-qa-a`, `batgirl-sec-a`) that review code they did not build. |
+| `pr_files_get` | Fetch all files in a PR with content at head SHA | `GITHUB_TOKEN` | Org allowlist. 20 KB cap per file, 50-file cap per PR (truncation marked explicitly). |
+| `slack_ack_poll` | Poll a Slack channel for the first ACK message from one author | `SLACK_BOT_TOKEN_ALFRED` | Used by the `autonomous-build-a` SS-08 gate. Regex keywords matched case-insensitive; paginates via `response_metadata.next_cursor`. **Requires bot scope `channels:history`** (and `users:read.email` so callers can resolve the approver's user id via `users.lookupByEmail`). |
+| `linear_update_issue_state` | Transition a Linear issue to a named workflow state | `LINEAR_API_KEY` | Scoped per-team (state IDs aren't global). Accepts UUID or identifier (e.g. `SAL-2680`). Team-states map cached in-process. |
+| `linear_list_project_issues` | List all issues in a Linear project with labels / estimate / state / relations | `LINEAR_API_KEY` | Paginates `issues(first: 100)`; default cap 250. Orchestrator uses this to build the wave + dependency graph. |
+| `linear_get_issue_relations` | Bucket relations for one issue into blocks / blocked_by / related | `LINEAR_API_KEY` | Unknown relation types fall into `related` so dependency info isn't dropped. |
+
+### Slack bot scopes required
+
+The `slack_post` tool needs `chat:write`. `slack_ack_poll` additionally needs
+**`channels:history`** (to read messages in the target channel) and
+**`users:read.email`** (to resolve an approver's user id via
+`users.lookupByEmail`). These two scopes must be added in the Slack app
+settings for the `SLACK_BOT_TOKEN_ALFRED` bot. After the scope change the
+operator must reinstall the app to the workspace and refresh the bot token.
+The repository does not vendor a Slack app manifest file — scope management
+lives in the Slack app dashboard.
 
 ## Personas
 

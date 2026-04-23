@@ -28,6 +28,8 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -883,6 +885,418 @@ async def http_get(url: str) -> Dict[str, Any]:
     }
 
 
+# ── slack_ack_poll ──────────────────────────────────────────────────────────
+
+SLACK_ACK_POLL_TIMEOUT_SEC = 30.0
+SLACK_ACK_POLL_PAGE_LIMIT = 100
+
+
+async def slack_ack_poll(
+    channel: str,
+    after_ts: str,
+    author_user_id: str,
+    keywords: List[str],
+) -> Dict[str, Any]:
+    """Poll Slack `conversations.history` for an ACK message from one author.
+
+    Returns the FIRST matching message (case-insensitive regex on `keywords`)
+    from `author_user_id` posted after `after_ts`. Paginates via cursor until
+    the full history slice (from `after_ts` forward) is exhausted or a match
+    is found.
+
+    Used by the autonomous_build orchestrator's SS-08 gate: post the claims
+    schema to #batcave, wait for Cristian to reply `ACK SS-08` (or similar),
+    then proceed with dispatch.
+
+    Returns:
+      {"matched": True, "message_ts": "...", "text": "...", "matched_keyword": "..."}
+        on a match, or {"matched": False} if no matching message is found.
+    """
+    token = os.environ.get("SLACK_BOT_TOKEN_ALFRED") or os.environ.get("SLACK_BOT_TOKEN")
+    if not token:
+        return {"error": "SLACK_BOT_TOKEN_ALFRED not configured"}
+    if not channel or not isinstance(channel, str):
+        return {"error": "channel must be a non-empty string"}
+    if not after_ts or not isinstance(after_ts, str):
+        return {"error": "after_ts must be a non-empty string"}
+    if not author_user_id or not isinstance(author_user_id, str):
+        return {"error": "author_user_id must be a non-empty string"}
+    if not isinstance(keywords, list) or not keywords:
+        return {"error": "keywords must be a non-empty list of regex strings"}
+
+    patterns: List[tuple[str, "re.Pattern[str]"]] = []
+    for k in keywords:
+        if not isinstance(k, str) or not k:
+            return {"error": "each keyword must be a non-empty string"}
+        try:
+            patterns.append((k, re.compile(k, re.IGNORECASE)))
+        except re.error as e:
+            return {"error": f"invalid regex {k!r}: {e}"}
+
+    cursor: Optional[str] = None
+    while True:
+        qs = (
+            f"channel={urllib.parse.quote(channel)}"
+            f"&oldest={urllib.parse.quote(after_ts)}"
+            f"&limit={SLACK_ACK_POLL_PAGE_LIMIT}"
+        )
+        if cursor:
+            qs += f"&cursor={urllib.parse.quote(cursor)}"
+        url = f"https://slack.com/api/conversations.history?{qs}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "saluca-alfred/1.0",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=SLACK_ACK_POLL_TIMEOUT_SEC) as r:
+                if r.status != 200:
+                    return {"error": f"slack http {r.status}"}
+                body = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return {"error": f"slack http {e.code}: {e.read().decode(errors='replace')[:300]}"}
+        except Exception as e:
+            return {"error": f"slack transport: {type(e).__name__}: {e}"}
+
+        if not body.get("ok"):
+            return {"error": f"slack {body.get('error', 'unknown')}", "raw": body}
+
+        messages = body.get("messages") or []
+        # Slack returns messages newest-first; iterate oldest-first so the
+        # "first match" is the earliest qualifying reply.
+        for msg in reversed(messages):
+            if msg.get("user") != author_user_id:
+                continue
+            text = msg.get("text") or ""
+            for raw_kw, pat in patterns:
+                if pat.search(text):
+                    return {
+                        "matched": True,
+                        "message_ts": msg.get("ts"),
+                        "text": text,
+                        "matched_keyword": raw_kw,
+                    }
+
+        # Pagination. Slack surfaces `has_more` + `response_metadata.next_cursor`.
+        if not body.get("has_more"):
+            break
+        next_cursor = ((body.get("response_metadata") or {}).get("next_cursor")) or ""
+        if not next_cursor:
+            break
+        cursor = next_cursor
+
+    return {"matched": False}
+
+
+# ── linear_update_issue_state ───────────────────────────────────────────────
+
+# Module-level cache: team_id -> {state_name_lower: state_id}. Linear team
+# state IDs are stable; one lookup per team per process is plenty.
+_LINEAR_TEAM_STATES_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+async def _linear_graphql(
+    query: str,
+    variables: Dict[str, Any],
+    key: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """POST a GraphQL query to Linear. Returns (body, error-string)."""
+    payload = json.dumps({"query": query, "variables": variables}).encode()
+    req = urllib.request.Request(
+        LINEAR_GRAPHQL,
+        data=payload,
+        headers={
+            "Authorization": key,
+            "Content-Type": "application/json",
+            "User-Agent": "saluca-alfred/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            if r.status != 200:
+                return None, f"linear http {r.status}"
+            return json.loads(r.read()), None
+    except urllib.error.HTTPError as e:
+        return None, f"linear http {e.code}: {e.read().decode(errors='replace')[:300]}"
+    except Exception as e:
+        return None, f"linear transport: {type(e).__name__}: {e}"
+
+
+async def _linear_load_team_states(team_id: str, key: str) -> tuple[Dict[str, str], Optional[str]]:
+    """Fetch + cache all workflow states for a Linear team. Returns (map, err)."""
+    cached = _LINEAR_TEAM_STATES_CACHE.get(team_id)
+    if cached is not None:
+        return cached, None
+
+    query = (
+        "query TeamStates($teamId: String!) { "
+        "team(id: $teamId) { id name states { nodes { id name type } } } }"
+    )
+    body, err = await _linear_graphql(query, {"teamId": team_id}, key)
+    if err is not None:
+        return {}, err
+    data = (body or {}).get("data") or {}
+    team = data.get("team") or {}
+    nodes = ((team.get("states") or {}).get("nodes")) or []
+    if not nodes:
+        return {}, f"linear team {team_id!r} has no workflow states"
+    state_map: Dict[str, str] = {}
+    for n in nodes:
+        name = n.get("name")
+        sid = n.get("id")
+        if name and sid:
+            state_map[name.lower()] = sid
+    _LINEAR_TEAM_STATES_CACHE[team_id] = state_map
+    return state_map, None
+
+
+async def linear_update_issue_state(
+    issue_id: str,
+    state_name: str,
+) -> Dict[str, Any]:
+    """Transition a Linear issue to a named workflow state (scoped to its team).
+
+    Looks up the issue's team, resolves `state_name` against that team's
+    workflow states (NOT global — Linear state IDs are per-team), and issues
+    the `issueUpdate` mutation.
+
+    `issue_id` may be either the UUID or the human identifier (e.g. "SAL-2680").
+    Returns `{ok, identifier, state}` on success, or `{error, ...}` on failure.
+    """
+    key = os.environ.get("LINEAR_API_KEY") or os.environ.get("ALFRED_OPS_LINEAR_API_KEY")
+    if not key:
+        return {"error": "LINEAR_API_KEY not configured"}
+    if not issue_id or not isinstance(issue_id, str):
+        return {"error": "issue_id must be a non-empty string"}
+    if not state_name or not isinstance(state_name, str):
+        return {"error": "state_name must be a non-empty string"}
+
+    # 1. Resolve issue -> {id, team.id, identifier}. The `issue(id:)` query
+    # accepts either the UUID or the human identifier directly.
+    issue_query = (
+        "query IssueLookup($id: String!) { "
+        "issue(id: $id) { id identifier team { id } state { name } } }"
+    )
+    body, err = await _linear_graphql(issue_query, {"id": issue_id}, key)
+    if err is not None:
+        return {"error": err}
+    issue = ((body or {}).get("data") or {}).get("issue") or {}
+    if not issue.get("id"):
+        return {"error": f"linear issue {issue_id!r} not found"}
+    uuid = issue["id"]
+    identifier = issue.get("identifier")
+    team_id = (issue.get("team") or {}).get("id")
+    if not team_id:
+        return {"error": "linear issue missing team id"}
+
+    # 2. Resolve state name -> state id (cached per team).
+    state_map, err = await _linear_load_team_states(team_id, key)
+    if err is not None:
+        return {"error": err}
+    state_id = state_map.get(state_name.lower())
+    if not state_id:
+        available = sorted(state_map.keys())
+        return {
+            "error": f"state {state_name!r} not found on team {team_id}",
+            "available_states": available,
+        }
+
+    # 3. Issue the mutation.
+    mutation = (
+        "mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { "
+        "issueUpdate(id: $id, input: $input) "
+        "{ success issue { identifier state { name } } } }"
+    )
+    body, err = await _linear_graphql(
+        mutation,
+        {"id": uuid, "input": {"stateId": state_id}},
+        key,
+    )
+    if err is not None:
+        return {"error": err}
+    result = ((body or {}).get("data") or {}).get("issueUpdate") or {}
+    if not result.get("success"):
+        return {"error": "linear issueUpdate returned success=false", "raw": body}
+    out_issue = result.get("issue") or {}
+    return {
+        "ok": True,
+        "identifier": out_issue.get("identifier") or identifier,
+        "state": (out_issue.get("state") or {}).get("name") or state_name,
+    }
+
+
+# ── linear_list_project_issues ──────────────────────────────────────────────
+
+LINEAR_LIST_PAGE_SIZE = 100
+LINEAR_LIST_DEFAULT_LIMIT = 250
+
+
+async def linear_list_project_issues(
+    project_id: str,
+    limit: int = LINEAR_LIST_DEFAULT_LIMIT,
+) -> Dict[str, Any]:
+    """List all issues in a Linear project with the fields the orchestrator needs.
+
+    Paginates `issues(first: 100, after: $cursor)` until the project is fully
+    drained or the `limit` cap is hit. Returns a top-level dict with the
+    `issues` list so callers can also see `total` + `truncated` at a glance.
+
+    Per-issue shape:
+      {id, identifier, title, labels[], estimate,
+       state: {name},
+       relations: [{type, relatedIssue: {id, identifier}}]}
+    """
+    key = os.environ.get("LINEAR_API_KEY") or os.environ.get("ALFRED_OPS_LINEAR_API_KEY")
+    if not key:
+        return {"error": "LINEAR_API_KEY not configured"}
+    if not project_id or not isinstance(project_id, str):
+        return {"error": "project_id must be a non-empty string"}
+    try:
+        limit_int = int(limit)
+    except (TypeError, ValueError):
+        return {"error": "limit must be an integer"}
+    if limit_int <= 0:
+        return {"error": "limit must be positive"}
+
+    query = (
+        "query ProjectIssues($projectId: String!, $first: Int!, $after: String) { "
+        "project(id: $projectId) { "
+        "id name "
+        "issues(first: $first, after: $after) { "
+        "pageInfo { hasNextPage endCursor } "
+        "nodes { "
+        "id identifier title estimate "
+        "labels { nodes { name } } "
+        "state { name } "
+        "relations { nodes { type relatedIssue { id identifier } } } "
+        "} } } }"
+    )
+
+    out: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    truncated = False
+    while True:
+        page_size = min(LINEAR_LIST_PAGE_SIZE, limit_int - len(out))
+        if page_size <= 0:
+            truncated = True
+            break
+        variables: Dict[str, Any] = {
+            "projectId": project_id,
+            "first": page_size,
+        }
+        if cursor:
+            variables["after"] = cursor
+        body, err = await _linear_graphql(query, variables, key)
+        if err is not None:
+            return {"error": err}
+        project = ((body or {}).get("data") or {}).get("project")
+        if not project:
+            return {"error": f"linear project {project_id!r} not found"}
+        issues = (project.get("issues") or {})
+        nodes = issues.get("nodes") or []
+        for n in nodes:
+            labels = [(lbl.get("name") or "") for lbl in ((n.get("labels") or {}).get("nodes") or [])]
+            relations = [
+                {
+                    "type": r.get("type"),
+                    "relatedIssue": {
+                        "id": ((r.get("relatedIssue") or {}).get("id")),
+                        "identifier": ((r.get("relatedIssue") or {}).get("identifier")),
+                    },
+                }
+                for r in ((n.get("relations") or {}).get("nodes") or [])
+            ]
+            out.append({
+                "id": n.get("id"),
+                "identifier": n.get("identifier"),
+                "title": n.get("title"),
+                "labels": labels,
+                "estimate": n.get("estimate"),
+                "state": {"name": ((n.get("state") or {}).get("name"))},
+                "relations": relations,
+            })
+            if len(out) >= limit_int:
+                break
+        page_info = issues.get("pageInfo") or {}
+        if len(out) >= limit_int:
+            truncated = bool(page_info.get("hasNextPage"))
+            break
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            break
+
+    return {
+        "issues": out,
+        "total": len(out),
+        "truncated": truncated,
+    }
+
+
+# ── linear_get_issue_relations ──────────────────────────────────────────────
+
+# Linear relation types the orchestrator cares about. `blocks` / `blocked_by`
+# are the two sides of the same edge; `related` covers the soft link.
+_RELATION_TYPE_BUCKETS = {
+    "blocks": "blocks",
+    "blocked_by": "blocked_by",
+    "related": "related",
+    "duplicate": "related",
+    "duplicate_of": "related",
+}
+
+
+async def linear_get_issue_relations(issue_id: str) -> Dict[str, Any]:
+    """Fetch the relations for one Linear issue, bucketed by direction.
+
+    Returns `{blocks: [...], blocked_by: [...], related: [...]}` — each list
+    holds the identifiers (e.g. "SAL-2680") of the OTHER side of the edge.
+    Unknown relation types land in `related` so the orchestrator never drops
+    dependency info silently.
+    """
+    key = os.environ.get("LINEAR_API_KEY") or os.environ.get("ALFRED_OPS_LINEAR_API_KEY")
+    if not key:
+        return {"error": "LINEAR_API_KEY not configured"}
+    if not issue_id or not isinstance(issue_id, str):
+        return {"error": "issue_id must be a non-empty string"}
+
+    query = (
+        "query IssueRelations($id: String!) { "
+        "issue(id: $id) { "
+        "id identifier "
+        "relations { nodes { type relatedIssue { id identifier state { name } } } } "
+        "} }"
+    )
+    body, err = await _linear_graphql(query, {"id": issue_id}, key)
+    if err is not None:
+        return {"error": err}
+    issue = ((body or {}).get("data") or {}).get("issue") or {}
+    if not issue.get("id"):
+        return {"error": f"linear issue {issue_id!r} not found"}
+
+    buckets: Dict[str, List[str]] = {"blocks": [], "blocked_by": [], "related": []}
+    for r in ((issue.get("relations") or {}).get("nodes") or []):
+        rtype = (r.get("type") or "").lower()
+        related = r.get("relatedIssue") or {}
+        ident = related.get("identifier")
+        if not ident:
+            continue
+        bucket = _RELATION_TYPE_BUCKETS.get(rtype, "related")
+        buckets[bucket].append(ident)
+
+    return {
+        "identifier": issue.get("identifier"),
+        "blocks": buckets["blocks"],
+        "blocked_by": buckets["blocked_by"],
+        "related": buckets["related"],
+    }
+
+
 # ── Registry ────────────────────────────────────────────────────────────────
 
 BUILTIN_TOOLS: Dict[str, ToolSpec] = {
@@ -1107,6 +1521,118 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=pr_files_get,
+    ),
+    "slack_ack_poll": ToolSpec(
+        name="slack_ack_poll",
+        description=(
+            "Poll a Slack channel for the first message from a specific author "
+            "(after a given timestamp) whose text matches any of the supplied "
+            "regex keywords (case-insensitive). Paginates via cursor. Used by "
+            "the autonomous_build orchestrator's SS-08 gate to wait on a "
+            "Cristian ACK before dispatching sensitive tickets. Requires the "
+            "bot to have `channels:history` scope on the target channel."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Slack channel id (e.g. 'C0ASAKFTR1C' for #batcave).",
+                },
+                "after_ts": {
+                    "type": "string",
+                    "description": "Only consider messages posted after this Slack ts (unix float as string).",
+                },
+                "author_user_id": {
+                    "type": "string",
+                    "description": "Slack user id of the approver (resolved via users.lookupByEmail).",
+                },
+                "keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Regex patterns; matched case-insensitive against message text.",
+                },
+            },
+            "required": ["channel", "after_ts", "author_user_id", "keywords"],
+            "additionalProperties": False,
+        },
+        handler=slack_ack_poll,
+    ),
+    "linear_update_issue_state": ToolSpec(
+        name="linear_update_issue_state",
+        description=(
+            "Transition a Linear issue to a named workflow state (scoped to the "
+            "issue's team). Looks up the issue's team, resolves the state name "
+            "against that team's states (Backlog / Todo / In Progress / In "
+            "Review / Done / Canceled / Duplicate — whatever the team has), "
+            "then issues the `issueUpdate` mutation. `issue_id` accepts either "
+            "the UUID or the human identifier (e.g. 'SAL-2680')."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "Linear issue UUID or identifier (e.g. 'SAL-2680').",
+                },
+                "state_name": {
+                    "type": "string",
+                    "description": "Target workflow state name (case-insensitive).",
+                },
+            },
+            "required": ["issue_id", "state_name"],
+            "additionalProperties": False,
+        },
+        handler=linear_update_issue_state,
+    ),
+    "linear_list_project_issues": ToolSpec(
+        name="linear_list_project_issues",
+        description=(
+            "List all issues in a Linear project. Paginates `issues(first: 100)` "
+            "until drained or `limit` is reached. Returns each issue with "
+            "{id, identifier, title, labels, estimate, state, relations}. "
+            "Used by the autonomous_build orchestrator to build the wave + "
+            "dependency graph up-front."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Linear project UUID.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of issues to return (default 250).",
+                    "minimum": 1,
+                },
+            },
+            "required": ["project_id"],
+            "additionalProperties": False,
+        },
+        handler=linear_list_project_issues,
+    ),
+    "linear_get_issue_relations": ToolSpec(
+        name="linear_get_issue_relations",
+        description=(
+            "Fetch the relations for one Linear issue, bucketed by direction. "
+            "Returns {identifier, blocks: [...], blocked_by: [...], related: [...]} "
+            "where each list holds identifiers of the OTHER side of the edge. "
+            "Unknown relation types fall into `related` so dependency info is "
+            "never dropped silently."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "Linear issue UUID or identifier (e.g. 'SAL-2680').",
+                },
+            },
+            "required": ["issue_id"],
+            "additionalProperties": False,
+        },
+        handler=linear_get_issue_relations,
     ),
 }
 
