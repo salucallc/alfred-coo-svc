@@ -1,5 +1,6 @@
-# Caddyfile for Mission Control Appliance (SAL-2558)
-# Routes internal services under a single hostname with path-based routing
+# Caddyfile for Mission Control Appliance
+# Routes internal services under a single hostname with path-based routing.
+# MCP services are routed per-service; /soul/* → soul-svc; /chat/* → open-webui.
 
 {$APPLIANCE_HOSTNAME:localhost} {
 
@@ -12,9 +13,24 @@
     reverse_proxy soul-svc:8080
   }
 
-  handle /mcp/* {
-    uri strip_prefix /mcp
-    reverse_proxy mcp-gateway:8000
+  handle /mcp/github/* {
+    uri strip_prefix /mcp/github
+    reverse_proxy mcp-github:8203
+  }
+
+  handle /mcp/slack/* {
+    uri strip_prefix /mcp/slack
+    reverse_proxy mcp-slack:8201
+  }
+
+  handle /mcp/linear/* {
+    uri strip_prefix /mcp/linear
+    reverse_proxy mcp-linear:8208
+  }
+
+  handle /mcp/notion/* {
+    uri strip_prefix /mcp/notion
+    reverse_proxy mcp-notion:8212
   }
 
   handle /chat/* {
