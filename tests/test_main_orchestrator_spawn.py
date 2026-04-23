@@ -87,10 +87,12 @@ def _make_persona(handler_name: str) -> Persona:
 
 @pytest.fixture(autouse=True)
 def _clear_orchestrator_registry():
-    """Each test starts with a clean `_running_orchestrators` + FakeHandler
-    instance list. Prevents cross-test leakage since the registry is a
-    module-level dict."""
+    """Each test starts with a clean `_running_orchestrators`,
+    `_orchestrators_by_project`, and FakeHandler instance list. Prevents
+    cross-test leakage since the registries are module-level dicts."""
     main_mod._running_orchestrators.clear()
+    # AB-09: also reset the project-slot registry.
+    main_mod._orchestrators_by_project.clear()
     _FakeOrchestrator.instances.clear()
     yield
     # Cancel any lingering tasks so pytest doesn't warn about them.
@@ -98,6 +100,7 @@ def _clear_orchestrator_registry():
         if not t.done():
             t.cancel()
     main_mod._running_orchestrators.clear()
+    main_mod._orchestrators_by_project.clear()
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────
@@ -269,3 +272,207 @@ async def test_resolve_handler_prefers_first_module_match(monkeypatch):
 
     cls = main_mod._resolve_handler("Target")
     assert cls is Target
+
+
+# ── AB-09: zombie orchestrator spawn guard (Layer 2) ────────────────────────
+
+
+def _kickoff_task(task_id: str, project_id: str | None, title: str = "kickoff") -> dict:
+    """Build a kickoff mesh task with a JSON description carrying the
+    linear_project_id (or no description if project_id is None)."""
+    if project_id is None:
+        desc = ""
+    else:
+        import json as _json
+        desc = _json.dumps({"linear_project_id": project_id})
+    return {
+        "id": task_id,
+        "title": f"[persona:autonomous-build-a] {title}",
+        "description": desc,
+    }
+
+
+async def test_duplicate_kickoff_same_project_fails_new(monkeypatch):
+    """AB-09: a second kickoff for the same linear_project_id while the
+    first orchestrator is still running must be rejected with a
+    `duplicate_kickoff` error, and `_running_orchestrators` must still
+    only contain the original task."""
+
+    class _NeverEndingOrchestrator:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self):
+            await asyncio.sleep(60)
+
+    _install_fake_handler_module(
+        monkeypatch, _NeverEndingOrchestrator, attr_name="NeverEnding"
+    )
+    mesh = _FakeMesh()
+    persona = _make_persona("NeverEnding")
+
+    # First kickoff spawns normally.
+    t1 = _kickoff_task("T1", "P")
+    spawned1 = await main_mod._spawn_long_running_handler(
+        task=t1, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    )
+    assert spawned1 is True
+    assert "T1" in main_mod._running_orchestrators
+    assert main_mod._orchestrators_by_project["P"] == "T1"
+    assert mesh.completions == []
+
+    # Second kickoff for the same project must be rejected.
+    t2 = _kickoff_task("T2", "P")
+    spawned2 = await main_mod._spawn_long_running_handler(
+        task=t2, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    )
+
+    assert spawned2 is False
+    # T2 must NOT have been stashed — only T1 should be in the registry.
+    assert "T2" not in main_mod._running_orchestrators
+    assert list(main_mod._running_orchestrators.keys()) == ["T1"]
+    # Project slot still owned by T1.
+    assert main_mod._orchestrators_by_project["P"] == "T1"
+    # mesh.complete was called exactly once, marking T2 failed with the
+    # duplicate_kickoff error.
+    assert len(mesh.completions) == 1
+    dup = mesh.completions[0]
+    assert dup["task_id"] == "T2"
+    assert dup["status"] == "failed"
+    assert "duplicate_kickoff" in dup["result"]["error"]
+    assert "T1" in dup["result"]["error"]
+    assert "P" in dup["result"]["error"]
+
+
+async def test_different_projects_both_spawn(monkeypatch):
+    """AB-09: two kickoffs for two different projects must both spawn —
+    the guard is scoped per linear_project_id, not global."""
+
+    class _NeverEndingOrchestrator:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self):
+            await asyncio.sleep(60)
+
+    _install_fake_handler_module(
+        monkeypatch, _NeverEndingOrchestrator, attr_name="NeverEnding"
+    )
+    mesh = _FakeMesh()
+    persona = _make_persona("NeverEnding")
+
+    t1 = _kickoff_task("T1", "P1")
+    t2 = _kickoff_task("T2", "P2")
+
+    assert await main_mod._spawn_long_running_handler(
+        task=t1, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    ) is True
+    assert await main_mod._spawn_long_running_handler(
+        task=t2, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    ) is True
+
+    assert "T1" in main_mod._running_orchestrators
+    assert "T2" in main_mod._running_orchestrators
+    assert main_mod._orchestrators_by_project == {"P1": "T1", "P2": "T2"}
+    assert mesh.completions == []
+
+
+async def test_completion_clears_project_slot(monkeypatch):
+    """AB-09: when an orchestrator task finishes (any terminal state), the
+    done_callback must clear the project slot so a subsequent kickoff for
+    the same project is allowed to spawn."""
+    _install_fake_handler_module(monkeypatch, _FakeOrchestrator)
+    mesh = _FakeMesh()
+    persona = _make_persona("FakeHandler")
+
+    t1 = _kickoff_task("T1", "P")
+    assert await main_mod._spawn_long_running_handler(
+        task=t1, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    ) is True
+    assert main_mod._orchestrators_by_project["P"] == "T1"
+
+    # _FakeOrchestrator.run() is `await asyncio.sleep(0)` — it completes
+    # almost immediately. Await the task to drive it to done, then yield
+    # once more so the done_callback fires.
+    stashed = main_mod._running_orchestrators["T1"]
+    await stashed
+    # Yield to let add_done_callback scheduling flush.
+    await asyncio.sleep(0)
+
+    assert main_mod._orchestrators_by_project.get("P") is None
+
+    # A fresh kickoff for the same project should now spawn cleanly.
+    t2 = _kickoff_task("T2", "P")
+    spawned2 = await main_mod._spawn_long_running_handler(
+        task=t2, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    )
+    assert spawned2 is True
+    assert main_mod._orchestrators_by_project["P"] == "T2"
+    # No duplicate error completions.
+    assert mesh.completions == []
+    await main_mod._running_orchestrators["T2"]
+
+
+async def test_payload_without_project_id_still_spawns(monkeypatch):
+    """AB-09: a kickoff whose description has no linear_project_id (e.g. a
+    literal empty-object JSON payload) must still spawn — the guard only
+    activates when we can identify the project. Falls back to the pre-AB-09
+    per-task-id tracking."""
+    _install_fake_handler_module(monkeypatch, _FakeOrchestrator)
+    mesh = _FakeMesh()
+    persona = _make_persona("FakeHandler")
+
+    task = {
+        "id": "T-no-pid",
+        "title": "[persona:autonomous-build-a] kickoff",
+        "description": "{}",  # valid JSON, but no linear_project_id key
+    }
+
+    spawned = await main_mod._spawn_long_running_handler(
+        task=task, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    )
+    assert spawned is True
+    assert "T-no-pid" in main_mod._running_orchestrators
+    # No duplicate_kickoff completion was emitted.
+    assert not any(
+        (c.get("result") or {}).get("error", "").startswith("duplicate_kickoff")
+        for c in mesh.completions
+    )
+    # Project registry stays empty because no id was extractable.
+    assert main_mod._orchestrators_by_project == {}
+    await main_mod._running_orchestrators["T-no-pid"]
+
+
+def test_peek_kickoff_project_id_handles_non_json_desc():
+    """AB-09: `_peek_kickoff_project_id` must never raise on a malformed
+    description (markdown, plain text, truncated JSON, etc.). It returns
+    None so the spawn path falls back to pre-AB-09 behavior."""
+    # Markdown-ish prose, not JSON.
+    assert main_mod._peek_kickoff_project_id(
+        {"id": "X", "description": "# Kickoff\n\nHello there."}
+    ) is None
+    # Empty description.
+    assert main_mod._peek_kickoff_project_id(
+        {"id": "X", "description": ""}
+    ) is None
+    # Missing description key entirely.
+    assert main_mod._peek_kickoff_project_id({"id": "X"}) is None
+    # JSON array at top level (not a dict) — should not explode.
+    assert main_mod._peek_kickoff_project_id(
+        {"id": "X", "description": '["not", "a", "dict"]'}
+    ) is None
+    # Truncated / invalid JSON.
+    assert main_mod._peek_kickoff_project_id(
+        {"id": "X", "description": '{"linear_project_id": "P"'}
+    ) is None
+    # Happy path: valid JSON with the key.
+    assert main_mod._peek_kickoff_project_id(
+        {"id": "X", "description": '{"linear_project_id": "P-OK"}'}
+    ) == "P-OK"
