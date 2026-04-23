@@ -1,0 +1,92 @@
+version: '3.8'
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    networks:
+      - mc-ops
+    volumes:
+      - otel-collector-config:/etc/otel-collector-config
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    networks:
+      - mc-ops
+    volumes:
+      - prometheus-data:/prometheus
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+  loki:
+    image: grafana/loki:3.3.2
+    networks:
+      - mc-ops
+    volumes:
+      - loki-data:/loki
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    networks:
+      - mc-ops
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+  caddy:
+    image: caddy:2-alpine
+    networks:
+      - mc-main
+      - mc-ops
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+    ports:
+      - "80:80"
+      - "443:443"
+  soul-svc:
+    build: .
+    networks:
+      - mc-main
+      - mc-ops
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+  tiresias:
+    image: salucallc/tiresias:v1.0.0
+    networks:
+      - mc-main
+      - mc-ops
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+  alfred-coo:
+    build: .
+    networks:
+      - mc-main
+      - mc-ops
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+  portal:
+    build:
+      context: ./portal
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+    networks:
+      - mc-main
+      - mc-ops
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+networks:
+  mc-main:
+    driver: bridge
+  mc-ops:
+    driver: bridge
+volumes:
+  caddy_data:
+    driver: local
+  prometheus-data:
+    driver: local
+  loki-data:
+    driver: local
+  grafana-data:
+    driver: local
+  otel-collector-config:
+    driver: local
