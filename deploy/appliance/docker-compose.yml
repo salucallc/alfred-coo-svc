@@ -68,7 +68,7 @@ services:
     volumes:
       - soul_data:/var/lib/soul-svc
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/v1/healthz"]
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8080/v1/healthz\", timeout=3).status == 200 else 1)"]
       interval: 15s
       timeout: 3s
       retries: 5
