@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from .budget import BudgetTracker, make_tracker
 from .cadence import SlackCadence
+from .dry_run import maybe_apply_dry_run
 from .graph import (
     TERMINAL_STATES,
     Ticket,
@@ -139,6 +140,12 @@ class AutonomousBuildOrchestrator:
         self._last_completed_records: List[Dict[str, Any]] = []
         # Overridable via payload (for tests that want a shorter threshold).
         self.stall_threshold_sec: int = DEFAULT_STALL_THRESHOLD_SEC
+
+        # AB-07: if AUTONOMOUS_BUILD_DRY_RUN is set, swap mesh/slack/linear
+        # clients for the in-process DryRunAdapter. The returned adapter (if
+        # any) is stashed on the instance as `self._dry_run_adapter` by
+        # `apply_dry_run` so tests + operators can inspect it.
+        self._dry_run_adapter = maybe_apply_dry_run(self)
 
     # ── public entry point ─────────────────────────────────────────────────
 
@@ -277,6 +284,12 @@ class AutonomousBuildOrchestrator:
             channel=slack_channel,
             interval_minutes=self.status_cadence_min,
         )
+
+        # AB-07: dry-run mode rebuilds slack wiring on cadence reconstruction.
+        # Re-bind the adapter's slack_post fn so the new cadence points at
+        # the in-process stub instead of the BUILTIN_TOOLS resolver.
+        if self._dry_run_adapter is not None:
+            self.cadence._slack_post_fn = self._dry_run_adapter.slack_post
 
         logger.info(
             "parsed kickoff payload: project=%s budget=$%.2f "
