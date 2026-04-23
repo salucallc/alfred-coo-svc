@@ -416,6 +416,90 @@ async def propose_pr(
     }
 
 
+# ── pr_review ───────────────────────────────────────────────────────────────
+
+_PR_REVIEW_EVENTS = frozenset({"APPROVE", "REQUEST_CHANGES", "COMMENT"})
+
+
+async def pr_review(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    event: str,
+    body: str,
+    line_comments: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Submit a pull-request review on a Saluca-owned repo.
+
+    Posts to https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews
+    with {body, event, comments}. `event` must be one of APPROVE,
+    REQUEST_CHANGES, or COMMENT. `line_comments` is an optional list of
+    {"path", "line", "body"} dicts (GitHub review-comment schema). Returns
+    {review_id, state, submitted_at, html_url} on success.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return {"error": "GITHUB_TOKEN not configured"}
+    if owner not in _ALLOWED_ORGS:
+        return {"error": f"owner {owner!r} not in allowlist {sorted(_ALLOWED_ORGS)}"}
+    if not _VALID_OWNER_RE.match(owner):
+        return {"error": "invalid owner name"}
+    if not _VALID_REPO_RE.match(repo):
+        return {"error": "invalid repo name"}
+    if event not in _PR_REVIEW_EVENTS:
+        return {"error": f"event {event!r} not in {sorted(_PR_REVIEW_EVENTS)}"}
+    try:
+        pr_num = int(pr_number)
+    except (TypeError, ValueError):
+        return {"error": "pr_number must be an integer"}
+    if pr_num <= 0:
+        return {"error": "pr_number must be positive"}
+
+    comments = line_comments or []
+    if not isinstance(comments, list):
+        return {"error": "line_comments must be a list"}
+    for c in comments:
+        if not isinstance(c, dict):
+            return {"error": "each line_comment must be a dict"}
+        if not all(k in c for k in ("path", "line", "body")):
+            return {"error": "each line_comment must have 'path', 'line', 'body'"}
+
+    payload = json.dumps({
+        "body": body or "",
+        "event": event,
+        "comments": comments,
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/reviews",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {
+            "error": f"github reviews http {e.code}",
+            "response": e.read().decode()[:500],
+        }
+    except Exception as e:
+        return {"error": f"github api transport: {type(e).__name__}: {e}"}
+
+    return {
+        "review_id": resp.get("id"),
+        "state": resp.get("state"),
+        "submitted_at": resp.get("submitted_at"),
+        "html_url": resp.get("html_url"),
+    }
+
+
 # ── http_get ────────────────────────────────────────────────────────────────
 
 # Maximum body bytes we'll read into a tool result. Larger responses are
@@ -596,8 +680,9 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
         name="mesh_task_create",
         description=(
             "Create a new mesh task that any daemon persona can claim. Use to "
-            "fan out work to specialist personas (e.g. delegate a PQ review to "
-            "mr-terrific-a, or a revenue question to revenue-pm). The `persona` "
+            "fan out work to specialist personas (e.g. delegate a PQ/crypto "
+            "review to riddler-crypto-a, a revenue question to maxwell-lord-a, "
+            "or a PR-level QA sweep to hawkman-qa-a). The `persona` "
             "argument routes the task; tags are optional free-form labels."
         ),
         parameters={
@@ -607,7 +692,7 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
                 "description": {"type": "string", "description": "Full task description + context"},
                 "persona": {
                     "type": "string",
-                    "description": "Persona to route the task to (e.g. 'mr-terrific-a', 'revenue-pm'). Optional.",
+                    "description": "Persona to route the task to (e.g. 'riddler-crypto-a', 'maxwell-lord-a', 'hawkman-qa-a'). Optional.",
                 },
                 "tags": {
                     "type": "array",
@@ -682,6 +767,58 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=propose_pr,
+    ),
+    "pr_review": ToolSpec(
+        name="pr_review",
+        description=(
+            "Submit a pull-request review on a Saluca-owned repo. Posts "
+            "to the GitHub reviews endpoint with an event of APPROVE, "
+            "REQUEST_CHANGES, or COMMENT, an overall body, and optional "
+            "inline line comments. Only Saluca-owned orgs are allowed "
+            "(salucallc, saluca-labs, cristianxruvalcaba-coder). Use this "
+            "for QA/security verifier personas that review code they did "
+            "not build."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "owner": {
+                    "type": "string",
+                    "description": "GitHub org/user. Must be salucallc, saluca-labs, or cristianxruvalcaba-coder.",
+                },
+                "repo": {"type": "string", "description": "Repo name"},
+                "pr_number": {
+                    "type": "integer",
+                    "description": "Pull request number (positive integer).",
+                },
+                "event": {
+                    "type": "string",
+                    "description": "Review verdict.",
+                    "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"],
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Overall review body (markdown).",
+                },
+                "line_comments": {
+                    "type": "array",
+                    "description": "Optional inline comments. Each item: {path, line, body}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "line": {"type": "integer"},
+                            "body": {"type": "string"},
+                        },
+                        "required": ["path", "line", "body"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["owner", "repo", "pr_number", "event", "body"],
+            "additionalProperties": False,
+        },
+        handler=pr_review,
     ),
 }
 

@@ -27,11 +27,11 @@ def test_legacy_alias_resolves_to_alfred_coo_a():
     assert a is b
 
 
-def test_mr_terrific_a_has_pq_topics():
+def test_mr_terrific_a_no_longer_resolves():
+    """Phase B.3.5: mr-terrific-a removed. Canonical DC_ORG_MAP assigns
+    Mr. Terrific to VP Product; crypto work lives with riddler-crypto-a."""
     p = get_persona("mr-terrific-a")
-    assert p.name == "mr-terrific-a"
-    assert "pq" in p.topics
-    assert "security" in p.topics
+    assert p.name == "default"
 
 
 def test_all_personas_have_fallback_distinct_from_preferred():
@@ -44,7 +44,14 @@ def test_all_personas_have_fallback_distinct_from_preferred():
 
 
 def test_all_pm_personas_have_topics():
-    for name in ("innovation-pm", "revenue-pm", "ventures-pm", "investment-pm", "operations-pm"):
+    """Phase B.3.5: PM-role personas renamed to canonical DC characters."""
+    for name in (
+        "maxwell-lord-a",
+        "starfire-ventures-a",
+        "lucius-fox-a",
+        "sawyer-ops-a",
+        "red-robin-a",
+    ):
         p = get_persona(name)
         assert p.name == name, f"{name} did not resolve"
         assert p.topics, f"{name} has empty topics list"
@@ -62,3 +69,37 @@ def test_default_persona_has_no_tools():
     """Safety: default persona must NOT auto-invoke tools."""
     p = get_persona("default")
     assert p.tools == []
+
+
+def test_riddler_crypto_has_five_tools():
+    """B.3.5: riddler-crypto-a replaces mr-terrific-a and carries the full
+    builder toolchain for PQ/crypto work."""
+    p = get_persona("riddler-crypto-a")
+    assert p.name == "riddler-crypto-a"
+    expected = {"linear_create_issue", "slack_post", "mesh_task_create", "propose_pr", "http_get"}
+    assert set(p.tools) == expected, f"riddler-crypto-a tools mismatch: {p.tools}"
+    assert len(p.tools) == 5
+
+
+def test_hawkman_qa_has_pr_review():
+    """B.3.5: hawkman-qa-a is an independent verifier — pr_review is required."""
+    p = get_persona("hawkman-qa-a")
+    assert p.name == "hawkman-qa-a"
+    assert "pr_review" in p.tools
+
+
+def test_batgirl_sec_has_pr_review():
+    """B.3.5: batgirl-sec-a is an independent security verifier — pr_review is required."""
+    p = get_persona("batgirl-sec-a")
+    assert p.name == "batgirl-sec-a"
+    assert "pr_review" in p.tools
+
+
+def test_batman_and_steel_are_advisory():
+    """B.3.5: CISO and CTO are advisory only — Slack + Linear, no code-write tools."""
+    for name in ("batman-ciso-a", "steel-cto-a"):
+        p = get_persona(name)
+        assert p.name == name, f"{name} did not resolve"
+        assert p.tools == ["slack_post", "linear_create_issue"], (
+            f"{name} should be advisory-only; got tools={p.tools}"
+        )

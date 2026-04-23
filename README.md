@@ -19,19 +19,24 @@ Headless COO daemon that claims tasks from the Saluca mesh, routes them by perso
 | `mesh_task_create` | Queue new mesh task for another persona | `SOUL_API_KEY` | Prepends `[persona:<name>]` + free-form tags to the title so the daemon parser routes on claim. |
 | `propose_pr` | Atomic clone → branch → commit → push → open PR | `GITHUB_TOKEN` | Org allowlist: `salucallc`, `saluca-labs`, `cristianxruvalcaba-coder`. Uses GitHub REST API directly (no `gh` CLI dependency). Workspaces keyed by task_id via ContextVar. |
 | `http_get` | Allowlisted read-only GET | none | 256 KB cap; text/json/xml/yaml only; hosts: Saluca GitHub paths, `*.saluca.com`, `*.tiresias.network`, `*.asphodel.ai`, arxiv, canonical docs. |
+| `pr_review` | Submit PR review (APPROVE / REQUEST_CHANGES / COMMENT) | `GITHUB_TOKEN` | Org allowlist (same as `propose_pr`). Supports overall body + optional inline line comments. Used by verifier personas (`hawkman-qa-a`, `batgirl-sec-a`) that review code they did not build. |
 
 ## Personas
 
 | Name | Preferred | Fallback | Tools | Topics |
 |---|---|---|---|---|
 | `default` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | (none) |
-| `alfred-coo-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | all five | coo-daemon, unified-plan, gap-closure, mission-control, autonomous-ops |
-| `mr-terrific-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | (none) | pq, sovereign-pq, security, karolin-sovereign-pq, crypto |
-| `innovation-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | twin-rho, mnemosyne, hypnos, ahi, innovation, research |
-| `revenue-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | stripe, pricing, onboarding, revenue, funnel, billing |
-| `ventures-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | impulse, ventures, arb-bot, trading |
-| `investment-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | patent, fundraising, investor, investment, ip |
-| `operations-pm` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | audit, pipeline, operations, deploy, runbook |
+| `alfred-coo-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | linear, slack, mesh, propose_pr, http_get | coo-daemon, unified-plan, gap-closure, mission-control, autonomous-ops |
+| `riddler-crypto-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | linear, slack, mesh, propose_pr, http_get | pq, sovereign-pq, crypto, karolin-sovereign-pq, cryptography, ciphers |
+| `hawkman-qa-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | http_get, pr_review, slack, linear | qa, test, coverage, acceptance-criteria, regression, verification |
+| `batgirl-sec-a` | `qwen3-coder:480b-cloud` | `deepseek-v3.2:cloud` | http_get, pr_review, slack, linear | security, attack-vector, zero-trust, pr-review, code-review, allowlist |
+| `batman-ciso-a` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | slack, linear | ciso, security-architecture, threat-model, red-team, siem, incident-response |
+| `steel-cto-a` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | slack, linear | cto, engineering, architecture, roadmap, platform |
+| `maxwell-lord-a` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | stripe, pricing, onboarding, revenue, funnel, billing, sales |
+| `starfire-ventures-a` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | impulse, ventures, arb-bot, trading, market-research |
+| `lucius-fox-a` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | patent, fundraising, investor, investment, ip, finance, cfo |
+| `sawyer-ops-a` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | audit, pipeline, operations, deploy, runbook, compliance, privacy |
+| `red-robin-a` | `deepseek-v3.2:cloud` | `qwen3-coder:480b-cloud` | (none) | twin-rho, mnemosyne, hypnos, ahi, innovation, research, r-and-d |
 
 `alfred-coo-a` prefers `qwen3-coder:480b-cloud` (deepseek as fallback) because `deepseek-v3.2:cloud` intermittently emits Anthropic-style `<function_calls>` XML in the content field instead of the OpenAI `tool_calls` field once the tool schema exceeds ~4 tools. See the comment above the persona definition and `reference_deepseek_tool_use_quirk.md` in soul memory.
 
