@@ -52,3 +52,8 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "smoke: end-to-end dry-run smoke tests (opt-in; run via `pytest -m smoke`)",
+]
+# Regular `pytest` runs skip the smoke tests; opt in with `-m smoke`.
+addopts = "-m 'not smoke'"
