@@ -28,6 +28,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from .budget import BudgetTracker, make_tracker
+from .cadence import SlackCadence
 from .graph import (
     TERMINAL_STATES,
     Ticket,
@@ -57,6 +59,13 @@ DEFAULT_POLL_SLEEP_SEC = 45
 # is merged_green and no critical-path failures, the wave is allowed to
 # close with a Slack warning. Critical-path failures always hard-halt.
 SOFT_GREEN_THRESHOLD = 0.9
+
+# Default: a critical-path ticket stuck in-flight for >30 min triggers
+# a Slack stall ping. Overridable by the payload for tests / tuning.
+DEFAULT_STALL_THRESHOLD_SEC = 30 * 60
+
+# Default Slack channel for the cadence poster if the payload omits it.
+DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
 
 class AutonomousBuildOrchestrator:
@@ -107,6 +116,29 @@ class AutonomousBuildOrchestrator:
         # whole graph path).
         self._list_project_issues = None
         self._get_issue_relations = None
+
+        # AB-05: budget tracking + Slack cadence + stall watcher.
+        # Constructed with defaults here; `_parse_payload` replaces them
+        # with payload-configured instances once the kickoff JSON is parsed.
+        self.budget_tracker: BudgetTracker = BudgetTracker(max_usd=self.budget_usd)
+        self.cadence: SlackCadence = SlackCadence(
+            channel=DEFAULT_STATUS_CHANNEL,
+            interval_minutes=self.status_cadence_min,
+        )
+        self._drain_mode: bool = False
+        # Map ticket UUID -> UNIX ts of the last orchestrator-observed
+        # status transition. Used by `_stall_watcher` to decide whether a
+        # critical-path ticket has been stuck too long.
+        self._ticket_transition_ts: Dict[str, float] = {}
+        # Tracks which CP stall warnings have already fired so a single
+        # stall event doesn't post on every dispatch loop iteration.
+        self._stall_pinged: Dict[str, float] = {}
+        # Last batch of completed mesh-task records from `_poll_children`;
+        # read by `_check_budget` to tally token spend without re-querying
+        # the mesh.
+        self._last_completed_records: List[Dict[str, Any]] = []
+        # Overridable via payload (for tests that want a shorter threshold).
+        self.stall_threshold_sec: int = DEFAULT_STALL_THRESHOLD_SEC
 
     # ── public entry point ─────────────────────────────────────────────────
 
@@ -218,20 +250,45 @@ class AutonomousBuildOrchestrator:
             )
         except (TypeError, ValueError):
             self.status_cadence_min = DEFAULT_STATUS_CADENCE_MIN
+        slack_channel = str(
+            status_cadence.get("slack_channel")
+            or payload.get("slack_channel")
+            or DEFAULT_STATUS_CHANNEL
+        ).strip() or DEFAULT_STATUS_CHANNEL
+
+        # Stall threshold (optional).
+        stall_override = status_cadence.get("stall_threshold_sec")
+        if stall_override is not None:
+            try:
+                self.stall_threshold_sec = int(stall_override)
+            except (TypeError, ValueError):
+                self.stall_threshold_sec = DEFAULT_STALL_THRESHOLD_SEC
 
         # Wave order.
         wave_order = payload.get("wave_order")
         if isinstance(wave_order, list) and wave_order:
             self.wave_order = [int(w) for w in wave_order if isinstance(w, (int, str))]
 
+        # AB-05: build the payload-configured tracker + cadence. Keep the
+        # previously-constructed defaults if the payload omits a field so
+        # tests that hand-roll an orchestrator still get usable instances.
+        self.budget_tracker = make_tracker(payload.get("budget"))
+        self.cadence = SlackCadence(
+            channel=slack_channel,
+            interval_minutes=self.status_cadence_min,
+        )
+
         logger.info(
             "parsed kickoff payload: project=%s budget=$%.2f "
-            "max_parallel_subs=%d per_epic_cap=%d waves=%s",
+            "max_parallel_subs=%d per_epic_cap=%d waves=%s "
+            "cadence=%dmin channel=%s",
             self.linear_project_id,
             self.budget_usd,
             self.max_parallel_subs,
             self.per_epic_cap,
             self.wave_order,
+            self.status_cadence_min,
+            slack_channel,
         )
 
     # ── graph build ─────────────────────────────────────────────────────────
@@ -294,10 +351,20 @@ class AutonomousBuildOrchestrator:
 
     def _snapshot_graph_into_state(self) -> None:
         """Copy current ticket statuses + child ids onto `self.state` before
-        we checkpoint. Keeps the state snapshot authoritative without
-        duplicating bookkeeping in the hot path."""
+        we checkpoint. Also bumps `_ticket_transition_ts` for tickets whose
+        status changed since the last snapshot so AB-05's stall watcher can
+        measure time-in-state on the critical path.
+        """
+        now = time.time()
         for uuid, ticket in self.graph.nodes.items():
-            self.state.ticket_status[uuid] = ticket.status.value
+            prior = self.state.ticket_status.get(uuid)
+            current = ticket.status.value
+            if prior != current:
+                self._ticket_transition_ts[uuid] = now
+            # Seed transition_ts for first-seen tickets so a stall watcher
+            # after a fresh restart has a reference point.
+            self._ticket_transition_ts.setdefault(uuid, now)
+            self.state.ticket_status[uuid] = current
             if ticket.child_task_id:
                 self.state.dispatched_child_tasks[uuid] = ticket.child_task_id
             if ticket.pr_url:
@@ -322,6 +389,13 @@ class AutonomousBuildOrchestrator:
 
             # ── dispatch within caps ────────────────────────────────────
             for ticket in ready:
+                # AB-05: in drain mode we let in-flight work finish but
+                # stop selecting new children. `break` (not `continue`)
+                # because the ready list is sorted critical-path first;
+                # bailing early preserves the priority ordering if/when
+                # drain is cleared.
+                if self._drain_mode:
+                    break
                 if len(in_flight) >= self.max_parallel_subs:
                     break
                 if self._epic_in_flight(ticket.epic, in_flight) >= self.per_epic_cap:
@@ -347,8 +421,12 @@ class AutonomousBuildOrchestrator:
                 logger.exception("poll_children failed; will retry next tick")
 
             # ── periodic hooks ──────────────────────────────────────────
-            await self._status_tick()
             await self._check_budget()
+            await self._status_tick()
+            try:
+                await self._stall_watcher()
+            except Exception:
+                logger.exception("stall_watcher failed; continuing")
 
             # ── snapshot + checkpoint ───────────────────────────────────
             self._snapshot_graph_into_state()
@@ -530,6 +608,15 @@ class AutonomousBuildOrchestrator:
             logger.exception("mesh.list_tasks(completed) failed")
             return []
         by_id = {c.get("id"): c for c in (completed or []) if isinstance(c, dict)}
+        # AB-05: expose the raw completed records for `_check_budget` to
+        # walk without re-querying the mesh. We stash only the records that
+        # correspond to tickets we actually dispatched (avoids double-
+        # counting unrelated completed tasks sharing the mesh bus).
+        self._last_completed_records = [
+            by_id[t.child_task_id]
+            for t in in_flight
+            if t.child_task_id in by_id
+        ]
 
         updated: List[Ticket] = []
         for ticket in in_flight:
@@ -762,8 +849,12 @@ class AutonomousBuildOrchestrator:
     # ── stubs for later AB tickets ──────────────────────────────────────────
 
     async def _status_tick(self) -> None:
-        """Rate-limited status log + (AB-05) Slack post. In AB-04 we only
-        log — the Slack post lands in AB-05 once `cadence.py` exists."""
+        """Rate-limited status log + Slack cadence post (AB-05).
+
+        The log line mirrors the AB-04 format so operational `grep` works
+        the same; the Slack post is delegated to `SlackCadence.tick`,
+        which applies its own rate limit (matches `status_cadence_min`).
+        """
         now = time.time()
         interval_sec = max(60, self.status_cadence_min * 60)
         if now - self._last_cadence_ts < interval_sec:
@@ -781,23 +872,145 @@ class AutonomousBuildOrchestrator:
             self.state.cumulative_spend_usd,
             self.budget_usd,
         )
+        try:
+            await self.cadence.tick(
+                self.state, self.graph, self.budget_tracker.status()
+            )
+        except Exception:
+            logger.exception("SlackCadence.tick failed; continuing")
 
     async def _check_budget(self) -> None:
-        """AB-05 fills in the arithmetic (token aggregation → USD). AB-04
-        ships a no-op so the call site is stable.
+        """AB-05: aggregate token spend from the last poll batch, update
+        `state.cumulative_spend_usd`, and trigger warn / hard-stop Slack
+        posts at the configured thresholds.
 
-        Contract for AB-05:
-          - Read per-child `result.tokens.{in,out}` + `result.model` off
-            completed mesh tasks (same list already fetched in
-            `_poll_children`).
-          - Accumulate into `self.state.cumulative_spend_usd`.
-          - When > 80% of `self.budget_usd`, post Slack warn.
-          - When ≥ `self.budget_usd`, call `await self._fail_kickoff(...)`
-            with reason="budget hard stop" and set a drain flag so
-            `_dispatch_wave` stops issuing new children (AB-05 will add
-            a `self._drain = True` short-circuit in the select loop).
+        Operates on `self._last_completed_records` populated by the most
+        recent `_poll_children` call. Each record is passed to the tracker,
+        which is tolerant of missing `tokens`/`model` fields.
         """
-        return
+        records = list(self._last_completed_records or [])
+        # Clear early so the same batch can't be double-counted on the next
+        # tick before the next _poll_children call repopulates it.
+        self._last_completed_records = []
+
+        if records:
+            for rec in records:
+                try:
+                    self.budget_tracker.record(rec)
+                except Exception:
+                    logger.exception(
+                        "budget_tracker.record raised; continuing on next record"
+                    )
+            # Mirror the tracker's cumulative spend onto state so the
+            # soul-memory checkpoint stays authoritative.
+            self.state.cumulative_spend_usd = self.budget_tracker.cumulative_spend
+
+        # Threshold transitions. `check_warn` + `check_hard_stop` both
+        # have one-shot semantics; calling them every tick is safe and
+        # cheap.
+        if self.budget_tracker.check_warn():
+            warn_msg = (
+                f":warning: [autonomous_build] budget 80% threshold hit: "
+                f"${self.budget_tracker.cumulative_spend:.2f} / "
+                f"${self.budget_tracker.max_usd:.2f}. Monitoring closely; "
+                f"no new dispatch change yet."
+            )
+            self.state.record_event(
+                "budget_warn",
+                spend=self.budget_tracker.cumulative_spend,
+                cap=self.budget_tracker.max_usd,
+            )
+            try:
+                await self.cadence.post(warn_msg)
+            except Exception:
+                logger.exception("cadence.post(warn) failed; continuing")
+
+        if self.budget_tracker.check_hard_stop():
+            self._drain_mode = True
+            stop_msg = (
+                f":stop_sign: [autonomous_build] BUDGET HARD STOP at "
+                f"${self.budget_tracker.cumulative_spend:.2f} "
+                f"(cap ${self.budget_tracker.max_usd:.2f}). Drain mode: "
+                f"in-flight drain, no new dispatches. Orchestrator will "
+                f"complete current wave then halt."
+            )
+            self.state.record_event(
+                "budget_hard_stop",
+                spend=self.budget_tracker.cumulative_spend,
+                cap=self.budget_tracker.max_usd,
+            )
+            try:
+                await self.cadence.post(stop_msg)
+            except Exception:
+                logger.exception("cadence.post(hard_stop) failed; continuing")
+            # Checkpoint immediately so a restart after a budget halt
+            # sees the drain flag's side effects persisted.
+            try:
+                await checkpoint(self.state, self.soul, self.task_id)
+            except Exception:
+                logger.exception("post-hard-stop checkpoint failed; continuing")
+
+    async def _stall_watcher(self) -> None:
+        """Scan in-flight critical-path tickets; ping Slack if any has been
+        in a non-terminal in-flight state for longer than
+        `self.stall_threshold_sec`.
+
+        Each ticket is pinged at most once per stall event — the
+        `_stall_pinged` dict tracks last-ping ts per ticket. If the
+        ticket transitions out of the stalled status, `_snapshot_graph_into_state`
+        refreshes its `_ticket_transition_ts` and a future stall would
+        re-arm the ping.
+        """
+        now = time.time()
+        in_flight_states = {
+            TicketStatus.DISPATCHED,
+            TicketStatus.IN_PROGRESS,
+            TicketStatus.PR_OPEN,
+            TicketStatus.REVIEWING,
+            TicketStatus.MERGE_REQUESTED,
+        }
+        threshold = max(60, int(self.stall_threshold_sec))
+
+        for uuid, ticket in self.graph.nodes.items():
+            if not ticket.is_critical_path:
+                continue
+            if ticket.status not in in_flight_states:
+                # Ticket moved out of an in-flight state; clear the ping
+                # marker so a fresh stall later re-arms.
+                self._stall_pinged.pop(uuid, None)
+                continue
+            entered_ts = self._ticket_transition_ts.get(uuid)
+            if entered_ts is None:
+                continue
+            elapsed = now - entered_ts
+            if elapsed < threshold:
+                continue
+            # Already pinged for this specific stall window? Skip.
+            if self._stall_pinged.get(uuid, 0.0) >= entered_ts:
+                continue
+            # Find the last event for this ticket, if any.
+            last_event = ""
+            for evt in reversed(self.state.events or []):
+                if not isinstance(evt, dict):
+                    continue
+                if evt.get("identifier") == ticket.identifier:
+                    last_event = f"{evt.get('kind', '?')} ({evt.get('identifier')})"
+                    break
+            try:
+                await self.cadence.critical_path_ping(
+                    ticket, int(elapsed), last_event
+                )
+                self._stall_pinged[uuid] = entered_ts
+                self.state.record_event(
+                    "critical_path_stall_ping",
+                    identifier=ticket.identifier,
+                    elapsed_sec=int(elapsed),
+                )
+            except Exception:
+                logger.exception(
+                    "critical_path_ping raised for %s; will retry next tick",
+                    ticket.identifier,
+                )
 
     async def _maybe_ss08_gate(self, ticket: Ticket) -> bool:
         """AB-06 fills in the Slack ACK polling. AB-04 logs + allows.
