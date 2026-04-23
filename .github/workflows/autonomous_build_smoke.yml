@@ -1,0 +1,49 @@
+name: autonomous_build smoke
+
+on:
+  pull_request:
+    paths:
+      - "src/alfred_coo/autonomous_build/**"
+      - "tests/smoke/**"
+      - "tests/test_autonomous_build_*.py"
+      - ".github/workflows/autonomous_build_smoke.yml"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: in-process dry-run smoke
+    runs-on: ubuntu-latest
+    env:
+      # Activates the orchestrator's dry-run wiring; no Linear / Slack /
+      # soul-svc credentials are required or consulted.
+      AUTONOMOUS_BUILD_DRY_RUN: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Ruff check (dry-run module + smoke test)
+        run: |
+          python -m ruff check \
+            src/alfred_coo/autonomous_build/dry_run.py \
+            tests/test_autonomous_build_dry_run.py \
+            tests/smoke/test_autonomous_build_smoke.py
+
+      - name: Run dry-run unit tests
+        run: python -m pytest tests/test_autonomous_build_dry_run.py -v
+
+      - name: Run smoke test (3-ticket end-to-end)
+        run: python -m pytest tests/smoke/test_autonomous_build_smoke.py -v -m smoke

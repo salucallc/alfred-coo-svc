@@ -93,7 +93,20 @@ See `deploy/.env.template` for the full set and defaults.
 pytest tests/
 ```
 
-59 tests across `test_persona.py`, `test_tools.py`, `test_artifacts.py`, `test_structured.py`.
+Regular `pytest` runs skip the `@pytest.mark.smoke` end-to-end harness for the
+`autonomous-build-a` persona. To exercise the dry-run smoke explicitly:
+
+```bash
+AUTONOMOUS_BUILD_DRY_RUN=1 pytest tests/smoke/test_autonomous_build_smoke.py -v -m smoke
+```
+
+The smoke test runs the full orchestrator `run()` loop in-process against a
+mocked Linear project with `DryRunAdapter` swapped in for mesh / Slack /
+Linear. No credentials or network required. CI runs it automatically on PRs
+that touch `src/alfred_coo/autonomous_build/**` (see
+`.github/workflows/autonomous_build_smoke.yml`). See `tests/smoke/README.md`
+for the operator's live-scope narrow-smoke procedure (real Linear, real
+Slack, $1 budget cap — do NOT automate).
 
 ## Status
 
