@@ -37,7 +37,7 @@ echo ""
 
 echo "Public routes:"
 probe "caddy-healthz"          "${BASE_URL}/healthz"              200
-probe "portal-root"            "${BASE_URL}/"                     200
+probe "portal-healthz"         "${BASE_URL}/api/healthz"            200
 probe "soul-svc-healthz"       "${BASE_URL}/soul/v1/healthz"      200
 probe "mcp-github-healthz"     "${BASE_URL}/mcp/github/healthz"   200
 probe "mcp-slack-healthz"      "${BASE_URL}/mcp/slack/healthz"    200
