@@ -340,6 +340,49 @@ async def test_pr_review_missing_token_returns_error(monkeypatch):
     assert "GITHUB_TOKEN" in result["error"]
 
 
+# ── B.3.6: pr_files_get ─────────────────────────────────────────────────────
+
+from alfred_coo.tools import pr_files_get
+
+
+def test_pr_files_get_registered():
+    assert "pr_files_get" in BUILTIN_TOOLS
+
+
+def test_pr_files_get_schema():
+    schema = openai_tool_schema(BUILTIN_TOOLS["pr_files_get"])
+    assert schema["function"]["name"] == "pr_files_get"
+    params = schema["function"]["parameters"]
+    required = params["required"]
+    for key in ("owner", "repo", "pr_number"):
+        assert key in required, f"pr_files_get schema missing required field: {key}"
+    assert params["properties"]["pr_number"]["type"] == "integer"
+
+
+@pytest.mark.asyncio
+async def test_pr_files_get_rejects_bad_owner(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await pr_files_get(
+        owner="evil-org",
+        repo="hack",
+        pr_number=1,
+    )
+    assert "error" in result
+    assert "allowlist" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_pr_files_get_rejects_missing_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    result = await pr_files_get(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        pr_number=1,
+    )
+    assert "error" in result
+    assert "GITHUB_TOKEN" in result["error"]
+
+
 # ── B.3.3: task-scoped workspaces via ContextVar ───────────────────────────
 
 from alfred_coo.tools import (

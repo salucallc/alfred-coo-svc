@@ -20,6 +20,7 @@ the dispatch loop.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import json
 import logging
@@ -500,6 +501,169 @@ async def pr_review(
     }
 
 
+# ── pr_files_get ────────────────────────────────────────────────────────────
+
+# Caps for pr_files_get payloads. The goal is to keep a single tool call under
+# a few hundred KB while still returning useful review surface. PRs with more
+# files or larger individual files are truncated with explicit markers so the
+# model knows to call out the gap rather than silently missing coverage.
+PR_FILES_GET_MAX_FILES = 50
+PR_FILES_GET_MAX_CONTENT_BYTES = 20 * 1024  # 20 KB per file
+PR_FILES_GET_TIMEOUT_SEC = 30.0
+
+
+async def _github_api_get_json(url: str, token: str) -> tuple[Optional[Any], Optional[str]]:
+    """GET a GitHub REST endpoint with auth. Returns (body, error-string)."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "alfred-coo-svc",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PR_FILES_GET_TIMEOUT_SEC) as r:
+            return json.loads(r.read()), None
+    except urllib.error.HTTPError as e:
+        return None, f"github http {e.code}: {e.read().decode(errors='replace')[:300]}"
+    except Exception as e:  # pragma: no cover — defensive
+        return None, f"github transport: {type(e).__name__}: {e}"
+
+
+async def pr_files_get(
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> Dict[str, Any]:
+    """Fetch all files in a PR with their current content at head SHA.
+
+    Authenticated against api.github.com via GITHUB_TOKEN. Works on private
+    repos in the allowlisted orgs. Single tool call replaces ~10+ http_get
+    calls a QA persona would otherwise need to walk a PR.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return {"error": "GITHUB_TOKEN not set"}
+    if owner not in _ALLOWED_ORGS:
+        return {"error": f"owner {owner!r} not in allowlist {sorted(_ALLOWED_ORGS)}"}
+    if not _VALID_OWNER_RE.match(owner):
+        return {"error": "invalid owner name"}
+    if not _VALID_REPO_RE.match(repo):
+        return {"error": "invalid repo name"}
+    try:
+        pr_num = int(pr_number)
+    except (TypeError, ValueError):
+        return {"error": "pr_number must be an integer"}
+    if pr_num <= 0:
+        return {"error": "pr_number must be positive"}
+
+    # 1. PR metadata for head SHA + branch refs.
+    pr_meta, err = await _github_api_get_json(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}",
+        token,
+    )
+    if err is not None:
+        return {"error": f"pr metadata fetch failed: {err}"}
+    head = (pr_meta or {}).get("head") or {}
+    base = (pr_meta or {}).get("base") or {}
+    head_sha = head.get("sha")
+    head_ref = head.get("ref")
+    base_ref = base.get("ref")
+    if not head_sha:
+        return {"error": "pr metadata missing head.sha"}
+
+    # 2. Files list (GitHub paginates at 100 per page; we cap at the first page
+    # plus a truncation marker). Sorted by GitHub in commit-diff order.
+    files_list, err = await _github_api_get_json(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/files?per_page=100",
+        token,
+    )
+    if err is not None:
+        return {"error": f"pr files fetch failed: {err}"}
+    if not isinstance(files_list, list):
+        return {"error": "pr files response was not a list"}
+
+    total_files = len(files_list)
+    truncated = total_files > PR_FILES_GET_MAX_FILES
+    files_slice = files_list[:PR_FILES_GET_MAX_FILES]
+
+    # 3. For each non-removed file, fetch raw contents at head SHA.
+    out_files: List[Dict[str, Any]] = []
+    for f in files_slice:
+        path = f.get("filename")
+        status = f.get("status")
+        entry: Dict[str, Any] = {
+            "path": path,
+            "status": status,
+            "additions": f.get("additions"),
+            "deletions": f.get("deletions"),
+        }
+        if status == "removed":
+            out_files.append(entry)
+            continue
+        if not path:
+            entry["content_error"] = "missing filename in PR files response"
+            out_files.append(entry)
+            continue
+
+        contents_url = (
+            f"https://api.github.com/repos/{owner}/{repo}/contents/"
+            f"{urllib.request.quote(path)}?ref={head_sha}"
+        )
+        body, err = await _github_api_get_json(contents_url, token)
+        if err is not None:
+            entry["content_error"] = err
+            out_files.append(entry)
+            continue
+        if not isinstance(body, dict):
+            entry["content_error"] = "contents response was not an object"
+            out_files.append(entry)
+            continue
+        encoding = body.get("encoding")
+        raw = body.get("content") or ""
+        if encoding == "base64":
+            try:
+                decoded = base64.b64decode(raw, validate=False)
+            except Exception as e:
+                entry["content_error"] = f"base64 decode failed: {type(e).__name__}: {e}"
+                out_files.append(entry)
+                continue
+        elif encoding in (None, "", "utf-8", "none"):
+            decoded = raw.encode("utf-8", errors="replace") if isinstance(raw, str) else b""
+        else:
+            entry["content_error"] = f"unsupported encoding: {encoding}"
+            out_files.append(entry)
+            continue
+
+        full_len = len(decoded)
+        if full_len > PR_FILES_GET_MAX_CONTENT_BYTES:
+            clipped = decoded[:PR_FILES_GET_MAX_CONTENT_BYTES]
+            text = clipped.decode("utf-8", errors="replace")
+            dropped = full_len - PR_FILES_GET_MAX_CONTENT_BYTES
+            entry["content"] = text + f"\n...[truncated {dropped} bytes]"
+            entry["content_truncated"] = True
+            entry["content_bytes_total"] = full_len
+        else:
+            entry["content"] = decoded.decode("utf-8", errors="replace")
+            entry["content_truncated"] = False
+            entry["content_bytes_total"] = full_len
+
+        out_files.append(entry)
+
+    return {
+        "pr_number": pr_num,
+        "head_sha": head_sha,
+        "head": head_ref,
+        "base": base_ref,
+        "files": out_files,
+        "truncated": truncated,
+        "total_files": total_files,
+    }
+
+
 # ── http_get ────────────────────────────────────────────────────────────────
 
 # Maximum body bytes we'll read into a tool result. Larger responses are
@@ -569,24 +733,55 @@ def _is_allowed_http_url(url: str) -> tuple[bool, str]:
     return False, f"host {host!r} not in allowlist"
 
 
+_GITHUB_AUTH_HOSTS = frozenset({
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "github.com",
+    "codeload.github.com",
+})
+
+
+def _github_authed_url(url: str) -> bool:
+    """True if url targets a GitHub host that accepts/requires token auth."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in _GITHUB_AUTH_HOSTS
+
+
 async def http_get(url: str) -> Dict[str, Any]:
     """Read-only GET against an allowlisted URL.
 
     Returns {status, headers, body, truncated, bytes_read}. The body is clamped
     to HTTP_GET_MAX_BYTES; larger responses arrive truncated with an explicit
-    marker. Only text-ish content types are accepted. No auth header is sent
-    (the GitHub REST API endpoints reachable here are the public ones).
+    marker. Only text-ish content types are accepted.
+
+    Auth: if the target host is a GitHub endpoint (api.github.com,
+    raw.githubusercontent.com, github.com) and GITHUB_TOKEN is set,
+    an Authorization bearer header is attached. This lets QA/review personas
+    read private repo contents inside the allowlisted Saluca orgs. The
+    allowlist check in `_is_allowed_http_url` still bounds which orgs/paths
+    are reachable.
     """
     ok, reason = _is_allowed_http_url(url)
     if not ok:
         return {"error": f"url rejected: {reason}"}
 
+    headers = {
+        "User-Agent": "saluca-alfred/1.0 (http_get tool)",
+        "Accept": "text/*, application/json;q=0.9, */*;q=0.1",
+    }
+    if _github_authed_url(url):
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["Accept"] = "application/vnd.github+json, text/*, */*;q=0.1"
+
     req = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": "saluca-alfred/1.0 (http_get tool)",
-            "Accept": "text/*, application/json;q=0.9, */*;q=0.1",
-        },
+        headers=headers,
         method="GET",
     )
     try:
@@ -819,6 +1014,32 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=pr_review,
+    ),
+    "pr_files_get": ToolSpec(
+        name="pr_files_get",
+        description=(
+            "Fetch all files in a pull request with content at head SHA. "
+            "Authenticated — works on private repos in allowlisted orgs. "
+            "Use this in QA/review workflows to read the change surface in "
+            "a single tool call."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "owner": {
+                    "type": "string",
+                    "description": "GitHub org/user. Must be salucallc, saluca-labs, or cristianxruvalcaba-coder.",
+                },
+                "repo": {"type": "string", "description": "Repo name"},
+                "pr_number": {
+                    "type": "integer",
+                    "description": "Pull request number (positive integer).",
+                },
+            },
+            "required": ["owner", "repo", "pr_number"],
+            "additionalProperties": False,
+        },
+        handler=pr_files_get,
     ),
 }
 

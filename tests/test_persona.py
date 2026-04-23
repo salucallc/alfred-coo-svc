@@ -103,3 +103,15 @@ def test_batman_and_steel_are_advisory():
         assert p.tools == ["slack_post", "linear_create_issue"], (
             f"{name} should be advisory-only; got tools={p.tools}"
         )
+
+
+def test_hawkman_qa_has_pr_files_get():
+    """B.3.6: hawkman-qa-a gets pr_files_get so private-repo PR review works."""
+    p = get_persona("hawkman-qa-a")
+    assert "pr_files_get" in p.tools
+
+
+def test_batgirl_sec_has_pr_files_get():
+    """B.3.6: batgirl-sec-a gets pr_files_get so private-repo PR review works."""
+    p = get_persona("batgirl-sec-a")
+    assert "pr_files_get" in p.tools
