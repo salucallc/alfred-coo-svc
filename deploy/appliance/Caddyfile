@@ -33,8 +33,7 @@
     reverse_proxy mcp-notion:8212
   }
 
-  handle /chat/* {
-    uri strip_prefix /chat
+  handle_path /chat* {
     reverse_proxy open-webui:8080
   }
 
