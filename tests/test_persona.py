@@ -115,3 +115,37 @@ def test_batgirl_sec_has_pr_files_get():
     """B.3.6: batgirl-sec-a gets pr_files_get so private-repo PR review works."""
     p = get_persona("batgirl-sec-a")
     assert "pr_files_get" in p.tools
+
+
+# ── AB-01: autonomous-build-a registration + handler field ──────────────────
+
+
+def test_autonomous_build_a_registers_with_handler():
+    """AB-01: autonomous-build-a opts into the long-running orchestrator path
+    via the new Persona.handler field."""
+    p = get_persona("autonomous-build-a")
+    assert p.name == "autonomous-build-a"
+    assert p.handler == "AutonomousBuildOrchestrator"
+
+
+def test_autonomous_build_a_routing_and_topics():
+    """AB-01: autonomous-build-a routes to qwen3-coder:480b-cloud with the
+    local 30b-a3b fallback, and carries the Mission Control v1 GA topics."""
+    p = get_persona("autonomous-build-a")
+    assert p.preferred_model == "qwen3-coder:480b-cloud"
+    assert p.fallback_model == "qwen3-coder:30b-a3b-q4_K_M"
+    assert "autonomous_build" in p.topics
+    assert "mission-control-v1-ga" in p.topics
+
+
+def test_handler_field_defaults_to_none_for_existing_personas():
+    """AB-01: the new Persona.handler field must default to None so no
+    existing persona is accidentally promoted into the long-running path."""
+    for name, p in BUILTIN_PERSONAS.items():
+        if name == "autonomous-build-a":
+            continue
+        assert p.handler is None, (
+            f"persona {name} unexpectedly has handler={p.handler!r}; "
+            "only autonomous-build-a should opt into the long-running path "
+            "in AB-01."
+        )
