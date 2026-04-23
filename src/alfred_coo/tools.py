@@ -1131,7 +1131,7 @@ async def linear_update_issue_state(
 
 # ── linear_list_project_issues ──────────────────────────────────────────────
 
-LINEAR_LIST_PAGE_SIZE = 100
+LINEAR_LIST_PAGE_SIZE = 25  # Linear complexity cap ~10000 hit at page=100 with labels+state+relations (observed 12081 on SAL project, 2026-04-23)
 LINEAR_LIST_DEFAULT_LIMIT = 250
 
 

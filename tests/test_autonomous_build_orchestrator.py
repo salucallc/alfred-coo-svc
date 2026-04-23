@@ -382,22 +382,31 @@ async def test_run_integration_dry_run_harness(monkeypatch):
         return None
     monkeypatch.setattr(orch, "_update_linear_state", _noop)
 
+    # Simulate an instant APPROVE + merge when the orchestrator dispatches
+    # a review task. In production this would take a real review loop; the
+    # dry-run harness short-circuits straight to MERGED_GREEN so the wave
+    # gate can advance. `_fake_review` sets MERGED_GREEN then raises — the
+    # raise prevents the orchestrator's next line (`ticket.status =
+    # REVIEWING`) from overwriting the terminal status. This is the only
+    # way to simulate test-side review completion without adding a new
+    # hook to the production code path (follow-up: AB-08 REVIEWING→
+    # MERGED_GREEN transition logic).
+    from alfred_coo.autonomous_build.graph import TicketStatus as _TS
+    class _FakeReviewDone(Exception):
+        pass
+    async def _fake_review(ticket):
+        ticket.status = _TS.MERGED_GREEN
+        raise _FakeReviewDone
+    monkeypatch.setattr(orch, "_dispatch_review", _fake_review)
+
     # Drive mesh.list_tasks: as soon as a child is dispatched, mark it
-    # completed with an empty summary on the next call (so the orchestrator
-    # sees no PR → treats as merged_green).
+    # completed with a fake PR URL so the orchestrator transitions to
+    # PR_OPEN → (review is a no-op here) → MERGED_GREEN via the PR path.
+    # (Children without PR URLs now mark FAILED, not MERGED_GREEN — see
+    # test_run_no_pr_child_marks_failed for that path.)
     original_list = mesh.list_tasks
 
     async def driving_list(status=None, limit=50):
-        # Auto-complete every dispatched child.
-        for rec in mesh.created:
-            # Already completed?
-            if any(c.get("id") and c.get("title") == rec["title"]
-                   for c in mesh.completed_tasks):
-                continue
-            # The real mesh assigned an id we don't know here; look it up
-            # by title in the calls list.
-            # We don't track ids per title in this simple fake — approximate:
-            # the Nth created task has id child-N.
         # Mark every dispatched child completed by title ordering.
         for idx, rec in enumerate(mesh.created, start=1):
             cid = f"child-{idx}"
@@ -407,7 +416,10 @@ async def test_run_integration_dry_run_harness(monkeypatch):
                 "id": cid,
                 "title": rec["title"],
                 "status": "completed",
-                "result": {"summary": "done"},
+                "result": {
+                    "summary": f"done; PR https://github.com/salucallc/x/pull/{idx}",
+                    "pr_url": f"https://github.com/salucallc/x/pull/{idx}",
+                },
             })
         return await original_list(status=status, limit=limit)
 
@@ -444,3 +456,54 @@ async def test_run_missing_linear_project_id_fails_kickoff():
     assert len(mesh.completions) == 1
     assert mesh.completions[0]["status"] == "failed"
     assert "linear_project_id" in mesh.completions[0]["result"]["error"]
+
+
+async def test_poll_children_marks_failed_when_no_pr_url(monkeypatch):
+    """Regression: a child task that completes WITHOUT a PR URL in its
+    result is a silent failure (model never called propose_pr), not a
+    success. Orchestrator must mark the ticket FAILED and push Linear
+    back to Backlog — NOT MERGED_GREEN + Done. (2026-04-23 bug: 12
+    false-greens observed on first live run.)"""
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    # One wave-0 ticket, dispatched, awaiting completion.
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-1"
+    _seed_graph(orch, [t])
+
+    # Track Linear state transitions the orchestrator requests.
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Fake mesh returns a "completed" child with no PR URL in result.
+    mesh.completed_tasks.append({
+        "id": "child-1",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-1 TIR-01 ...",
+        "status": "completed",
+        "result": {"summary": "I considered the task but did not open a PR"},
+    })
+
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"expected FAILED, got {t.status}; no-PR children must NOT be "
+        f"marked MERGED_GREEN (regression from 2026-04-23 bug)"
+    )
+    assert ("SAL-1", "Backlog") in linear_calls, (
+        f"expected Linear rollback to Backlog, got: {linear_calls}"
+    )
+    assert not any(state == "Done" for _, state in linear_calls), (
+        f"ticket was falsely moved to Done: {linear_calls}"
+    )
