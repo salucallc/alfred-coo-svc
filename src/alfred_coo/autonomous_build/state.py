@@ -49,6 +49,15 @@ class OrchestratorState:
     dispatched_child_tasks: Dict[str, str] = field(default_factory=dict)
     pr_urls: Dict[str, str] = field(default_factory=dict)
     review_cycles: Dict[str, int] = field(default_factory=dict)
+    # AB-08: REVIEWING → MERGED_GREEN loop bookkeeping.
+    #   review_task_ids  ticket_uuid → hawkman-qa-a mesh task id
+    #   review_verdicts  ticket_uuid → last verdict (APPROVE / REQUEST_CHANGES / ...)
+    #   merged_pr_urls   ticket_uuid → merge_commit_sha (or pr_url fallback)
+    # All three survive to_json/from_json; unknown keys already drop on load
+    # so old snapshots keep loading forward-compat.
+    review_task_ids: Dict[str, str] = field(default_factory=dict)
+    review_verdicts: Dict[str, str] = field(default_factory=dict)
+    merged_pr_urls: Dict[str, str] = field(default_factory=dict)
     cumulative_spend_usd: float = 0.0
     ss08_acked: bool = False
     last_cadence_ts: float = 0.0
