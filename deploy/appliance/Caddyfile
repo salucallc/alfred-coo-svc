@@ -1,0 +1,28 @@
+# Caddyfile for Mission Control Appliance (SAL-2558)
+# Routes internal services under a single hostname with path-based routing
+
+{$APPLIANCE_HOSTNAME:localhost} {
+
+  handle /healthz {
+    respond "ok" 200
+  }
+
+  handle /soul/* {
+    uri strip_prefix /soul
+    reverse_proxy soul-svc:8080
+  }
+
+  handle /mcp/* {
+    uri strip_prefix /mcp
+    reverse_proxy mcp-gateway:8000
+  }
+
+  handle /chat/* {
+    uri strip_prefix /chat
+    reverse_proxy open-webui:8080
+  }
+
+  handle {
+    reverse_proxy alfred-portal:3000
+  }
+}
