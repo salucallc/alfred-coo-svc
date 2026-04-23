@@ -486,10 +486,32 @@ async def pr_review(
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
     except urllib.error.HTTPError as e:
-        return {
-            "error": f"github reviews http {e.code}",
-            "response": e.read().decode()[:500],
-        }
+        err_body = e.read().decode(errors="replace")[:800]
+        # GitHub 422 on self-authored PRs: fall back to posting the review as a
+        # PR comment so the analysis still lands in a visible place. This is
+        # the current reality because builder and reviewer run under the same
+        # GITHUB_TOKEN identity; split-identity is a separate infra change.
+        if e.code == 422 and "own pull request" in err_body.lower():
+            comment_result = await _post_pr_comment(
+                owner, repo, pr_num, token,
+                event=event, body=body or "(empty review body)",
+                line_comments=comments,
+            )
+            if "error" not in comment_result:
+                return {
+                    "state": "COMMENTED_FALLBACK",
+                    "review_id": None,
+                    "fallback_reason": "self-authored PR; used issue-comment",
+                    "html_url": comment_result.get("html_url"),
+                    "comment_id": comment_result.get("comment_id"),
+                    "intended_event": event,
+                }
+            return {
+                "error": f"github reviews http {e.code} (fallback also failed)",
+                "response": err_body,
+                "fallback_error": comment_result.get("error"),
+            }
+        return {"error": f"github reviews http {e.code}", "response": err_body}
     except Exception as e:
         return {"error": f"github api transport: {type(e).__name__}: {e}"}
 
@@ -499,6 +521,51 @@ async def pr_review(
         "submitted_at": resp.get("submitted_at"),
         "html_url": resp.get("html_url"),
     }
+
+
+async def _post_pr_comment(
+    owner: str,
+    repo: str,
+    pr_num: int,
+    token: str,
+    event: str,
+    body: str,
+    line_comments: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Post a PR comment via the issues API. pr_review self-authored fallback."""
+    prefix = {
+        "APPROVE": "### :white_check_mark: Review: APPROVE (fallback - self-authored PR)",
+        "REQUEST_CHANGES": "### :warning: Review: REQUEST_CHANGES (fallback - self-authored PR)",
+        "COMMENT": "### Review: COMMENT (fallback - self-authored PR)",
+    }.get(event, f"### Review: {event}")
+
+    full_body = f"{prefix}\n\n{body}"
+    if line_comments:
+        full_body += "\n\n---\n#### Line comments"
+        for c in line_comments:
+            full_body += f"\n- `{c.get('path')}:{c.get('line')}` - {c.get('body')}"
+
+    payload = json.dumps({"body": full_body}).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_num}/comments",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"error": f"comment http {e.code}", "response": e.read().decode(errors="replace")[:400]}
+    except Exception as e:
+        return {"error": f"comment transport: {type(e).__name__}: {e}"}
+    return {"comment_id": resp.get("id"), "html_url": resp.get("html_url")}
 
 
 # ── pr_files_get ────────────────────────────────────────────────────────────
