@@ -38,6 +38,10 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
 
     # COO / executive strategy. Maps [persona:alfred-coo-a].
     # Tool-enabled: can open Linear tickets and post Slack status.
+    # Prefer qwen3-coder for tool-use: deepseek-v3.2 intermittently emits
+    # Anthropic-style <function_calls> XML in content instead of using the
+    # OpenAI tool_calls field when the schema exceeds ~4 tools. See memory
+    # reference_deepseek_tool_use_quirk.md.
     "alfred-coo-a": Persona(
         name="alfred-coo-a",
         system_prompt=(
@@ -49,8 +53,8 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "writing it into the summary. For escalations or status that "
             "Cristian should see live, use slack_post (defaults to batcave)."
         ),
-        preferred_model="deepseek-v3.2:cloud",
-        fallback_model="qwen3-coder:480b-cloud",
+        preferred_model="qwen3-coder:480b-cloud",
+        fallback_model="deepseek-v3.2:cloud",
         topics=[
             "coo-daemon",
             "unified-plan",
