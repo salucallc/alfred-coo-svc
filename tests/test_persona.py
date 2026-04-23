@@ -16,9 +16,8 @@ def test_default_persona_returned_on_unknown():
 def test_alfred_coo_a_resolves():
     p = get_persona("alfred-coo-a")
     assert p.name == "alfred-coo-a"
-    assert p.preferred_model == "deepseek-v3.2:cloud"
-    assert p.fallback_model is not None
-    assert p.fallback_model != p.preferred_model
+    assert p.preferred_model == "qwen3-coder:480b-cloud"
+    assert p.fallback_model == "deepseek-v3.2:cloud"
     assert "coo-daemon" in p.topics
 
 
