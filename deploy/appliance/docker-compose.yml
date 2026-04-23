@@ -43,7 +43,7 @@ services:
       - appliance
 
   alfred-portal:
-    image: ghcr.io/cristianxruvalcaba-coder/alfred-portal:latest
+    image: ghcr.io/salucallc/alfred-portal:latest
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://appliance:${POSTGRES_PASSWORD:?must set}@postgres:5432/alfred
