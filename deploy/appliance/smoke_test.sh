@@ -9,7 +9,6 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 APPLIANCE_HOSTNAME="${APPLIANCE_HOSTNAME:-localhost}"
-# Resolve ports: Caddy is the only public ingress; everything else is internal to the compose net.
 BASE_URL="http://${APPLIANCE_HOSTNAME}"
 
 fail_count=0
@@ -18,7 +17,7 @@ probe() {
   local name="$1"
   local url="$2"
   local expect_status="${3:-200}"
-  printf "  %-20s " "$name"
+  printf "  %-26s " "$name"
   local status
   status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" || true)
   if [[ "$status" == "$expect_status" ]]; then
@@ -37,11 +36,14 @@ echo "  target: ${BASE_URL}"
 echo ""
 
 echo "Public routes:"
-probe "portal-root"        "${BASE_URL}/"                      200
-probe "portal-healthz"     "${BASE_URL}/api/healthz"           200
-probe "soul-svc-healthz"   "${BASE_URL}/api/soul/v1/healthz"   200
-probe "mcp-gateway-healthz" "${BASE_URL}/api/mcp/healthz"      200
-probe "open-webui-root"    "${BASE_URL}/chat"                   200
+probe "caddy-healthz"          "${BASE_URL}/healthz"              200
+probe "portal-root"            "${BASE_URL}/"                     200
+probe "soul-svc-healthz"       "${BASE_URL}/soul/v1/healthz"      200
+probe "mcp-github-healthz"     "${BASE_URL}/mcp/github/healthz"   200
+probe "mcp-slack-healthz"      "${BASE_URL}/mcp/slack/healthz"    200
+probe "mcp-linear-healthz"     "${BASE_URL}/mcp/linear/healthz"   200
+probe "mcp-notion-healthz"     "${BASE_URL}/mcp/notion/healthz"   200
+probe "open-webui-root"        "${BASE_URL}/chat"                 200
 
 echo ""
 echo "Container health (docker compose):"

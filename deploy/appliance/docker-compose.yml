@@ -1,12 +1,18 @@
 # deploy/appliance/docker-compose.yml
-# Mission Control Appliance bundle -- SAL-2557
+# Mission Control Appliance bundle — SAL-2557 + SAL-2582 Phase 3b
 # Single `docker compose up` stands up all services behind Caddy reverse proxy.
-# Paired with deploy/appliance/Caddyfile (SAL-2558, PR #11).
+# Paired with deploy/appliance/Caddyfile.
 #
-# Required environment:
-#   APPLIANCE_HOSTNAME   (default: localhost; set to real FQDN for HTTPS via ACME)
-#   POSTGRES_PASSWORD    (required; no default)
+# Required environment (see .env.template):
+#   APPLIANCE_HOSTNAME   (default: localhost; set real FQDN for HTTPS via ACME)
+#   POSTGRES_PASSWORD    (required)
 #   SOUL_API_KEY_ROOT    (required; root bootstrap key for soul-svc)
+#   SOUL_API_KEY         (required; daemon key — mint after first-boot wizard)
+#   GITHUB_TOKEN         (required; PAT for COO daemon + mcp-github)
+#   SLACK_BOT_TOKEN      (required; xoxb token for COO daemon + mcp-slack)
+#   SLACK_TEAM_ID        (required; Slack workspace ID starting with T)
+#   LINEAR_API_KEY       (required; for COO daemon + mcp-linear)
+#   NOTION_API_KEY       (required; for mcp-notion)
 #   OLLAMA_BASE_URL      (default: http://host.docker.internal:11434)
 
 version: "3.9"
@@ -27,7 +33,11 @@ services:
     depends_on:
       - alfred-portal
       - soul-svc
-      - mcp-gateway
+      - alfred-coo-svc
+      - mcp-github
+      - mcp-slack
+      - mcp-linear
+      - mcp-notion
       - open-webui
     networks:
       - appliance
@@ -38,7 +48,6 @@ services:
     environment:
       DATABASE_URL: postgresql://appliance:${POSTGRES_PASSWORD:?must set}@postgres:5432/alfred
       SOUL_API_URL: http://soul-svc:8080
-      MCP_GATEWAY_URL: http://mcp-gateway:8000
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,14 +75,65 @@ services:
     networks:
       - appliance
 
-  mcp-gateway:
-    image: ghcr.io/salucallc/mcp-gateway:latest
+  alfred-coo-svc:
+    image: ghcr.io/salucallc/alfred-coo-svc:latest
     restart: unless-stopped
     environment:
       SOUL_API_URL: http://soul-svc:8080
+      SOUL_API_KEY: ${SOUL_API_KEY:?must set}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?must set}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:?must set}
+      LINEAR_API_KEY: ${LINEAR_API_KEY:?must set}
     depends_on:
       soul-svc:
         condition: service_healthy
+    networks:
+      - appliance
+
+  # ── MCP Services (curated: github, slack, linear, notion) ─────────────────
+  mcp-github:
+    image: ghcr.io/salucallc/mcp-gateway-node:latest
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    environment:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN:?must set}
+    command: ["--port", "8203", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @modelcontextprotocol/server-github"]
+    networks:
+      - appliance
+
+  mcp-slack:
+    image: ghcr.io/salucallc/mcp-gateway-node:latest
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    environment:
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:?must set}
+      SLACK_TEAM_ID: ${SLACK_TEAM_ID:?must set}
+    command: ["--port", "8201", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @modelcontextprotocol/server-slack"]
+    networks:
+      - appliance
+
+  mcp-linear:
+    image: ghcr.io/salucallc/mcp-gateway-node:latest
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    environment:
+      LINEAR_API_KEY: ${LINEAR_API_KEY:?must set}
+    command: ["--port", "8208", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y linear-mcp-server"]
+    networks:
+      - appliance
+
+  mcp-notion:
+    image: ghcr.io/salucallc/mcp-gateway-node:latest
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    environment:
+      NOTION_API_KEY: ${NOTION_API_KEY:?must set}
+    command: ["--port", "8212", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @notionhq/notion-mcp-server"]
     networks:
       - appliance
 
