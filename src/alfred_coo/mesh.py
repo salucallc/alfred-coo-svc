@@ -47,6 +47,44 @@ class MeshClient:
             return resp.get("tasks", [])
         return resp
 
+    async def list_tasks(self, status: str | None = None, limit: int = 50) -> list[dict]:
+        """Generic mesh tasks listing. Used by the autonomous_build orchestrator
+        to poll for completed child tasks (status="completed") after dispatch.
+
+        Mirrors the unwrap behaviour of `list_pending`.
+        """
+        qs = f"limit={limit}"
+        if status:
+            qs += f"&status={status}"
+        url = f"/v1/mesh/tasks?{qs}"
+        headers = self._get_auth_header()
+        resp = await self._make_request("GET", url, headers=headers)
+        if isinstance(resp, dict):
+            return resp.get("tasks", [])
+        return resp
+
+    async def create_task(
+        self,
+        title: str,
+        description: str = "",
+        from_session_id: str | None = None,
+    ) -> dict:
+        """POST /v1/mesh/tasks. Returns the created task record.
+
+        Used by the autonomous_build orchestrator to fan out per-ticket child
+        tasks (tagged `[persona:alfred-coo-a]` by the caller). Mirrors the
+        standalone `mesh_task_create` tool handler in tools.py but reuses the
+        shared httpx client + failover chain rather than urllib.
+        """
+        url = "/v1/mesh/tasks"
+        headers = self._get_auth_header()
+        data = {
+            "from_session_id": from_session_id or "alfred-coo",
+            "title": title,
+            "description": description or "",
+        }
+        return await self._make_request("POST", url, headers=headers, json=data)
+
     async def claim(self, task_id: str, session_id: str, node_id: str) -> dict:
         url = f"/v1/mesh/tasks/{task_id}/claim"
         headers = self._get_auth_header()
