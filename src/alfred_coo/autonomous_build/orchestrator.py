@@ -1013,25 +1013,107 @@ class AutonomousBuildOrchestrator:
                 )
 
     async def _maybe_ss08_gate(self, ticket: Ticket) -> bool:
-        """AB-06 fills in the Slack ACK polling. AB-04 logs + allows.
+        """SS-08 gate: post JWS claims schema + poll #batcave for ACK.
 
-        Contract for AB-06:
-          - If `self.state.ss08_acked`, return True immediately.
-          - Otherwise:
-              * Post the JWS claims schema to #batcave via `slack_post`.
-              * Record `gate_ts` in state.
-              * Loop every 2 min calling `slack_ack_poll(channel, after_ts,
-                author_user_id, keywords=["ACK SS-08", "approve SS-08"])`.
-              * On match: set `self.state.ss08_acked = True`, checkpoint,
-                return True.
-              * On 4h timeout: mark ticket FAILED, record event, return
-                False (skip + defer per Q3 lock).
+        AB-06 implementation. Contract:
+          - Non-SS-08 tickets: no-op, return True.
+          - `self.state.ss08_acked` already True: skip gate, return True.
+          - Otherwise run `run_ss08_gate(cadence, slack_ack_poll_fn)`:
+              * On ACK: set `state.ss08_acked = True`, checkpoint,
+                return True (dispatch proceeds).
+              * On 4h timeout: mark ticket FAILED, record event,
+                checkpoint, return False (skip + defer to v1.1 per D2).
+              * On gate crash: log, mark FAILED, return False.
         """
-        logger.info(
-            "SS-08 gate not yet implemented; skipping gate for %s",
-            ticket.identifier,
+        if ticket.code.upper() != "SS-08":
+            return True
+        if self.state.ss08_acked:
+            logger.info(
+                "SS-08 already acked in state; skipping gate for %s",
+                ticket.identifier,
+            )
+            return True
+
+        # Lazy import avoids forcing ss08_gate into the orchestrator's
+        # import graph for tests that never touch SS-08 tickets.
+        from .ss08_gate import run_ss08_gate
+
+        # Resolve the real `slack_ack_poll` handler. Tests that exercise
+        # the gate path inject a fake via monkeypatching
+        # `orchestrator._resolve_slack_ack_poll` or stubbing
+        # `BUILTIN_TOOLS`; AB-07 dry-run/smoke flips this to a no-op.
+        try:
+            poll_fn = self._resolve_slack_ack_poll()
+        except Exception as e:
+            logger.exception(
+                "failed to resolve slack_ack_poll for SS-08 gate: %s", e
+            )
+            ticket.status = TicketStatus.FAILED
+            self.state.record_event(
+                "ss08_gate_resolve_failed",
+                identifier=ticket.identifier,
+                error=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+            await checkpoint(self.state, self.soul, self.task_id)
+            return False
+
+        try:
+            acked = await run_ss08_gate(
+                cadence=self.cadence,
+                slack_ack_poll_fn=poll_fn,
+                logger_=logger,
+            )
+        except Exception as e:
+            logger.exception("SS-08 gate errored: %s", e)
+            ticket.status = TicketStatus.FAILED
+            self.state.record_event(
+                "ss08_gate_crashed",
+                identifier=ticket.identifier,
+                error=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+            await checkpoint(self.state, self.soul, self.task_id)
+            return False
+
+        self.state.ss08_acked = bool(acked)
+        await checkpoint(self.state, self.soul, self.task_id)
+
+        if not acked:
+            # D2: defer SS-08 to v1.1 on timeout. Marking the ticket
+            # FAILED keeps the wave-gate soft-green logic honest: if
+            # SS-08 is critical-path the orchestrator will halt; if
+            # non-critical it can still clear the wave with a warning.
+            ticket.status = TicketStatus.FAILED
+            self.state.record_event(
+                "ss08_gate_timeout",
+                identifier=ticket.identifier,
+                note="marked deferred v1.1",
+            )
+            await checkpoint(self.state, self.soul, self.task_id)
+            return False
+
+        self.state.record_event(
+            "ss08_gate_acked",
+            identifier=ticket.identifier,
         )
         return True
+
+    def _resolve_slack_ack_poll(self):
+        """Return the callable used by `run_ss08_gate` to poll Slack.
+
+        Default resolution goes through `BUILTIN_TOOLS["slack_ack_poll"].handler`.
+        Kept as a dedicated method so AB-07 (dry-run/smoke) can override
+        via a simple `orch._resolve_slack_ack_poll = lambda: fake_fn`
+        without reaching into BUILTIN_TOOLS.
+        """
+        from alfred_coo.tools import BUILTIN_TOOLS
+
+        spec = BUILTIN_TOOLS.get("slack_ack_poll")
+        if spec is None:
+            raise RuntimeError(
+                "slack_ack_poll tool missing from BUILTIN_TOOLS; "
+                "cannot run SS-08 gate"
+            )
+        return spec.handler
 
     # ── Linear bookkeeping ──────────────────────────────────────────────────
 
