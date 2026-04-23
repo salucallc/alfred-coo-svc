@@ -281,6 +281,65 @@ async def test_http_get_rejects_before_network_call():
     assert "allowlist" in result["error"]
 
 
+# ── B.3.5: pr_review ────────────────────────────────────────────────────────
+
+from alfred_coo.tools import pr_review
+
+
+def test_pr_review_registered():
+    assert "pr_review" in BUILTIN_TOOLS
+
+
+def test_pr_review_schema():
+    schema = openai_tool_schema(BUILTIN_TOOLS["pr_review"])
+    assert schema["function"]["name"] == "pr_review"
+    required = schema["function"]["parameters"]["required"]
+    for key in ("owner", "repo", "pr_number", "event", "body"):
+        assert key in required, f"pr_review schema missing required field: {key}"
+
+
+@pytest.mark.asyncio
+async def test_pr_review_rejects_bad_owner(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await pr_review(
+        owner="evil-org",
+        repo="hack",
+        pr_number=1,
+        event="APPROVE",
+        body="looks good",
+    )
+    assert "error" in result
+    assert "allowlist" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_pr_review_rejects_invalid_event(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await pr_review(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        pr_number=1,
+        event="MERGE_IT",
+        body="ship it",
+    )
+    assert "error" in result
+    assert "event" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_pr_review_missing_token_returns_error(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    result = await pr_review(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        pr_number=1,
+        event="COMMENT",
+        body="hi",
+    )
+    assert "error" in result
+    assert "GITHUB_TOKEN" in result["error"]
+
+
 # ── B.3.3: task-scoped workspaces via ContextVar ───────────────────────────
 
 from alfred_coo.tools import (
