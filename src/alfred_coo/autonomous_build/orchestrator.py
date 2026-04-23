@@ -679,14 +679,20 @@ class AutonomousBuildOrchestrator:
                     )
                 updated.append(ticket)
             else:
-                # No PR → treat as merged_green if the child says so.
-                ticket.status = TicketStatus.MERGED_GREEN
+                # No PR → child silently completed without producing a PR.
+                # This is almost always a bug in the child persona (model did
+                # not call propose_pr), NOT a success. Mark FAILED so the wave
+                # gate catches it. Operator resets Linear state to Backlog to
+                # retry (2026-04-23: observed 12 false-greens on first live
+                # run; orchestrator marked MERGED_GREEN in this branch,
+                # skipping the real claim→build→PR→review flow).
+                ticket.status = TicketStatus.FAILED
                 self.state.record_event(
-                    "ticket_green",
+                    "ticket_failed",
                     identifier=ticket.identifier,
-                    note="no-pr child completion",
+                    note="child completed without PR URL",
                 )
-                await self._update_linear_state(ticket, "Done")
+                await self._update_linear_state(ticket, "Backlog")
                 updated.append(ticket)
 
         return updated
