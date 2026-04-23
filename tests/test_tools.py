@@ -383,6 +383,133 @@ async def test_pr_files_get_rejects_missing_token(monkeypatch):
     assert "GITHUB_TOKEN" in result["error"]
 
 
+# ── AB-10: github_merge_pr ──────────────────────────────────────────────────
+
+from alfred_coo.tools import github_merge_pr
+
+
+@pytest.mark.asyncio
+async def test_github_merge_pr_missing_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    result = await github_merge_pr(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        pr_number=1,
+    )
+    assert result == {"error": "missing GITHUB_TOKEN"}
+
+
+@pytest.mark.asyncio
+async def test_github_merge_pr_bad_owner(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await github_merge_pr(
+        owner="evil-org",
+        repo="hack",
+        pr_number=1,
+    )
+    assert "error" in result
+    assert "allowlist" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_github_merge_pr_success(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    captured = _install_urlopen_queue(
+        monkeypatch,
+        [{"merged": True, "sha": "abc", "message": "Pull Request successfully merged"}],
+    )
+    result = await github_merge_pr(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        pr_number=42,
+        merge_method="squash",
+    )
+    assert result == {
+        "ok": True,
+        "merged": True,
+        "sha": "abc",
+        "message": "Pull Request successfully merged",
+    }
+    # Request should be a PUT to the merge endpoint with squash body.
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.get_method() == "PUT"
+    assert req.full_url.endswith("/repos/salucallc/alfred-coo-svc/pulls/42/merge")
+    body = json.loads(req.data.decode("utf-8"))
+    assert body == {"merge_method": "squash"}
+
+
+@pytest.mark.asyncio
+async def test_github_merge_pr_not_mergeable_405(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+
+    import io
+    import urllib.error as _ue
+    import urllib.request as _ur
+
+    def fake_urlopen(req, timeout=None):
+        raise _ue.HTTPError(
+            req.full_url,
+            405,
+            "Method Not Allowed",
+            {},
+            io.BytesIO(b'{"message":"Pull Request is not mergeable"}'),
+        )
+
+    monkeypatch.setattr(_ur, "urlopen", fake_urlopen)
+
+    result = await github_merge_pr(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        pr_number=1,
+    )
+    assert result["error"] == "not_mergeable"
+    assert result["status"] == 405
+    assert "not mergeable" in result["body"].lower()
+
+
+@pytest.mark.asyncio
+async def test_github_merge_pr_stale_head_409(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+
+    import io
+    import urllib.error as _ue
+    import urllib.request as _ur
+
+    def fake_urlopen(req, timeout=None):
+        raise _ue.HTTPError(
+            req.full_url,
+            409,
+            "Conflict",
+            {},
+            io.BytesIO(b'{"message":"Head branch was modified. Review and try the merge again."}'),
+        )
+
+    monkeypatch.setattr(_ur, "urlopen", fake_urlopen)
+
+    result = await github_merge_pr(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        pr_number=1,
+    )
+    assert result["error"] == "stale_head"
+    assert result["status"] == 409
+    assert "head branch" in result["body"].lower()
+
+
+def test_github_merge_pr_registered_in_builtins():
+    assert "github_merge_pr" in BUILTIN_TOOLS
+    spec = BUILTIN_TOOLS["github_merge_pr"]
+    assert spec.handler is github_merge_pr
+    assert spec.name == "github_merge_pr"
+    schema = openai_tool_schema(spec)
+    required = schema["function"]["parameters"]["required"]
+    for key in ("owner", "repo", "pr_number"):
+        assert key in required
+    props = schema["function"]["parameters"]["properties"]
+    assert props["merge_method"]["enum"] == ["squash", "merge", "rebase"]
+
+
 # ── B.3.3: task-scoped workspaces via ContextVar ───────────────────────────
 
 from alfred_coo.tools import (
