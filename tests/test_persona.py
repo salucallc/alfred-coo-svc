@@ -16,11 +16,13 @@ def test_default_persona_returned_on_unknown():
 def test_alfred_coo_a_resolves():
     p = get_persona("alfred-coo-a")
     assert p.name == "alfred-coo-a"
-    # AB-17-h: swapped from qwen3-coder:480b-cloud to kimi-k2-thinking:cloud
-    # after v8-smoke-b showed persistent hallucination under qwen on
-    # SAL-2634 (OPS-01) despite AB-17-g "tool output is ground truth"
-    # clause. kimi chain-of-thought should catch hint-vs-tool contradictions.
-    assert p.preferred_model == "kimi-k2-thinking:cloud"
+    # AB-17-j: swapped from kimi-k2-thinking:cloud to gpt-oss:120b-cloud
+    # after v8-smoke-d (mesh task f8cf459b) got 0/3 PRs because
+    # kimi-k2-thinking emitted Anthropic-XML tool-call syntax as content
+    # instead of OpenAI tool_calls (same wire-format bug as deepseek-v3.2).
+    # gpt-oss:120b-cloud has proven stable OpenAI tool_calls format
+    # (post AB-17-i hawkman swap).
+    assert p.preferred_model == "gpt-oss:120b-cloud"
     assert p.fallback_model == "deepseek-v3.2:cloud"
     assert "coo-daemon" in p.topics
 
