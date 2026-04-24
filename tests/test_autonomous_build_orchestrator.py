@@ -491,6 +491,39 @@ def test_child_task_body_uses_repo_raw_plan_url():
     assert f"{base}/G_autonomous_build_gap_closers.md" in body
 
 
+# ── AB-14 (SAL-2699): child body must emit Plan-doc code grep anchor ───────
+
+
+def test_child_task_body_emits_plan_doc_code_line():
+    """AB-14: children must see a `Plan-doc code: <code>` line verbatim
+    so they can grep the plan-doc markdown for the exact section header
+    (``F08``, ``OPS-01``, ``C-26``, ...). Without this, the live run on
+    2026-04-23 showed SAL-2616's F08 child fabricating scope because it
+    had no stable anchor in the plan doc.
+    """
+    orch = _mk_orchestrator()
+    ticket = _t("u-1", "SAL-2616", "F08", 1, "fleet")
+    body = orch._child_task_body(ticket)
+    assert (
+        "Plan-doc code: F08 "
+        "(search for this string in the plan-doc markdown)"
+    ) in body, f"missing plan-doc-code line in body:\n{body}"
+
+
+def test_child_task_body_unparseable_code_emits_escalate_line():
+    """AB-14: empty ticket.code means the orchestrator failed to parse
+    a plan-doc anchor from the title. The child MUST NOT guess; it must
+    escalate per Step 0 of its persona protocol. The body makes that
+    explicit instead of silently omitting the Plan-doc code line."""
+    orch = _mk_orchestrator()
+    ticket = _t("u-bad", "SAL-BAD", "", 1, "ops")
+    body = orch._child_task_body(ticket)
+    assert (
+        "Plan-doc code: (unparseable — escalate per Step 0 of your "
+        "persona protocol)"
+    ) in body, f"missing escalate fallback line in body:\n{body}"
+
+
 async def test_run_missing_linear_project_id_fails_kickoff():
     """Payload without linear_project_id → orchestrator fails the kickoff
     cleanly instead of crashing."""

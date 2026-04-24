@@ -54,11 +54,17 @@ KNOWN_EPICS: frozenset[str] = frozenset(
 )
 
 
-# Matches codes like TIR-01, ALT-03, C-26, FLEET-05, OPS-04, SS-08, AB-04
-# embedded in the issue title — usually right after the `SAL-XXXX` prefix
-# (but we allow it anywhere as a fallback).
+# Matches codes like TIR-01, ALT-03, C-26, FLEET-05, OPS-04, SS-08, AB-04,
+# F08, D03, E02, H01 embedded in the issue title — usually right after the
+# `SAL-XXXX` prefix (but we allow it anywhere as a fallback).
+#
+# AB-14 (SAL-2699): widened with F/D/E/H single-letter plan-doc prefixes so
+# children can grep the plan-doc markdown by ticket.code. Prior to this,
+# "F08: soul-lite service..." parsed to an empty code, leaving the child
+# with no grep anchor (→ scope fabrication; live-run regression on
+# SAL-2616, 2026-04-23).
 _CODE_RE = re.compile(
-    r"\b(TIR|ALT|C|FLEET|OPS|SS|AB|MC|SG)[-_]?(\d{1,3}[A-Za-z]?)\b",
+    r"\b(TIR|ALT|FLEET|OPS|SS|AB|MC|SG|C|D|E|F|H)[-_]?(\d{1,3}[A-Za-z]?)\b",
     re.IGNORECASE,
 )
 
@@ -181,15 +187,20 @@ def _parse_critical_path(labels: Sequence[str]) -> bool:
 
 
 def _parse_code(title: str) -> str:
-    """Pull the short epic code (TIR-01, SS-08, ...) out of the title."""
+    """Pull the short epic code (TIR-01, SS-08, F08, ...) out of the title.
+
+    Preserves the original separator format so plan-doc greps match
+    verbatim: ``TIR-01`` stays ``TIR-01`` (dash); ``F08`` stays ``F08``
+    (no dash). An underscore in the source (``C_26``) is normalised to a
+    dash (``C-26``) because plan docs use the dash form for multi-char
+    prefixes exclusively. Uppercased for consistency.
+    """
     if not title:
         return ""
     m = _CODE_RE.search(title)
     if not m:
         return ""
-    prefix = m.group(1).upper()
-    number = m.group(2).upper()
-    return f"{prefix}-{number}"
+    return m.group(0).upper().replace("_", "-")
 
 
 def _linear_state_to_status(state_name: str) -> TicketStatus:
