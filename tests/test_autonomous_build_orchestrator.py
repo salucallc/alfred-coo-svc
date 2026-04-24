@@ -925,3 +925,441 @@ def test_verification_result_allows_none_hint_for_no_hint_status():
     )
     assert vr.hint is None
     assert vr.status is HintStatus.NO_HINT
+
+
+# ── AB-17-b · _verify_hint + _verify_wave_hints + wave-start wiring ────────
+#
+# Plan I §1 — the core value of Plan I. Per-ticket hint verification runs at
+# wave start; results are stashed on the orchestrator for AB-17-c to render
+# into the ## Target block. These tests mock httpx.AsyncClient so the loop
+# exercises the status-aggregation logic without hitting real GitHub.
+
+
+class _FakeResp:
+    """Minimal httpx.Response stand-in — only carries status_code + json()."""
+
+    def __init__(self, status_code: int, payload: dict | None = None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self) -> dict:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx as _httpx
+            req = _httpx.Request("GET", "https://api.github.com/fake")
+            raise _httpx.HTTPStatusError(
+                f"{self.status_code}", request=req,
+                response=_httpx.Response(self.status_code, request=req),
+            )
+
+
+class _FakeClient:
+    """Script-driven AsyncClient replacement. `responses` is a dict mapping
+    an endpoint-marker (substring of URL + ref) → list of _FakeResp. Each
+    `.get()` pops the first response for the matching marker; leftover
+    markers raise so tests catch missing fakes loudly.
+    """
+
+    # Class-level counter so concurrency tests can observe peak concurrency
+    # regardless of how many FakeClient instances are constructed.
+    _active = 0
+    _peak = 0
+
+    def __init__(self, *args, **kwargs):
+        self._script: list | None = None  # populated by classmethod
+        self._calls: list = []
+
+    async def __aenter__(self):
+        _FakeClient._active += 1
+        if _FakeClient._active > _FakeClient._peak:
+            _FakeClient._peak = _FakeClient._active
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        _FakeClient._active -= 1
+        return False
+
+    async def get(self, url, headers=None, params=None):
+        # Record for assertions + pull from the shared script.
+        _FakeClient._calls_shared.append({"url": url, "params": params})
+        script = _FakeClient._script_shared
+        # Match policy:
+        #   - Matcher keys starting with "repos/" match ONLY repo probes
+        #     (URL ends with "/{owner}/{repo}", no /contents/ segment).
+        #   - Matcher keys starting with "contents/" match ONLY contents
+        #     probes (URL has "/contents/<path>"). Ref must match when
+        #     matcher's ref_part is not None.
+        ref = (params or {}).get("ref") if params else None
+        is_contents_call = "/contents/" in url
+        for matcher, resps in script.items():
+            url_part, ref_part = matcher
+            if url_part.startswith("contents/"):
+                if not is_contents_call:
+                    continue
+                # url_part like "contents/README.md" → check that
+                # "/<url_part>" appears in url (anchored after /contents/).
+                if f"/{url_part}" not in url:
+                    continue
+                if ref_part is not None and ref_part != ref:
+                    continue
+            elif url_part.startswith("repos/"):
+                if is_contents_call:
+                    continue
+                # url_part like "repos/owner/repo" — check url ends with it.
+                if not url.endswith(f"/{url_part}"):
+                    continue
+            else:
+                # Bare substring fallback for any other matcher shape.
+                if url_part not in url:
+                    continue
+                if ref_part is not None and ref_part != ref:
+                    continue
+            if not resps:
+                raise AssertionError(f"FakeClient script exhausted for {matcher}")
+            return resps.pop(0)
+        raise AssertionError(f"no FakeClient script entry matches url={url} ref={ref}")
+
+
+# Shared state so the tests can wire up a script and inspect calls without
+# needing to thread it through constructor kwargs.
+_FakeClient._calls_shared = []
+_FakeClient._script_shared = {}
+
+
+def _reset_fake_client():
+    _FakeClient._active = 0
+    _FakeClient._peak = 0
+    _FakeClient._calls_shared = []
+    _FakeClient._script_shared = {}
+
+
+def _install_fake_client(monkeypatch, script: dict):
+    """Patch `httpx.AsyncClient` in the orchestrator module. `script` keys
+    are (url_substring, ref_or_None) → list of _FakeResp.
+    """
+    _reset_fake_client()
+    _FakeClient._script_shared = script
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.httpx.AsyncClient",
+        _FakeClient,
+    )
+    # Also stub out the 2s sleep used by retry so tests don't stall.
+    import alfred_coo.autonomous_build.orchestrator as _mod
+
+    async def _fast_sleep(_delay):
+        return None
+    monkeypatch.setattr(_mod.asyncio, "sleep", _fast_sleep)
+
+
+# Case 1: happy path — all paths exist → OK.
+async def test_verify_hint_all_paths_exist_status_ok(monkeypatch):
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {"name": "alfred-coo-svc"})],
+        ("contents/deploy/appliance/docker-compose.yml", "main"): [_FakeResp(200, {"type": "file"})],
+        # new_paths expects absent → 404 is the happy outcome.
+        ("contents/deploy/appliance/IMAGE_PINS.md", "main"): [_FakeResp(404)],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("OPS-02", hint)
+
+    assert vr.status is HintStatus.OK
+    assert vr.repo_exists is True
+    assert vr.error is None
+    assert len(vr.path_results) == 2
+    assert all(pr.ok for pr in vr.path_results)
+
+
+# Case 2: repo 404 → REPO_MISSING.
+async def test_verify_hint_repo_404_status_repo_missing(monkeypatch):
+    hint = TargetHint(
+        owner="salucallc",
+        repo="nonexistent-repo",
+        paths=("README.md",),
+    )
+    script = {
+        ("repos/salucallc/nonexistent-repo", None): [_FakeResp(404)],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("X-99", hint)
+
+    assert vr.status is HintStatus.REPO_MISSING
+    assert vr.repo_exists is False
+    assert vr.path_results == ()
+    assert "404" in (vr.error or "")
+
+
+# Case 3: a path in `paths` missing → PATH_MISSING.
+async def test_verify_hint_missing_path_status_path_missing(monkeypatch):
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/docker-compose.yml",
+            "deploy/appliance/Caddyfile",
+        ),
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {})],
+        ("contents/deploy/appliance/docker-compose.yml", "main"): [_FakeResp(200, {})],
+        ("contents/deploy/appliance/Caddyfile", "main"): [_FakeResp(404)],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("OPS-03", hint)
+
+    assert vr.status is HintStatus.PATH_MISSING
+    assert vr.repo_exists is True
+    # Exactly one PathResult should be non-ok.
+    non_ok = [pr for pr in vr.path_results if not pr.ok]
+    assert len(non_ok) == 1
+    assert non_ok[0].path == "deploy/appliance/Caddyfile"
+    assert non_ok[0].observed == "absent"
+
+
+# Case 4: a path in `new_paths` already exists → PATH_CONFLICT.
+async def test_verify_hint_new_path_conflict_status_path_conflict(monkeypatch):
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {})],
+        ("contents/deploy/appliance/docker-compose.yml", "main"): [_FakeResp(200, {})],
+        # IMAGE_PINS.md is meant to be new, but GitHub says it's there.
+        ("contents/deploy/appliance/IMAGE_PINS.md", "main"): [_FakeResp(200, {})],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("OPS-02", hint)
+
+    assert vr.status is HintStatus.PATH_CONFLICT
+    # Conflict takes precedence over other non-OK states.
+    conflicts = [pr for pr in vr.path_results
+                 if pr.expected == "absent" and pr.observed == "exist"]
+    assert len(conflicts) == 1
+
+
+# Case 5: 5xx twice (retry exhausted) → UNVERIFIED with error.
+async def test_verify_hint_5xx_twice_status_unverified(monkeypatch):
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("README.md",),
+    )
+    script = {
+        # _gh_api retries once on 5xx — provide two 503s to exhaust.
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(503), _FakeResp(503)],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("X-5XX", hint)
+
+    # Repo probe raised (5xx twice) → UNVERIFIED, not REPO_MISSING.
+    assert vr.status is HintStatus.UNVERIFIED
+    assert vr.repo_exists is False
+    assert "repo probe failed" in (vr.error or "")
+
+
+# Case 6: 429 rate-limited → UNVERIFIED (no retry).
+async def test_verify_hint_429_status_unverified(monkeypatch):
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("README.md",),
+    )
+    script = {
+        # _gh_api on 429 raises immediately (no retry).
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(429)],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("X-429", hint)
+
+    assert vr.status is HintStatus.UNVERIFIED
+    assert vr.repo_exists is False
+
+
+# ── _verify_wave_hints integration ─────────────────────────────────────────
+
+
+async def test_verify_wave_hints_mixed_cases(monkeypatch):
+    """Three wave-1 tickets: one OK, one with unknown code (NO_HINT), one
+    with a repo_missing hint. `_verify_wave_hints` should return a
+    dict-by-code with all three represented."""
+    orch = _mk_orchestrator()
+    # OPS-01 is a real entry in _TARGET_HINTS → we script it to succeed.
+    # UNKNOWN-99 is not in the table → NO_HINT, no http calls.
+    # OPS-03 we override below — we can't mutate _TARGET_HINTS, so we use
+    # a real code but script its repo as 404.
+    t_ok = _t("u1", "SAL-1", "OPS-01", 1, "ops")
+    t_no_hint = _t("u2", "SAL-2", "UNKNOWN-99", 1, "ops")
+    t_missing = _t("u3", "SAL-3", "OPS-03", 1, "ops")
+    _seed_graph(orch, [t_ok, t_no_hint, t_missing])
+
+    # OPS-01 has paths=("deploy/appliance/docker-compose.yml",).
+    # OPS-03 has 2 paths (Caddyfile, docker-compose.yml).
+    script = {
+        # OPS-01 repo + path — all happy.
+        ("repos/salucallc/alfred-coo-svc", None): [
+            _FakeResp(200, {"name": "alfred-coo-svc"}),
+            _FakeResp(404),  # OPS-03 repo probe (simulate missing)
+        ],
+        ("contents/deploy/appliance/docker-compose.yml", "main"): [
+            _FakeResp(200, {}),
+        ],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    results = await orch._verify_wave_hints(1)
+
+    assert set(results.keys()) == {"OPS-01", "UNKNOWN-99", "OPS-03"}
+    assert results["OPS-01"].status is HintStatus.OK
+    assert results["UNKNOWN-99"].status is HintStatus.NO_HINT
+    assert results["UNKNOWN-99"].hint is None
+    assert results["OPS-03"].status is HintStatus.REPO_MISSING
+
+
+async def test_verify_wave_hints_no_hint_skips_http(monkeypatch):
+    """A ticket whose code is not in _TARGET_HINTS must NOT make any
+    GitHub call — NO_HINT is cheap by construction."""
+    orch = _mk_orchestrator()
+    t = _t("u1", "SAL-1", "ZZ-DOES-NOT-EXIST", 1, "other")
+    _seed_graph(orch, [t])
+
+    _install_fake_client(monkeypatch, {})  # empty script — any call explodes
+    results = await orch._verify_wave_hints(1)
+
+    assert results["ZZ-DOES-NOT-EXIST"].status is HintStatus.NO_HINT
+    assert _FakeClient._calls_shared == []
+
+
+async def test_verify_wave_hints_empty_code_skipped(monkeypatch):
+    """A ticket with an unparseable/empty code is dropped silently —
+    there's nothing to key on in _verified_hints."""
+    orch = _mk_orchestrator()
+    t = _t("u1", "SAL-1", "", 1, "other")
+    _seed_graph(orch, [t])
+
+    _install_fake_client(monkeypatch, {})
+    results = await orch._verify_wave_hints(1)
+    assert results == {}
+
+
+# ── Semaphore concurrency cap ──────────────────────────────────────────────
+
+
+async def test_verify_semaphore_caps_concurrency_at_8(monkeypatch):
+    """Plan I §1.2: the orchestrator owns an asyncio.Semaphore(8) so a
+    wave of N >> 8 tickets never fans out more than 8 hint verifications
+    at a time. We count peak concurrency inside the fake response and
+    assert the cap holds."""
+    orch = _mk_orchestrator()
+    # Build 16 tickets all pointing at OPS-01 (a real hint). We can't
+    # inject 16 distinct _TARGET_HINTS entries at test time, but using the
+    # same code 16× still exercises the semaphore because _verify_hint is
+    # called once per ticket-code (NOT deduped at this layer).
+    tickets = []
+    for i in range(16):
+        tickets.append(_t(f"u{i}", f"SAL-{i}", "OPS-01", 1, "ops"))
+    _seed_graph(orch, tickets)
+
+    # We need 16 repo-probe responses and 16 path-probe responses. Make
+    # every probe block on an event until all 16 have entered the
+    # semaphore so peak concurrency is observable.
+    entered = asyncio.Event()
+    count = {"n": 0}
+
+    class _SlowResp(_FakeResp):
+        async def _gate(self):
+            count["n"] += 1
+            if count["n"] >= 8:
+                entered.set()
+            await entered.wait()
+
+    # Patch _gh_api and _gh_contents directly so we can assert semaphore
+    # semantics without juggling FakeClient for 32 calls.
+    original_verify = orch._verify_hint
+    peak = {"n": 0, "active": 0}
+
+    async def _instrumented_gh_api(path):
+        peak["active"] += 1
+        peak["n"] = max(peak["n"], peak["active"])
+        await asyncio.sleep(0)  # yield
+        try:
+            return {"ok": True}
+        finally:
+            peak["active"] -= 1
+
+    async def _instrumented_gh_contents(owner, repo, path, ref):
+        peak["active"] += 1
+        peak["n"] = max(peak["n"], peak["active"])
+        await asyncio.sleep(0)
+        try:
+            return "exist"
+        finally:
+            peak["active"] -= 1
+
+    monkeypatch.setattr(orch, "_gh_api", _instrumented_gh_api)
+    monkeypatch.setattr(orch, "_gh_contents", _instrumented_gh_contents)
+
+    results = await orch._verify_wave_hints(1)
+    # 16 tickets, same code → last write wins in the dict, but all 16
+    # _verify_hint coroutines ran.
+    assert results["OPS-01"].status is HintStatus.OK
+    # Semaphore(8) → peak active in-flight hint verifications ≤ 8.
+    assert peak["n"] <= 8, f"peak concurrency was {peak['n']}, cap is 8"
+
+
+# ── Wave-start wiring ──────────────────────────────────────────────────────
+
+
+async def test_verified_hints_initialised_empty_on_construction():
+    """AB-17-b instance attribute `_verified_hints` starts at {}; filled
+    lazily at wave start."""
+    orch = _mk_orchestrator()
+    assert orch._verified_hints == {}
+    # Semaphore is constructed too.
+    assert isinstance(orch._verify_semaphore, asyncio.Semaphore)
+
+
+async def test_verify_hint_respects_base_branch(monkeypatch):
+    """Non-default base_branch must be passed through as the `ref` query
+    param. Catches the easy bug where we hardcode `main`."""
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("README.md",),
+        base_branch="develop",
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {})],
+        ("contents/README.md", "develop"): [_FakeResp(200, {})],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("X", hint)
+
+    assert vr.status is HintStatus.OK
+    # Confirm the ref=develop param was sent.
+    ref_params = [c["params"].get("ref") for c in _FakeClient._calls_shared
+                  if c.get("params")]
+    assert "develop" in ref_params
