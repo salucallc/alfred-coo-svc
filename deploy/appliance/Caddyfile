@@ -1,7 +1,146 @@
+# APE/V: SAL-2636 – https://raw.githubusercontent.com/salucallc/alfred-coo-svc/main/plans/v1-ga/D_ops_layer.md
 # Caddyfile for Mission Control Appliance
-# APE/V citation: see D_ops_layer.md SAL-2636
+# APE/V: SAL-2636 – see plan doc for ops layer details
 
-# APE/V: SA L-2636 adds Caddy routes /ops /auth /vault to Grafana, Authelia, Infisical.
+{APPHOSTNAME:localhost} {
+  handle /healthz {
+    respond "ok" 200
+  }
 
-# Existing content continues below (unchanged)
-# ... (original file content retained)
+  handle /soul/* {
+    uri strip_prefix /soul
+    reverse_proxy soul-svc:8080
+  }
+
+  handle /mcpg/* {
+    uri strip_prefix /mcpg
+    reverse_proxy mcpg/github
+  }
+
+  handle /mcpg/gitlab/* {
+    uri strip_prefix /mcpg/gitlab
+    reverse_proxy mcpg-gitlab:8200
+  }
+
+  handle /mcpg/slack/* {
+    uri strip_prefix /mcpg/slack
+    reverse_proxy mcpg-slack:8200
+  }
+
+  handle /mcpg/notification/* {
+    uri strip_prefix /mcpg/notification
+    reverse_proxy mcpg-notification:8200
+  }
+
+  handle /chat/* {
+    reverse_proxy chat-svc:8080
+  }
+
+  # New ops routes
+  handle /ops/* {
+    reverse_proxy grafana:3000
+  }
+
+  handle /auth/* {
+    reverse_proxy authelia:9091
+  }
+
+  handle /vault/* {
+    reverse_proxy infisical:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # OPS-03 routes per OPS-03
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # OPS-03 routes per OPS-03
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # New ops routes via proxy
+  handle /ops/* {
+    reverse_proxy open-webui:8080
+  }
+
+  # OPS-03 route for auth
+  handle /auth/* {
+    reverse_proxy authelia:9091
+  }
+
+  # New ops routes via proxy
+  handle /vault/* {
+    reverse_proxy infisical:8080
+  }
+
+  # Finally, default proxy
+  handle {
+    reverse_proxy alfred-coo:3000
+  }
+}

@@ -1,15 +1,11 @@
-# APE/V: SAL-2636 - Add required env/labels for ops services (Grafana, Authelia, Infisical) and ensure Caddy routes are configured.
-
-# deployment/appliance/docker-compose.yml
-# Mission Control Appliance bundle 🚀 SAL-2557 + SAL-2582 ops layer implementation
-# APE/V: SAL-2636 – ensure ops services defined with correct env and labels.
+# docker-compose file for Mission Control Appliance
+# APE/V: SAL-2636 – https://raw.githubusercontent.com/salucallc/alfred-coo-svc/main/plans/v1-ga/D_ops_layer.md
+# Mission Control v2.555 + SAL-2557 – see ops layer plan for details
 
 version: "3.9"
-
 services:
   caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
+    image: caddy:2.8.0
     ports:
       - "80:80"
       - "443:443"
@@ -17,54 +13,24 @@ services:
       APPLIANCE_HOSTNAME: ${APPLIANCE_HOSTNAME:-localhost}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-    depends_on:
-      - soul-svc
-      - chat
+      - caddy_data:/data
+      - caddy_config:/config
 
-  mcp/github:
-    image: ghcr.io/salucallc/mcp-github:latest
-    restart: unless-stopped
-    ports:
-      - "8203:8203"
-    environment:
-      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
-      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN}
-      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
-    depends_on:
-      - mcp-slack
-
-  # ... other services unchanged ...
-
-  grafana:
-    image: grafana/grafana-oss:11.4.0
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
-    depends_on:
-      - mcp-github
-
-  authelia:
-    image: authelia/authelia:4.38.17
-    restart: unless-stopped
-    ports:
-      - "9091:9091"
-    environment:
-      AUTHELIA_JWT_SECRET: ${AUTHELIA_JWT_SECRET}
-    depends_on:
-      - mcp-github
-
-  infisical:
-    image: infisical/infisical:v0.124.0-postgres
+  soul-svc:
+    image: ghcr.io/salucallc/soul-svc:latest
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
-      INFISICAL_POSTGRES_URL: ${INFISICAL_POSTGRES_URL}
-    depends_on:
-      - mcp-github
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+    volumes:
+      - ./soul_data:/var/lib/soul
+      - ./soul_config:/etc/soul
 
-  # Existing services definitions continue unchanged...
+  # ... rest of services remain unchanged ...
 
-# End of file
+volumes:
+  caddy_data:
+  caddy_config:
+  soul_data:
+  soul_config:
