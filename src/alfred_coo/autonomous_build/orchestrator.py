@@ -1947,6 +1947,65 @@ class AutonomousBuildOrchestrator:
         )
         return True
 
+    async def _lookup_pr_branch(self, pr_url: Optional[str]) -> Optional[str]:
+        """Fetch ``head.ref`` for a GitHub PR URL via the REST API.
+
+        AB-17-o: the respawn body needs to name the branch so the child
+        can call ``update_pr`` against it. We do NOT persist branch on the
+        Ticket dataclass (propose_pr returns it but our orchestrator
+        previously discarded it), so look it up live. Best-effort: on
+        transport / auth / 404, returns ``None`` and the caller renders
+        a placeholder that fails loud rather than pushing to a wrong
+        branch.
+        """
+        if not pr_url:
+            return None
+        m = _PR_URL_RE.search(pr_url)
+        if not m:
+            return None
+        # Parse owner / repo / number out of the url for the api call.
+        # _PR_URL_RE only captures the whole URL, so re-parse with a
+        # dedicated pattern here.
+        sub = re.search(
+            r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_url
+        )
+        if not sub:
+            return None
+        owner, repo, num = sub.group(1), sub.group(2), sub.group(3)
+        try:
+            data = await self._gh_api(f"repos/{owner}/{repo}/pulls/{num}")
+        except Exception:
+            logger.exception("pr branch lookup failed for %s", pr_url)
+            return None
+        if not data:
+            return None
+        head = data.get("head") or {}
+        ref = head.get("ref")
+        return str(ref) if ref else None
+
+    async def _render_prior_pr_block(self, ticket: Ticket) -> str:
+        """Render the ``## Prior PR`` section for a fix-round respawn.
+
+        Body pins the existing PR URL + branch so the respawned child
+        knows to call ``update_pr`` (AB-17-o) instead of ``propose_pr``.
+        If the branch lookup fails, the block still emits with a
+        ``(lookup failed)`` marker so the child surfaces it as a
+        grounding gap rather than silently opening a new PR.
+        """
+        branch = await self._lookup_pr_branch(ticket.pr_url)
+        branch_line = branch or "(lookup failed — escalate via linear_create_issue)"
+        return (
+            "## Prior PR\n"
+            f"url: {ticket.pr_url}\n"
+            f"branch: {branch_line}\n"
+            "\n"
+            "This ticket was previously submitted as the PR above and "
+            "received REQUEST_CHANGES. To apply the review feedback below, "
+            "use the `update_pr` tool to push a new commit to the EXISTING "
+            "branch — do NOT call `propose_pr` (which would create a "
+            "duplicate PR on a new branch).\n"
+        )
+
     async def _respawn_child_with_fixes(
         self,
         ticket: Ticket,
@@ -1998,6 +2057,17 @@ class AutonomousBuildOrchestrator:
             ticket.code,
             vr=self._verified_hints.get(ticket.code),
         )
+
+        # AB-17-o (2026-04-24): look up the existing PR's head.ref so the
+        # respawned child can call the new ``update_pr`` tool against the
+        # same branch. v8-full-v4 wave-0 exposed the duplicate-PR leak:
+        # each respawn was calling ``propose_pr`` with a fresh timestamped
+        # branch, opening a NEW PR per cycle (acs#59/60, ts#4/5, ss#17/18).
+        # ``_lookup_pr_branch`` is best-effort; if it fails we still render
+        # the ``## Prior PR`` section with a placeholder so the child knows
+        # to skip ``propose_pr`` and surface the failure explicitly.
+        prior_pr_block = await self._render_prior_pr_block(ticket)
+
         body = (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -2009,12 +2079,14 @@ class AutonomousBuildOrchestrator:
             f"\n"
             f"{target_block}"
             f"\n"
+            f"{prior_pr_block}"
+            f"\n"
             f"## Acceptance (APE/V)\n"
             f"- [ ] Address every point in the review feedback below.\n"
             f"- [ ] Tests still green (`ruff` + `pytest`).\n"
-            f"- [ ] Push fixes to the EXISTING branch for {ticket.pr_url}; "
-            f"do NOT open a new PR. The reviewer bot will re-review "
-            f"automatically once your new commit lands.\n"
+            f"- [ ] Push fixes to the EXISTING branch for {ticket.pr_url} "
+            f"via the `update_pr` tool; do NOT open a new PR. The reviewer "
+            f"bot will re-review automatically once your new commit lands.\n"
             f"\n"
             f"## Review feedback\n"
             f"{review_excerpt or _NO_REVIEW_BODY_NOTE}\n"
@@ -2023,8 +2095,9 @@ class AutonomousBuildOrchestrator:
             f"{plan_doc}\n"
             f"\n"
             f"## Instructions\n"
-            f"Push fixes to existing branch; do NOT open a new PR. "
-            f"The reviewer bot will re-review automatically.\n"
+            f"Push fixes to the existing branch via `update_pr`; do NOT "
+            f"call `propose_pr` (that would open a duplicate PR). The "
+            f"reviewer bot will re-review automatically.\n"
         )
 
         resp = await self.mesh.create_task(

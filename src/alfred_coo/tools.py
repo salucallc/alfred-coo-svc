@@ -419,6 +419,284 @@ async def propose_pr(
     }
 
 
+# ── update_pr (AB-17-o) ─────────────────────────────────────────────────────
+#
+# Fix-round companion to propose_pr. When hawkman-qa-a emits REQUEST_CHANGES
+# on an existing PR, the orchestrator respawns a child alfred-coo-a task with
+# a ``## Prior PR`` section pinning the branch. The child must push fixes to
+# that *existing* branch so the original PR and its review thread are
+# preserved. Using ``propose_pr`` on a respawn would open a duplicate PR on a
+# new branch, which is the exact behaviour v8-full-v4 exposed on wave-0
+# (acs#59/60, ts#4/5, ss#17/18). Worst case with MAX_REVIEW_CYCLES=3 across
+# 95 tickets would be 285 orphan PRs. This tool exists to stop that bleed.
+
+_PR_URL_PATTERN = re.compile(
+    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)/?$"
+)
+
+
+async def update_pr(
+    pr_url: str,
+    branch: str,
+    commit_message: str,
+    files: Optional[List[Dict[str, str]]] = None,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    force_push: bool = False,
+    task_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Push file updates to an existing PR's feature branch.
+
+    AB-17-o (2026-04-24): companion to ``propose_pr`` for fix-round respawns
+    after a hawkman REQUEST_CHANGES. Clones the repo, fetches the existing
+    branch, writes the given files, commits, and pushes. Preserves the
+    existing PR URL + review thread instead of opening a duplicate PR on a
+    fresh timestamped branch.
+
+    ``files`` is a list of ``{"path": str, "content": str}`` dicts. The list
+    form (versus propose_pr's dict form) matches how hawkman feedback names
+    the paths to edit and avoids key-collision edge cases when the fix-round
+    spec carries ordered edits.
+
+    Errors raise ``UpdatePrError`` so the dispatch loop surfaces a clean
+    message rather than a partial push. In particular: refuse to touch a
+    CLOSED or MERGED PR, refuse a missing branch (that is propose_pr's job),
+    refuse an empty ``files`` list (silent no-op would hide a bug), and
+    refuse a non-fast-forward push unless ``force_push=True``.
+
+    Returns ``{"pushed_sha", "pr_url", "commit_url", "branch", "pr_number",
+    "files_written", "commit_message"}``.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return {"error": "GITHUB_TOKEN not configured"}
+
+    # Parse pr_url into (owner, repo, pr_number).
+    m = _PR_URL_PATTERN.match((pr_url or "").strip())
+    if not m:
+        return {
+            "error": (
+                f"invalid pr_url {pr_url!r}; expected "
+                "https://github.com/<owner>/<repo>/pull/<n>"
+            )
+        }
+    owner = m.group("owner")
+    repo = m.group("repo")
+    try:
+        pr_number = int(m.group("number"))
+    except (TypeError, ValueError):
+        return {"error": "could not parse pr number from url"}
+
+    if owner not in _ALLOWED_ORGS:
+        return {"error": f"owner {owner!r} not in allowlist {sorted(_ALLOWED_ORGS)}"}
+    if not _VALID_OWNER_RE.match(owner):
+        return {"error": "invalid owner name"}
+    if not _VALID_REPO_RE.match(repo):
+        return {"error": "invalid repo name"}
+    if not _VALID_BRANCH_RE.match(branch or ""):
+        return {"error": "invalid branch name"}
+    if not commit_message or not commit_message.strip():
+        return {"error": "commit_message must be non-empty"}
+
+    if not isinstance(files, list) or not files:
+        return {"error": "files must be a non-empty list of {path, content}"}
+    for entry in files:
+        if not isinstance(entry, dict):
+            return {"error": "each files[] entry must be a dict"}
+        if "path" not in entry or "content" not in entry:
+            return {"error": "each files[] entry must have 'path' and 'content'"}
+        if not isinstance(entry["path"], str) or not isinstance(entry["content"], str):
+            return {"error": "files[] path and content must be strings"}
+
+    # ── Step 1: confirm PR is open. Refuse closed / merged up-front so the
+    # caller gets a clear error instead of a mystery push against a stale
+    # branch that nobody is reading anymore.
+    pr_meta_req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(pr_meta_req, timeout=30) as r:
+            pr_meta = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {
+            "error": f"github pulls GET http {e.code}",
+            "response": e.read().decode()[:500],
+        }
+    except Exception as e:
+        return {"error": f"github api transport: {type(e).__name__}: {e}"}
+
+    state = (pr_meta.get("state") or "").lower()
+    merged = bool(pr_meta.get("merged"))
+    if merged:
+        return {"error": "PR not open: state=merged"}
+    if state != "open":
+        return {"error": f"PR not open: state={state}"}
+
+    head_ref = (pr_meta.get("head") or {}).get("ref") or ""
+    if head_ref and head_ref != branch:
+        # Caller named a branch that doesn't match the PR head. Bail rather
+        # than push to the wrong branch and confuse the review thread.
+        return {
+            "error": (
+                f"branch mismatch: pr head is {head_ref!r} but caller "
+                f"passed {branch!r}"
+            )
+        }
+
+    # ── Step 2: clone fresh workspace + fetch the feature branch. We clone
+    # main shallowly (--no-checkout) then fetch + check out the target
+    # branch. This avoids needing the default branch at all and keeps the
+    # operation fast on large repos.
+    workspace_id = task_id or get_current_task_id() or f"ad-hoc-{os.getpid()}"
+    workspace = WORKSPACE_ROOT / workspace_id / f"{repo}-update-{pr_number}"
+    if workspace.exists():
+        shutil.rmtree(workspace, ignore_errors=True)
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+
+    clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+    env = _git_env()
+
+    rc, _, err = await _run(
+        ["git", "clone", "--no-checkout", "--filter=blob:none", clone_url, str(workspace)],
+        env=env,
+    )
+    if rc != 0:
+        return {"error": "git clone failed", "stderr": err[:500]}
+
+    rc, _, err = await _run(
+        ["git", "fetch", "origin", branch], cwd=workspace, env=env,
+    )
+    if rc != 0:
+        return {
+            "error": f"branch not found: {branch}",
+            "stderr": err[:500],
+        }
+
+    rc, _, err = await _run(
+        ["git", "checkout", "-B", branch, f"origin/{branch}"],
+        cwd=workspace, env=env,
+    )
+    if rc != 0:
+        return {"error": "git checkout failed", "stderr": err[:500]}
+
+    # ── Step 3: write files + commit.
+    written: List[str] = []
+    for entry in files:
+        rel_path = entry["path"]
+        content = entry["content"]
+        target = _safe_workspace_path(workspace, rel_path)
+        if target is None:
+            return {"error": f"unsafe path: {rel_path!r}"}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8", newline="\n")
+        written.append(rel_path)
+
+    rc, _, err = await _run(["git", "add", *written], cwd=workspace, env=env)
+    if rc != 0:
+        return {"error": "git add failed", "stderr": err[:500]}
+
+    rc, _, err = await _run(
+        ["git", "commit", "-m", commit_message], cwd=workspace, env=env,
+    )
+    if rc != 0:
+        # "nothing to commit" is a distinct failure — the caller passed files
+        # identical to what is already on the branch, which shouldn't silently
+        # succeed. Surface the git stderr verbatim (truncated) so the model
+        # can adjust.
+        return {"error": "git commit failed", "stderr": err[:500]}
+
+    push_cmd = ["git", "push", "origin", branch]
+    if force_push:
+        push_cmd = ["git", "push", "--force-with-lease", "origin", branch]
+    rc, _, err = await _run(push_cmd, cwd=workspace, env=env)
+    if rc != 0:
+        hint = (
+            " (non-fast-forward; retry with force_push=True if intentional)"
+            if "non-fast-forward" in (err or "").lower()
+            or "rejected" in (err or "").lower()
+            else ""
+        )
+        return {
+            "error": f"git push failed{hint}",
+            "stderr": err[:500],
+        }
+
+    # Capture the pushed sha for the return envelope.
+    rc, sha_out, err = await _run(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, env=env,
+    )
+    pushed_sha = (sha_out or "").strip()
+    if rc != 0 or not pushed_sha:
+        return {"error": "could not read pushed sha", "stderr": err[:500]}
+
+    # ── Step 4: optional PR title / body update.
+    if title is not None or body is not None:
+        patch_payload: Dict[str, Any] = {}
+        if title is not None:
+            patch_payload["title"] = str(title)
+        if body is not None:
+            patch_payload["body"] = str(body)
+        patch_req = urllib.request.Request(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            data=json.dumps(patch_payload).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "saluca-alfred/1.0",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            method="PATCH",
+        )
+        try:
+            with urllib.request.urlopen(patch_req, timeout=30) as r:
+                r.read()  # consume
+        except urllib.error.HTTPError as e:
+            # Push already succeeded, so don't fail the whole call — return
+            # the sha + a warning. The fix-round is still landed.
+            return {
+                "pushed_sha": pushed_sha,
+                "pr_url": pr_url,
+                "pr_number": pr_number,
+                "branch": branch,
+                "files_written": written,
+                "commit_message": commit_message.split("\n")[0],
+                "commit_url": f"https://github.com/{owner}/{repo}/commit/{pushed_sha}",
+                "warning": (
+                    f"pr title/body patch failed http {e.code}: "
+                    f"{e.read().decode()[:200]}"
+                ),
+            }
+        except Exception as e:
+            return {
+                "pushed_sha": pushed_sha,
+                "pr_url": pr_url,
+                "pr_number": pr_number,
+                "branch": branch,
+                "files_written": written,
+                "commit_message": commit_message.split("\n")[0],
+                "commit_url": f"https://github.com/{owner}/{repo}/commit/{pushed_sha}",
+                "warning": f"pr patch transport: {type(e).__name__}: {e}",
+            }
+
+    return {
+        "pushed_sha": pushed_sha,
+        "pr_url": pr_url,
+        "pr_number": pr_number,
+        "branch": branch,
+        "files_written": written,
+        "commit_message": commit_message.split("\n")[0],
+        "commit_url": f"https://github.com/{owner}/{repo}/commit/{pushed_sha}",
+    }
+
+
 # ── pr_review ───────────────────────────────────────────────────────────────
 
 _PR_REVIEW_EVENTS = frozenset({"APPROVE", "REQUEST_CHANGES", "COMMENT"})
@@ -1540,6 +1818,65 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=propose_pr,
+    ),
+    "update_pr": ToolSpec(
+        name="update_pr",
+        description=(
+            "Push file updates to an EXISTING pull request's feature branch. "
+            "AB-17-o fix-round companion to propose_pr: when a task body "
+            "contains a `## Prior PR` section (set by the orchestrator on a "
+            "REQUEST_CHANGES respawn), call update_pr with that PR URL + "
+            "branch instead of propose_pr so the original review thread is "
+            "preserved and no duplicate PR is opened. Refuses closed / "
+            "merged PRs and missing branches (that's propose_pr's job). "
+            "Only Saluca-owned repos (salucallc, saluca-labs, "
+            "cristianxruvalcaba-coder) are allowed."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "pr_url": {
+                    "type": "string",
+                    "description": "Full PR URL (https://github.com/<owner>/<repo>/pull/<n>).",
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Existing feature branch on the PR head (e.g. 'feature/sal-2615-x').",
+                },
+                "commit_message": {
+                    "type": "string",
+                    "description": "Commit message for the fix-round push. Required.",
+                },
+                "files": {
+                    "type": "array",
+                    "description": "Files to overwrite. Each item: {path, content}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional PR title replacement. Omit to keep existing.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Optional PR body replacement. Omit to keep existing.",
+                },
+                "force_push": {
+                    "type": "boolean",
+                    "description": "Use --force-with-lease on the push. Default false.",
+                },
+            },
+            "required": ["pr_url", "branch", "commit_message", "files"],
+            "additionalProperties": False,
+        },
+        handler=update_pr,
     ),
     "pr_review": ToolSpec(
         name="pr_review",
