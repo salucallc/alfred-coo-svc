@@ -30,6 +30,7 @@ from alfred_coo.autonomous_build.orchestrator import (
     TargetHint,
     VerificationResult,
     _TARGET_HINTS,
+    _VERDICT_REQUEST_CHANGES_RE,
     _render_target_block,
 )
 
@@ -1884,3 +1885,116 @@ async def test_child_task_body_uses_verified_hints_without_hasattr_guard(
     assert "# verified exists @ main" in body
     # And no legacy fallthrough to `(unresolved)`.
     assert "(unresolved" not in body
+
+
+# ── AB-17-k · respawn grounding + verdict extraction hardening ─────────────
+#
+# v8-smoke-e (mesh task c4459e37, 2026-04-24 ~16:33 UTC) passed the human
+# gate but failed the orchestrator's internal gate at green_ratio=0.87.
+# Three distinct defects diagnosed by debug sub ad3aa6937:
+#   1. `_respawn_child_with_fixes` omitted the ## Target block the initial
+#      dispatch renders (SAL-2634 fix-round silent-escalated).
+#   2. `_VERDICT_REQUEST_CHANGES_RE` missed past-tense "Requested changes"
+#      (SAL-2583 silent verdict, trace row 115).
+#   3. `_extract_verdict` priority-1 read `result.state` but the mesh-task
+#      daemon persists tool-call *arguments*, not *results*; priority-1b
+#      now inspects arguments directly.
+
+
+def test_respawn_body_includes_target_block():
+    """AB-17-k · Edit 1 · `_respawn_child_with_fixes` body now renders the
+    same `## Target` block as `_child_task_body`. v8-smoke-e SAL-2634:
+    the respawned child had no target grounding, silent-escalated via
+    linear_create_issue against a broken prompt. Regression guard.
+    """
+    orch = _mk_orchestrator()
+    # Pre-populate _verified_hints so the rendered block carries the
+    # owner/repo + verified-exists marker the child would have seen on
+    # initial dispatch.
+    hint = _TARGET_HINTS["OPS-01"]
+    orch._verified_hints["OPS-01"] = VerificationResult(
+        code="OPS-01",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=tuple(
+            PathResult(path=p, expected="exist", observed="exist", ok=True)
+            for p in hint.paths
+        ),
+    )
+    ticket = _t("u-ops-01", "SAL-2634", "OPS-01", 0, "ops", size="S")
+    ticket.pr_url = "https://github.com/salucallc/alfred-coo-svc/pull/42"
+    ticket.review_cycles = 1
+
+    asyncio.run(orch._respawn_child_with_fixes(ticket, "please address foo"))
+
+    # The mesh_create_task call captured the body we care about.
+    assert orch.mesh.created, "respawn should have created a child task"
+    body = orch.mesh.created[-1]["description"]
+    assert "## Target" in body
+    # Owner/repo pinned from the verified hint.
+    assert hint.owner in body
+    assert hint.repo in body
+    # And the verified-exists marker from _render_target_block.
+    assert "# verified exists @ main" in body
+
+
+def test_verdict_regex_matches_past_tense():
+    """AB-17-k · Edit 2 · `_VERDICT_REQUEST_CHANGES_RE` now matches
+    past-tense + gerund variants. v8-smoke-e SAL-2583 trace row 115:
+    envelope summary was "Requested changes", which the AB-17-i pattern
+    missed (only `request(?:ing)?`). Regression guard.
+    """
+    accept = [
+        "REQUEST_CHANGES",
+        "request_changes",
+        "request changes",
+        "Requesting changes",
+        "Requested changes",
+        "Request Change",
+    ]
+    for s in accept:
+        assert _VERDICT_REQUEST_CHANGES_RE.search(s), f"should match: {s!r}"
+
+    # Reject: unrelated vocabulary must not match.
+    assert not _VERDICT_REQUEST_CHANGES_RE.search("disapprove")
+
+
+def test_extract_verdict_from_tool_call_args():
+    """AB-17-k · Edit 3 · `_extract_verdict` priority-1b inspects tool-call
+    arguments when mesh doesn't persist results. Synthetic `pr_review`
+    call with arguments={"event":"REQUEST_CHANGES"} + empty result.
+    Asserts verdict is extracted via the new priority-1b path, before
+    falling through to the priority-2 summary regex.
+    """
+    result = {
+        "tool_calls": [
+            {
+                "name": "pr_review",
+                # Empty result/output mirrors the mesh-task daemon shape
+                # observed in v8-smoke-e SAL-2583.
+                "result": {},
+                "arguments": {
+                    "event": "REQUEST_CHANGES",
+                    "body": "address the target grounding gap",
+                },
+            }
+        ],
+        # Summary contains no verdict token, so priority-2 regex must
+        # fail — if the test passes, priority-1b is the only source.
+        "summary": "review completed",
+    }
+    assert AutonomousBuildOrchestrator._extract_verdict(result) == "REQUEST_CHANGES"
+
+    # Also cover the JSON-string arguments shape some mesh adapters use.
+    result_json_args = {
+        "tool_calls": [
+            {
+                "name": "pr_review",
+                "result": None,
+                "arguments": json.dumps({"event": "APPROVE"}),
+            }
+        ],
+        "summary": "",
+    }
+    assert AutonomousBuildOrchestrator._extract_verdict(result_json_args) == "APPROVE"

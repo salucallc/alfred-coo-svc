@@ -92,8 +92,11 @@ MAX_REVIEW_CYCLES = 3
 #   REQ-CH    matches: REQUEST_CHANGES, request-changes, request changes,
 #                      Requesting changes, Request Change, request_change
 _VERDICT_APPROVE_RE = re.compile(r"\bapprove[ds]?\b", re.IGNORECASE)
+# AB-17-k (2026-04-24 v8-smoke-e trace 115): extend to past-tense "Requested"
+# and singular "change" — envelope summaries like "Requested changes" leaked
+# past the AB-17-i pattern and returned None from _extract_verdict.
 _VERDICT_REQUEST_CHANGES_RE = re.compile(
-    r"\brequest(?:ing)?[ _-]?changes?\b", re.IGNORECASE
+    r"\brequest(?:ing|ed)?[ _-]?change(?:s|d)?\b", re.IGNORECASE
 )
 
 # Placeholder used when a REQUEST_CHANGES review body is empty/missing.
@@ -1523,6 +1526,25 @@ class AutonomousBuildOrchestrator:
                 state = out.get("state")
                 if isinstance(state, str) and state:
                     return state.upper()
+                # AB-17-k priority-1b: the mesh-task daemon persists
+                # tool-call *arguments*, not *results* — so `out.state`
+                # is always empty. v8-smoke-e SAL-2583 (trace 115):
+                # hawkman emitted pr_review(event="REQUEST_CHANGES", ...)
+                # but result was bare, priority-2 regex missed the
+                # past-tense "Requested changes" in the envelope, and
+                # verdict returned None. Inspect arguments directly.
+                args = call.get("arguments") or call.get("args") or call.get("input")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = None
+                if isinstance(args, dict):
+                    event = args.get("event") or args.get("state")
+                    if isinstance(event, str):
+                        event = event.strip().upper()
+                        if event in ("APPROVE", "REQUEST_CHANGES", "COMMENT", "COMMENTED_FALLBACK"):
+                            return event
 
         # Priority 2: summary regex.
         summary = result.get("summary")
@@ -1933,6 +1955,16 @@ class AutonomousBuildOrchestrator:
 
         plan_doc = self._plan_doc_for_epic(ticket.epic)
         cp_line = " CRITICAL-PATH" if ticket.is_critical_path else ""
+        # AB-17-k (2026-04-24): respawn body now includes the same
+        # ``## Target`` block rendered on initial dispatch. v8-smoke-e
+        # SAL-2634 showed the fix-round child had no target grounding and
+        # silent-escalated, because the original respawn body skipped the
+        # block that `_child_task_body` emits. Mirror it here so the
+        # respawned child knows owner/repo/paths.
+        target_block = _render_target_block(
+            ticket.code,
+            vr=self._verified_hints.get(ticket.code),
+        )
         body = (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -1941,6 +1973,8 @@ class AutonomousBuildOrchestrator:
             f"Parent autonomous_build kickoff: {self.task_id}\n"
             f"Previous PR: {ticket.pr_url}\n"
             f"Review round: {round_num} of {MAX_REVIEW_CYCLES}\n"
+            f"\n"
+            f"{target_block}"
             f"\n"
             f"## Acceptance (APE/V)\n"
             f"- [ ] Address every point in the review feedback below.\n"
