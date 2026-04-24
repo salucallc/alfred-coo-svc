@@ -1,9 +1,10 @@
-from fastapi.testclient import TestClient
+import pytest
+from httpx import AsyncClient
 from aletheia.app.main import app
 
-client = TestClient(app)
-
-def test_healthz():
-    response = client.get("/healthz")
+@pytest.mark.asyncio
+async def test_healthz():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}

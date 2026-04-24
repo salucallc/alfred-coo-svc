@@ -5,9 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aletheia"
 version = "0.1.0"
-description = "Aletheia verification daemon"
+description = "Standalone Aletheia verifier service"
+authors = [{name = "Saluca", email = "dev@saluca.com"}]
+readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn"]
+license = {text = "MIT"}
+
+[project.dependencies]
+fastapi = "*"
+uvicorn = {extras = ["standard"], version = "*"}
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,12 +1,15 @@
 FROM python:3.11-slim
 
+# Set work directory
 WORKDIR /app
 
-COPY pyproject.toml .
+# Install dependencies
+COPY aletheia/pyproject.toml .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
 
-COPY aletheia ./aletheia
+# Copy source code
+COPY aletheia/ ./aletheia/
 
 EXPOSE 8080
 
