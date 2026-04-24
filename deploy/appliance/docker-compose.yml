@@ -91,7 +91,7 @@ services:
     networks:
       - appliance
 
-  # — MCP Services (curated: github, slack, linear, notion) ————
+  # — MCP Services (curated: github, slack, linear, notion) ———
   mcp-github:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
     restart: unless-stopped
@@ -166,6 +166,67 @@ services:
     networks:
       - appliance
 
+  # New Ops services
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${POSTGRES_PASSWORD:?must set}
+    depends_on:
+      - prometheus
+      - loki
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - appliance
+
+  authelia:
+    image: authelia/authelia:4.38.17
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+    volumes:
+      - authelia_data:/config
+    networks:
+      - appliance
+
+  infisical:
+    image: infisical/infisical:v0.124.0-postgres
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://appliance:${POSTGRES_PASSWORD:?must set}@postgres:5432/infisical
+    depends_on:
+      - postgres
+    volumes:
+      - infisical_data:/app/data
+    networks:
+      - appliance
+
+  # Observability stack services (already defined earlier in the file) – placeholders for completeness
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    restart: unless-stopped
+    networks:
+      - appliance
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    volumes:
+      - prometheus_data:/prometheus
+    networks:
+      - appliance
+
+  loki:
+    image: grafana/loki:3.3.2
+    restart: unless-stopped
+    volumes:
+      - loki_data:/loki
+    networks:
+      - appliance
+
+  # Additional services (restic, etc.) could be added here
+
 volumes:
   caddy_data:
   caddy_config:
@@ -176,6 +237,8 @@ volumes:
   prometheus_data:
   loki_data:
   restic_data:
+  authelia_data:
+  infisical_data:
 
 networks:
   appliance:
