@@ -224,3 +224,98 @@ def test_alfred_coo_a_prompt_contains_all_mandated_phrases():
     assert "do not guess" in lower, "mandated phrase missing: 'Do NOT guess'"
     for i in range(7):
         assert f"STEP {i}" in prompt, f"missing STEP {i} marker"
+
+
+# ── AB-15: hawkman-qa-a APE/V citation + 300-line diff cap (SAL-2700) ───────
+#
+# Root cause R1/R2 of the 2026-04-24 off-scope PR incident (#31/#32): the
+# hawkman-qa-a system_prompt had no APE/V-citation gate and no diff-size
+# cap, so the reviewer APPROVED both phantom PRs. This suite asserts the
+# extended prompt contains every mandated phrase from plan H §2 G-5 + G-7.
+# Reference: Z:/_planning/v1-ga/H_child_grounding.md §2 G-5 + G-7.
+
+
+def _hawkman_prompt() -> str:
+    return BUILTIN_PERSONAS["hawkman-qa-a"].system_prompt
+
+
+def test_hawkman_prompt_declares_ape_v_gate():
+    """Gate 1: prompt must reference APE/V by name so the reviewer knows
+    which acceptance structure to look for."""
+    assert "APE/V" in _hawkman_prompt()
+
+
+def test_hawkman_prompt_requires_verbatim_citation():
+    """Gate 1: prompt must instruct the reviewer to verify the PR cites
+    the acceptance lines verbatim (or 'verbatim citation') from the plan."""
+    prompt = _hawkman_prompt()
+    assert (
+        "cite the acceptance lines verbatim" in prompt
+        or "verbatim citation" in prompt
+    ), "prompt must require verbatim APE/V citation"
+
+
+def test_hawkman_prompt_declares_request_changes_verdict():
+    """Both gates route failures through pr_review REQUEST_CHANGES."""
+    assert "REQUEST_CHANGES" in _hawkman_prompt()
+
+
+def test_hawkman_prompt_has_missing_ape_v_citation_reason():
+    """Gate 1 reason-string for pr_review must be the exact phrase the
+    orchestrator-side validator (AB-15 partner work) expects."""
+    assert "missing APE/V citation" in _hawkman_prompt()
+
+
+def test_hawkman_prompt_has_300_line_cap():
+    """Gate 2: the 300-line threshold must be spelled out numerically."""
+    assert "300" in _hawkman_prompt()
+
+
+def test_hawkman_prompt_names_size_s_and_size_m_labels():
+    """Gate 2 only triggers on size-S / size-M tickets; both labels must
+    be named explicitly (case-insensitive to accept either styling)."""
+    prompt = _hawkman_prompt()
+    lower = prompt.lower()
+    assert "size-s" in lower, "missing size-S label reference"
+    assert "size-m" in lower, "missing size-M label reference"
+
+
+def test_hawkman_prompt_has_oversized_diff_escape_hatch():
+    """Gate 2: the PR-body escape-hatch marker 'Justification for oversized
+    diff:' must appear verbatim so the builder persona knows the exact
+    phrase to use when a legitimate split is impractical."""
+    assert "Justification for oversized diff" in _hawkman_prompt()
+
+
+def test_hawkman_prompt_preserves_ab12_verifier_protocol():
+    """Extending the prompt must NOT delete the existing independent-
+    verifier protocol; the 'independent verifier' framing and the
+    pr_files_get guidance must still be present."""
+    prompt = _hawkman_prompt()
+    assert "independent verifier" in prompt
+    assert "pr_files_get" in prompt
+
+
+def test_hawkman_prompt_contains_all_mandated_phrases():
+    """Single-shot aggregate check: every mandated phrase from the AB-15
+    spec must be present. Guards against future edits that silently remove
+    one of them."""
+    prompt = _hawkman_prompt()
+    lower = prompt.lower()
+    mandated_exact = [
+        "APE/V",
+        "REQUEST_CHANGES",
+        "300",
+        "Justification for oversized diff",
+        "missing APE/V citation",
+    ]
+    for phrase in mandated_exact:
+        assert phrase in prompt, f"mandated phrase missing: {phrase!r}"
+    # verbatim-citation phrasing: either form is acceptable
+    assert (
+        "cite the acceptance lines verbatim" in prompt
+        or "verbatim citation" in prompt
+    ), "mandated phrase missing: 'cite the acceptance lines verbatim'"
+    # size labels: case-insensitive
+    assert "size-s" in lower, "mandated phrase missing: 'size-S'"
+    assert "size-m" in lower, "mandated phrase missing: 'size-M'"
