@@ -707,6 +707,17 @@ class AutonomousBuildOrchestrator:
 
         updated: List[Ticket] = []
         for ticket in in_flight:
+            # AB-08 bug fix (2026-04-24): if the ticket is already past
+            # PR_OPEN — i.e. already handed off to _poll_reviews — do NOT
+            # re-process the same completed child record. Otherwise every
+            # poll cycle re-fires _dispatch_review, spawning duplicate
+            # review tasks and burning budget. Observed on v5 live run:
+            # SAL-2634 got 15+ review tasks in 7 minutes before the patch.
+            if ticket.status in (
+                TicketStatus.REVIEWING,
+                TicketStatus.MERGE_REQUESTED,
+            ):
+                continue
             rec = by_id.get(ticket.child_task_id)
             if rec is None:
                 # Still in flight. Escalate status from DISPATCHED to

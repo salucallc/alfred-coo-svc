@@ -581,3 +581,51 @@ def test_parse_fallback_verdict_finds_intended_event():
 
 # Note: pyproject.toml sets `asyncio_mode = "auto"` so async test functions
 # are picked up automatically without a per-test `@pytest.mark.asyncio`.
+
+
+async def test_poll_children_skips_tickets_already_in_reviewing(monkeypatch):
+    """Regression: when a ticket is already REVIEWING (or MERGE_REQUESTED),
+    _poll_children must NOT re-process its completed child record — otherwise
+    it keeps re-firing _dispatch_review, spawning duplicate review tasks.
+
+    Live-run observation 2026-04-24 on v5: SAL-2634 OPS-01 got 15+ review
+    tasks in 7 minutes before the fix. Budget burned: ~$0.50.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    t = _mk_reviewing_ticket()
+    t.pr_url = "https://github.com/salucallc/x/pull/1"
+    _seed_graph(orch, [t])
+
+    # Fake mesh returns the completed child record. If the bug returns,
+    # _dispatch_review gets called again on this poll cycle.
+    completed_child = {
+        "id": "child-1",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-1 TIR-01 ...",
+        "status": "completed",
+        "result": {
+            "summary": "opened PR https://github.com/salucallc/x/pull/1",
+            "pr_url": "https://github.com/salucallc/x/pull/1",
+        },
+    }
+    async def _fake_list_tasks(status=None, limit=50):
+        return [completed_child]
+    mesh.list_tasks = _fake_list_tasks
+
+    dispatched = []
+    async def _capture_dispatch(ticket):
+        dispatched.append(ticket.identifier)
+    monkeypatch.setattr(orch, "_dispatch_review", _capture_dispatch)
+
+    async def _noop(*a, **kw): return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop)
+
+    await orch._poll_children()
+
+    assert dispatched == [], (
+        f"_dispatch_review was called for REVIEWING ticket: {dispatched}. "
+        f"The guard in _poll_children must skip it."
+    )
+    assert t.status == TicketStatus.REVIEWING, (
+        f"Ticket status changed unexpectedly: {t.status}"
+    )
