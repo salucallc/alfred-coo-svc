@@ -2108,3 +2108,108 @@ async def test_dispatch_wave_deadlock_detected_and_broken(monkeypatch, caplog):
     assert ticks["n"] <= 3, (
         f"detector took {ticks['n']} ticks to break; expected <=3"
     )
+
+
+# ── AB-17-o · Prior PR block + update_pr wiring ────────────────────────────
+#
+# v8-full-v4 (mesh task 83dd216d, 2026-04-24 ~18:14 UTC) exposed the
+# duplicate-PR leak. Respawns were correctly firing after AB-17-k but
+# calling ``propose_pr`` with a fresh branch, opening a new PR per cycle
+# (acs#59/60, ts#4/5, ss#17/18). AB-17-o: orchestrator now renders a
+# ``## Prior PR`` section with the existing URL + branch, and the
+# alfred-coo-a persona prompt tells the builder to call ``update_pr``
+# against it instead of ``propose_pr``.
+
+
+def test_respawn_body_includes_prior_pr_section(monkeypatch):
+    """Edit 2 · `_respawn_child_with_fixes` injects `## Prior PR` naming
+    the existing PR URL + branch. Branch is resolved via `_gh_api`; we
+    stub that to return head.ref='feature/sal-2634-existing' so the
+    assertion can pin the exact string the builder will read.
+    """
+    orch = _mk_orchestrator()
+    hint = _TARGET_HINTS["OPS-01"]
+    orch._verified_hints["OPS-01"] = VerificationResult(
+        code="OPS-01",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=tuple(
+            PathResult(path=p, expected="exist", observed="exist", ok=True)
+            for p in hint.paths
+        ),
+    )
+    ticket = _t("u-ops-01", "SAL-2634", "OPS-01", 0, "ops", size="S")
+    ticket.pr_url = "https://github.com/salucallc/alfred-coo-svc/pull/42"
+    ticket.review_cycles = 1
+
+    # Stub _gh_api so _lookup_pr_branch resolves to a deterministic branch.
+    async def _fake_gh_api(path):
+        assert path == "repos/salucallc/alfred-coo-svc/pulls/42"
+        return {"head": {"ref": "feature/sal-2634-existing"}}
+    orch._gh_api = _fake_gh_api  # type: ignore[assignment]
+
+    asyncio.run(orch._respawn_child_with_fixes(ticket, "address foo"))
+
+    assert orch.mesh.created, "respawn should have created a child task"
+    body = orch.mesh.created[-1]["description"]
+    assert "## Prior PR" in body
+    assert "url: https://github.com/salucallc/alfred-coo-svc/pull/42" in body
+    assert "branch: feature/sal-2634-existing" in body
+    # And the steering sentence that tells the builder to pick update_pr.
+    assert "update_pr" in body
+    # Existing AB-17-k contract still holds: Target block rendered too.
+    assert "## Target" in body
+
+
+def test_respawn_body_prior_pr_lookup_failure_emits_placeholder():
+    """If `_gh_api` returns None (404 or transport fail), the Prior PR
+    block still renders with a `(lookup failed ...)` marker so the child
+    surfaces it as a grounding gap rather than silently opening a new PR.
+    """
+    orch = _mk_orchestrator()
+    hint = _TARGET_HINTS["OPS-01"]
+    orch._verified_hints["OPS-01"] = VerificationResult(
+        code="OPS-01",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=tuple(
+            PathResult(path=p, expected="exist", observed="exist", ok=True)
+            for p in hint.paths
+        ),
+    )
+    ticket = _t("u-ops-01", "SAL-2634", "OPS-01", 0, "ops", size="S")
+    ticket.pr_url = "https://github.com/salucallc/alfred-coo-svc/pull/42"
+    ticket.review_cycles = 1
+
+    async def _fake_gh_api(path):
+        return None  # simulate 404
+    orch._gh_api = _fake_gh_api  # type: ignore[assignment]
+
+    asyncio.run(orch._respawn_child_with_fixes(ticket, "address foo"))
+
+    body = orch.mesh.created[-1]["description"]
+    assert "## Prior PR" in body
+    assert "lookup failed" in body
+    # Still tells the child not to call propose_pr.
+    assert "update_pr" in body
+
+
+def test_alfred_coo_a_persona_mentions_update_pr_for_fix_round():
+    """Edit 3 · alfred-coo-a Step 6 addendum mentions `update_pr` and
+    the `## Prior PR` section so a fix-round child picks the right tool.
+    """
+    from alfred_coo.persona import BUILTIN_PERSONAS
+    prompt = BUILTIN_PERSONAS["alfred-coo-a"].system_prompt
+    assert "update_pr" in prompt, (
+        "alfred-coo-a prompt must mention update_pr for fix-round variant"
+    )
+    assert "Prior PR" in prompt, (
+        "alfred-coo-a prompt must reference the `## Prior PR` section"
+    )
+    # And update_pr is in the tool allowlist.
+    tools = BUILTIN_PERSONAS["alfred-coo-a"].tools
+    assert "update_pr" in tools, (
+        f"update_pr missing from alfred-coo-a tool allowlist: {tools}"
+    )

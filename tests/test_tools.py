@@ -914,3 +914,207 @@ async def test_linear_get_issue_relations_missing_key(monkeypatch):
     result = await linear_get_issue_relations("SAL-100")
     assert "error" in result
     assert "LINEAR_API_KEY" in result["error"]
+
+
+# ── AB-17-o: update_pr tool ────────────────────────────────────────────────
+#
+# v8-full-v4 (mesh task 83dd216d, 2026-04-24 ~18:14 UTC) surfaced the
+# duplicate-PR leak: after AB-17-k fixed respawn grounding, fix-round
+# children call ``propose_pr`` with a fresh timestamped branch → a NEW PR
+# per REQUEST_CHANGES cycle (wave-0: acs#59/60, ts#4/5, ss#17/18). AB-17-o
+# adds ``update_pr`` to push to the existing branch instead.
+
+from alfred_coo.tools import update_pr
+
+
+def test_update_pr_registered():
+    assert "update_pr" in BUILTIN_TOOLS
+    schema = openai_tool_schema(BUILTIN_TOOLS["update_pr"])
+    required = schema["function"]["parameters"]["required"]
+    for key in ("pr_url", "branch", "commit_message", "files"):
+        assert key in required, f"update_pr schema missing required field: {key}"
+
+
+@pytest.mark.asyncio
+async def test_update_pr_pushes_to_existing_branch(monkeypatch, tmp_path):
+    """Happy path: update_pr clones, fetches the branch, writes files,
+    commits, and pushes to the SAME branch. Return envelope carries the
+    pushed sha + commit_url.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    monkeypatch.setenv("ALFRED_WORKSPACES_ROOT", str(tmp_path))
+    # WORKSPACE_ROOT is resolved at import time from the env var, so rebind
+    # it to the tmp path too.
+    import alfred_coo.tools as t
+    monkeypatch.setattr(t, "WORKSPACE_ROOT", tmp_path)
+
+    # Stub the PR-meta GET to return an open PR on branch "feature/sal-2615-x".
+    class _Resp:
+        def __init__(self, body):
+            self._body = body.encode() if isinstance(body, str) else body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self._body
+
+    def _fake_urlopen(req, timeout=30):
+        method = getattr(req, "method", None) or "GET"
+        if method == "GET" and "/pulls/" in req.full_url:
+            return _Resp(json.dumps({
+                "state": "open", "merged": False,
+                "head": {"ref": "feature/sal-2615-x"},
+            }))
+        # No title/body patch in this test, but leave a no-op just in case.
+        return _Resp(json.dumps({}))
+
+    monkeypatch.setattr(t.urllib.request, "urlopen", _fake_urlopen)
+
+    # Stub _run to record git calls and synthesise successful outputs.
+    calls: list[list[str]] = []
+    async def _fake_run(cmd, cwd=None, env=None):
+        calls.append(list(cmd))
+        # Simulate a real clone by creating the workspace directory so
+        # subsequent file writes succeed.
+        if cmd[:2] == ["git", "clone"]:
+            import pathlib
+            pathlib.Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+        if cmd[:2] == ["git", "rev-parse"]:
+            return 0, "deadbeefcafefeed1234\n", ""
+        return 0, "", ""
+    monkeypatch.setattr(t, "_run", _fake_run)
+
+    result = await update_pr(
+        pr_url="https://github.com/salucallc/alfred-coo-svc/pull/59",
+        branch="feature/sal-2615-x",
+        commit_message="fix(sal-2615): address review feedback",
+        files=[{"path": "src/foo.py", "content": "print('ok')\n"}],
+    )
+
+    assert "error" not in result, f"unexpected error: {result}"
+    assert result["pushed_sha"].startswith("deadbeefcafe")
+    assert result["pr_url"] == "https://github.com/salucallc/alfred-coo-svc/pull/59"
+    assert result["branch"] == "feature/sal-2615-x"
+    assert result["pr_number"] == 59
+    assert result["commit_url"].endswith("/commit/deadbeefcafefeed1234")
+
+    cmd_strs = [" ".join(c) for c in calls]
+    joined = " | ".join(cmd_strs)
+    assert any(c.startswith("git clone") for c in cmd_strs), joined
+    assert any(
+        c == "git fetch origin feature/sal-2615-x" for c in cmd_strs
+    ), joined
+    assert any(
+        c == "git checkout -B feature/sal-2615-x origin/feature/sal-2615-x"
+        for c in cmd_strs
+    ), joined
+    assert any(
+        c == "git push origin feature/sal-2615-x" for c in cmd_strs
+    ), joined
+    # Crucially: the push is to the EXISTING branch, not a new one.
+    assert not any("propose" in c for c in cmd_strs)
+
+
+@pytest.mark.asyncio
+async def test_update_pr_rejects_closed_pr(monkeypatch, tmp_path):
+    """update_pr must refuse to touch a CLOSED PR. A fix-round on a
+    closed PR is a caller bug; silently pushing would leave the branch
+    out of date with no review thread watching."""
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    import alfred_coo.tools as t
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body.encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self._body
+
+    def _fake_urlopen(req, timeout=30):
+        return _Resp(json.dumps({
+            "state": "closed", "merged": False,
+            "head": {"ref": "feature/sal-2615-x"},
+        }))
+
+    monkeypatch.setattr(t.urllib.request, "urlopen", _fake_urlopen)
+
+    result = await update_pr(
+        pr_url="https://github.com/salucallc/alfred-coo-svc/pull/59",
+        branch="feature/sal-2615-x",
+        commit_message="fix: x",
+        files=[{"path": "a.py", "content": "x"}],
+    )
+    assert "error" in result
+    assert "state=closed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_update_pr_rejects_missing_branch(monkeypatch, tmp_path):
+    """If the feature branch no longer exists on origin, update_pr must
+    bail with a clear error rather than falling back to creating a new
+    branch (that is propose_pr's job)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    monkeypatch.setenv("ALFRED_WORKSPACES_ROOT", str(tmp_path))
+    import alfred_coo.tools as t
+    monkeypatch.setattr(t, "WORKSPACE_ROOT", tmp_path)
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body.encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self._body
+
+    def _fake_urlopen(req, timeout=30):
+        return _Resp(json.dumps({
+            "state": "open", "merged": False,
+            "head": {"ref": "feature/sal-2615-x"},
+        }))
+    monkeypatch.setattr(t.urllib.request, "urlopen", _fake_urlopen)
+
+    async def _fake_run(cmd, cwd=None, env=None):
+        if cmd[:2] == ["git", "clone"]:
+            import pathlib
+            pathlib.Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return 0, "", ""
+        if cmd[:2] == ["git", "fetch"]:
+            return 1, "", (
+                "fatal: couldn't find remote ref feature/sal-2615-x"
+            )
+        return 0, "", ""
+    monkeypatch.setattr(t, "_run", _fake_run)
+
+    result = await update_pr(
+        pr_url="https://github.com/salucallc/alfred-coo-svc/pull/59",
+        branch="feature/sal-2615-x",
+        commit_message="fix: x",
+        files=[{"path": "a.py", "content": "x"}],
+    )
+    assert "error" in result
+    assert "branch not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_update_pr_rejects_empty_files(monkeypatch):
+    """An empty files list should NOT silently succeed — that would hide
+    a bug in the caller (fix-round with nothing to change)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await update_pr(
+        pr_url="https://github.com/salucallc/alfred-coo-svc/pull/59",
+        branch="feature/sal-2615-x",
+        commit_message="fix: x",
+        files=[],
+    )
+    assert "error" in result
+    assert "files" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_update_pr_rejects_non_saluca_owner(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    result = await update_pr(
+        pr_url="https://github.com/evil-org/hack/pull/1",
+        branch="feature/x",
+        commit_message="x",
+        files=[{"path": "a", "content": "b"}],
+    )
+    assert "error" in result
+    assert "allowlist" in result["error"]

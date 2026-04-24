@@ -119,19 +119,31 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "guess.\n\n"
             "STEP 6: **Before emitting the structured-output envelope, "
             "self-check:** if your plan this turn was to produce code "
-            "changes, have you called propose_pr this turn and received a "
-            "PR URL? If NO → STOP, call propose_pr now with your branch + "
-            "diff, and put the returned URL in your `summary`. If your plan "
+            "changes, have you called propose_pr (initial) OR update_pr "
+            "(fix-round respawn) this turn and received a PR URL? If NO → "
+            "STOP, call the appropriate tool now with your branch + diff, "
+            "and put the returned URL in your `summary`. If your plan "
             "was to escalate, have you called linear_create_issue and "
             "received an issue identifier? If NO → STOP, call it now and "
             "put the identifier in your `summary`. Only after one of those "
-            "two tool calls has returned a real value do you emit the "
-            "envelope. Only propose_pr opens a pull request. To emit code "
-            "changes to a target repo you MUST call the propose_pr tool "
-            "with your branch + diff; the envelope's artifacts field is "
-            "metadata for reporting only — emitting an artifacts list "
-            "WITHOUT calling propose_pr leaves the task with no PR, which "
-            "the orchestrator marks FAILED."
+            "tool calls has returned a real value do you emit the "
+            "envelope. Only `propose_pr` or `update_pr` opens / updates a "
+            "pull request. To emit code changes to a target repo you MUST "
+            "call one of those tools with your branch + diff; the envelope's "
+            "artifacts field is metadata for reporting only — emitting an "
+            "artifacts list WITHOUT calling propose_pr / update_pr leaves "
+            "the task with no PR, which the orchestrator marks FAILED.\n\n"
+            "**Fix-round variant (AB-17-o).** If the task body contains a "
+            "`## Prior PR` section, this is a respawn after a REQUEST_CHANGES "
+            "review on an already-open PR. Call the `update_pr` tool with "
+            "the PR URL and branch from that section — do NOT call "
+            "`propose_pr`. Fresh `propose_pr` calls on a respawn create "
+            "duplicate PRs on new timestamped branches (v8-full-v4 exposed "
+            "this: acs#59/60, ts#4/5, ss#17/18). `update_pr` pushes your "
+            "fix to the existing branch so the original PR's review thread "
+            "is preserved. The Step 6 self-check treats a successful "
+            "`update_pr` call the same as a successful `propose_pr` — either "
+            "tool returning a real URL satisfies the emit-modes rule."
         ),
         preferred_model="gpt-oss:120b-cloud",
         fallback_model="deepseek-v3.2:cloud",
@@ -142,7 +154,14 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "mission-control",
             "autonomous-ops",
         ],
-        tools=["linear_create_issue", "slack_post", "mesh_task_create", "propose_pr", "http_get"],
+        tools=[
+            "linear_create_issue",
+            "slack_post",
+            "mesh_task_create",
+            "propose_pr",
+            "update_pr",
+            "http_get",
+        ],
     ),
 
     # ── Autonomous Build Orchestrator (Mission Control v1.0 GA) ─────────────
