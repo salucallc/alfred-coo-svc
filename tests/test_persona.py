@@ -319,3 +319,121 @@ def test_hawkman_prompt_contains_all_mandated_phrases():
     # size labels: case-insensitive
     assert "size-s" in lower, "mandated phrase missing: 'size-S'"
     assert "size-m" in lower, "mandated phrase missing: 'size-M'"
+
+
+# ── AB-17-e · persona vocabulary deltas for AB-17-c/d (Plan I §4) ───────────
+#
+# AB-17-c/d introduced the `paths:` / `new_paths:` split and the four marker
+# vocabularies — `(unresolved ...)`, `(conflict ...)`, `(unverified ...)`,
+# and `# VERIFICATION WARNING`. AB-17-e taught both persona prompts how to
+# react to each marker. AB-17-f locks the required phrasing with substring
+# assertions so future edits can't silently remove a marker.
+# Reference: Z:/_planning/v1-ga/I_target_verification.md §4.
+
+
+# ── alfred-coo-a: Step 0 + Step 2 vocabulary (Plan I §4.1 + §4.2) ──────────
+
+
+def test_alfred_coo_a_prompt_names_paths_and_new_paths_sections():
+    """Plan I §4.1 — Step 2: the prompt must reference both `paths:` and
+    `new_paths:` sections of the ## Target block so the builder checks
+    each axis with the right expectation (200 vs 404)."""
+    prompt = _alfred_prompt()
+    assert "paths:" in prompt, "missing `paths:` section reference in Step 2"
+    assert "new_paths:" in prompt, (
+        "missing `new_paths:` section reference in Step 2"
+    )
+
+
+def test_alfred_coo_a_prompt_teaches_three_markers():
+    """Plan I §4.2 — Step 0: the prompt must name each of the three
+    target-block decision markers so the builder knows which branch to
+    take. `(unresolved`, `(conflict`, `(unverified` — all with the
+    opening paren anchor."""
+    prompt = _alfred_prompt()
+    for marker in ("(unresolved", "(conflict", "(unverified"):
+        assert marker in prompt, (
+            f"alfred-coo-a prompt missing marker {marker!r}; AB-17-e "
+            "Step 0 decision rules regress"
+        )
+
+
+def test_alfred_coo_a_prompt_mentions_verification_warning_banner():
+    """Plan I §4.2: the `# VERIFICATION WARNING` banner surfaces on every
+    UNVERIFIED block, and Step 0 must tell the builder how to react
+    (proceed to Step 2 + re-verify)."""
+    assert "VERIFICATION WARNING" in _alfred_prompt()
+
+
+def test_alfred_coo_a_prompt_references_base_branch_in_step_2():
+    """Plan I §4.1 — the Step 2 http_get template must interpolate
+    `{base_branch}` (not hardcode `main`) so hints with a non-default
+    base_branch verify correctly."""
+    prompt = _alfred_prompt()
+    assert "{base_branch}" in prompt, (
+        "Step 2 http_get template missing {base_branch} placeholder; "
+        "AB-17-e Plan I §4.1 regress"
+    )
+
+
+# ── hawkman-qa-a: GATE 3 target-drift (Plan I §4.3) ────────────────────────
+
+
+def test_hawkman_prompt_declares_gate_3_uppercase():
+    """Plan I §4.3: the new gate is literally labelled `GATE 3` (uppercase)
+    so the reviewer persona's gate-naming convention stays consistent
+    (GATE 1, GATE 2, GATE 3)."""
+    prompt = _hawkman_prompt()
+    assert "GATE 3" in prompt, (
+        "hawkman-qa-a prompt missing GATE 3 label; AB-17-e target-block "
+        "fidelity gate regress"
+    )
+
+
+def test_hawkman_prompt_names_target_drift_reason_string():
+    """Plan I §4.3: failures on GATE 3 must route through pr_review with
+    reason=`target-drift`. Orchestrator-side AB-17-d partner validator
+    grep-matches this exact string."""
+    assert "target-drift" in _hawkman_prompt()
+
+
+def test_hawkman_prompt_references_pr_files_get_for_gate_3():
+    """Plan I §4.3: GATE 3 needs the diff's file list + statuses to check
+    `paths:` vs `new_paths:` against the PR — pr_files_get is the only
+    tool that returns both. AB-15 already required pr_files_get; AB-17-e
+    must not drop it."""
+    assert "pr_files_get" in _hawkman_prompt()
+
+
+# ── AB-17-f · AB-17-e aggregate guards (single-shot regression) ─────────────
+
+
+def test_alfred_coo_a_prompt_contains_all_ab17e_markers():
+    """AB-17-f aggregate guard for AB-17-e Plan I §4.1 + §4.2 deltas.
+    Every marker the builder must react to in Step 0 / Step 2 is present
+    in the resolved prompt. Guards against silent edits stripping one."""
+    prompt = _alfred_prompt()
+    mandated = [
+        "paths:",
+        "new_paths:",
+        "(unresolved",
+        "(conflict",
+        "(unverified",
+        "VERIFICATION WARNING",
+        "{base_branch}",
+    ]
+    for marker in mandated:
+        assert marker in prompt, (
+            f"alfred-coo-a missing AB-17-e marker {marker!r}"
+        )
+
+
+def test_hawkman_prompt_contains_all_ab17e_markers():
+    """AB-17-f aggregate guard for AB-17-e Plan I §4.3 GATE 3 delta.
+    The three GATE 3 load-bearing strings must all be present."""
+    prompt = _hawkman_prompt()
+    mandated = ["GATE 3", "target-drift", "pr_files_get"]
+    for marker in mandated:
+        assert marker in prompt, (
+            f"hawkman-qa-a missing AB-17-e marker {marker!r}"
+        )

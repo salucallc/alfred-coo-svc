@@ -1200,17 +1200,12 @@ class AutonomousBuildOrchestrator:
         #
         # AB-17-c (SAL — Plan I §3): pass the per-wave VerificationResult
         # through so the render can decorate the block with verified /
-        # unresolved / conflict / unverified markers. ``hasattr`` guard
-        # preserves back-compat for code paths that instantiate this
-        # orchestrator without going through ``_start_wave`` →
-        # ``_verify_wave_hints`` (e.g. older unit tests); AB-17-f will
-        # tighten this by initializing ``_verified_hints = {}`` in
-        # ``__init__`` and removing the guard.
+        # unresolved / conflict / unverified markers. AB-17-f tightened
+        # this by initializing ``_verified_hints = {}`` in ``__init__``
+        # (see AB-17-b block above), so no ``hasattr`` guard is needed.
         target_block = _render_target_block(
             ticket.code,
-            vr=self._verified_hints.get(ticket.code)
-            if hasattr(self, "_verified_hints")
-            else None,
+            vr=self._verified_hints.get(ticket.code),
         )
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
