@@ -71,6 +71,12 @@ SOFT_GREEN_THRESHOLD = 0.9
 # a Slack stall ping. Overridable by the payload for tests / tuning.
 DEFAULT_STALL_THRESHOLD_SEC = 30 * 60
 
+# AB-17-p: warn if `_dispatch_wave` has had in-flight work but no forward
+# progress event for >15 min. Visibility only — does NOT cancel or retry.
+# Separate from the 30-min CP stall ping above (that one is per-ticket +
+# posts to Slack; this one is per-wave + WARN-level log + state event).
+PROGRESS_STALL_WARN_SEC = 900  # 15 min
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -731,6 +737,15 @@ class AutonomousBuildOrchestrator:
         # rate-limit itself without a separate timer.
         self._last_cadence_ts: float = 0.0
 
+        # AB-17-p: wall-clock of the last observed forward-progress event
+        # (successful dispatch, state transition in _poll_children, or
+        # review verdict handled in _poll_reviews). The _dispatch_wave
+        # watchdog compares `time.time() - self._last_progress_ts` against
+        # PROGRESS_STALL_WARN_SEC to emit a "[watchdog] wave N no forward
+        # progress" warning. Seeded to now() so a fresh orchestrator
+        # doesn't immediately trip the threshold before its first tick.
+        self._last_progress_ts: float = time.time()
+
         # Injectable tool fetchers — tests swap these without monkeypatching.
         # Defaults resolve lazily so import of this module never depends on
         # LINEAR_API_KEY being set (e.g. in unit tests that stub out the
@@ -1095,6 +1110,15 @@ class AutonomousBuildOrchestrator:
             in_flight = self._in_flight_for_wave(wave_n)
             ready = self._select_ready(wave_tickets, in_flight)
 
+            # AB-17-p: per-tick liveness trace so an operator tailing
+            # DEBUG logs can distinguish "orchestrator ticking but not
+            # logging" from "orchestrator genuinely hung" without waiting
+            # for the 20-min _status_tick cadence.
+            logger.debug(
+                "[tick] wave=%d in_flight=%d ready=%d",
+                wave_n, len(in_flight), len(ready),
+            )
+
             # ── dispatch within caps ────────────────────────────────────
             for ticket in ready:
                 # AB-05: in drain mode we let in-flight work finish but
@@ -1193,6 +1217,27 @@ class AutonomousBuildOrchestrator:
                     )
                 break
 
+            # AB-17-p: no-forward-progress visibility. Emits a WARN + state
+            # event when the wave has had in-flight work but no progress
+            # event (dispatch / poll_children transition / review verdict)
+            # for >PROGRESS_STALL_WARN_SEC. Pairs with AB-17-n's structural
+            # deadlock break above: AB-17-n catches "nothing in-flight AND
+            # nothing ready" (stuck graph), this catches "in-flight but
+            # frozen" (stuck sub / review task). Visibility ONLY — does not
+            # cancel, retry, or mark failed.
+            stall_sec = time.time() - self._last_progress_ts
+            if stall_sec > PROGRESS_STALL_WARN_SEC and in_flight:
+                logger.warning(
+                    "[watchdog] wave %d no forward progress for %.0fs; "
+                    "in_flight=%d ready=%d",
+                    wave_n, stall_sec, len(in_flight), len(ready),
+                )
+                self.state.record_event(
+                    "wave_no_progress",
+                    wave=wave_n, stall_sec=stall_sec,
+                    in_flight=len(in_flight), ready=len(ready),
+                )
+
             await asyncio.sleep(self.poll_sleep_sec)
 
     def _select_ready(
@@ -1279,6 +1324,8 @@ class AutonomousBuildOrchestrator:
             identifier=ticket.identifier,
             child_task_id=ticket.child_task_id,
         )
+        # AB-17-p: successful dispatch = forward progress.
+        self._last_progress_ts = time.time()
 
         # Linear: Todo -> In Progress via the AB-03 helper. Failure is
         # logged but non-fatal — orchestrator bookkeeping is the source of
@@ -1516,6 +1563,11 @@ class AutonomousBuildOrchestrator:
                 await self._update_linear_state(ticket, "Backlog")
                 updated.append(ticket)
 
+        # AB-17-p: any state transition this tick (PR_OPEN, REVIEWING,
+        # FAILED) counts as forward progress. Single stamp at the loop
+        # exit keeps this cheap and covers every branch above.
+        if updated:
+            self._last_progress_ts = time.time()
         return updated
 
     @staticmethod
@@ -1764,6 +1816,10 @@ class AutonomousBuildOrchestrator:
             result = rec.get("result") or {}
             verdict = self._extract_verdict(result)
             await self._handle_review_verdict(ticket, rec, verdict, updated)
+        # AB-17-p: any verdict handled this tick (APPROVE merge, REQUEST_CHANGES
+        # respawn, silent retry, etc.) is forward progress by watchdog standards.
+        if updated:
+            self._last_progress_ts = time.time()
         return updated
 
     async def _handle_review_verdict(

@@ -2215,3 +2215,160 @@ def test_alfred_coo_a_persona_mentions_update_pr_for_fix_round():
     assert "update_pr" in tools, (
         f"update_pr missing from alfred-coo-a tool allowlist: {tools}"
     )
+
+
+# ── AB-17-p · per-tick liveness + no-forward-progress watchdog ────────────
+
+
+async def test_dispatch_wave_emits_no_progress_warning(monkeypatch, caplog):
+    """AB-17-p: when the wave has in-flight work but `_last_progress_ts`
+    is older than PROGRESS_STALL_WARN_SEC, `_dispatch_wave` emits a
+    `[watchdog] wave N no forward progress` WARN log and a
+    `wave_no_progress` state event. Visibility ONLY — the loop does NOT
+    cancel, retry, or mark tickets failed. The deadlock path (AB-17-n)
+    is separately responsible for terminal structural issues.
+    """
+    import logging
+    from alfred_coo.autonomous_build.orchestrator import (
+        PROGRESS_STALL_WARN_SEC,
+    )
+
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+
+    # One DISPATCHED ticket so `_in_flight_for_wave` is non-empty.
+    t1 = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t1.status = TicketStatus.DISPATCHED
+    t1.child_task_id = "mesh-1"
+    _seed_graph(orch, [t1])
+
+    # Age _last_progress_ts past the threshold so the watchdog fires on
+    # the very first tick.
+    orch._last_progress_ts = (
+        __import__("time").time() - (PROGRESS_STALL_WARN_SEC + 30)
+    )
+
+    async def _noop(*args, **kwargs):
+        return None
+    async def _noop_list(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+
+    # Bail out of the while-loop after one tick by flipping the ticket
+    # terminal in `asyncio.sleep` — the watchdog runs BEFORE the sleep,
+    # so by the time we flip the status the WARN + event are already
+    # emitted.
+    async def _flip_then_sleep(delay):
+        t1.status = TicketStatus.MERGED_GREEN
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        _flip_then_sleep,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="alfred_coo.autonomous_build.orchestrator"
+    ):
+        await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    # WARN log fired.
+    watchdog_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "[watchdog]" in r.getMessage()
+        and "no forward progress" in r.getMessage()
+    ]
+    assert watchdog_msgs, (
+        f"expected a watchdog WARN log; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+
+    # `wave_no_progress` state event recorded.
+    events = [e for e in orch.state.events if e["kind"] == "wave_no_progress"]
+    assert len(events) == 1, (
+        f"expected exactly one wave_no_progress event, got {len(events)}: "
+        f"{events}"
+    )
+    evt = events[0]
+    assert evt["wave"] == 0
+    assert evt["in_flight"] == 1
+    assert evt["ready"] == 0
+    assert evt["stall_sec"] >= PROGRESS_STALL_WARN_SEC
+
+    # Ticket was NOT mutated by the watchdog (visibility only).
+    # It flipped to MERGED_GREEN inside `_flip_then_sleep`, but not FAILED.
+    assert t1.status == TicketStatus.MERGED_GREEN
+
+
+async def test_dispatch_wave_watchdog_silent_when_no_in_flight(monkeypatch, caplog):
+    """AB-17-p: the watchdog guard requires in-flight work. A wave
+    with nothing dispatched yet (pre-dispatch tick) must NOT emit the
+    warning even if `_last_progress_ts` is stale — that's the expected
+    idle state, not a stall.
+    """
+    import logging
+    from alfred_coo.autonomous_build.orchestrator import (
+        PROGRESS_STALL_WARN_SEC,
+    )
+
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+
+    # PENDING, never dispatched.
+    t1 = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    _seed_graph(orch, [t1])
+
+    orch._last_progress_ts = (
+        __import__("time").time() - (PROGRESS_STALL_WARN_SEC + 30)
+    )
+
+    async def _noop(*args, **kwargs):
+        return None
+    async def _noop_list(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    # Stub dispatch so the tick completes without real mesh traffic.
+    async def _fake_dispatch(ticket):
+        ticket.status = TicketStatus.MERGED_GREEN
+    monkeypatch.setattr(orch, "_dispatch_child", _fake_dispatch)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+    async def _real_sleep(delay):
+        pass
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        _real_sleep,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="alfred_coo.autonomous_build.orchestrator"
+    ):
+        await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    # No watchdog WARN should have fired (in_flight was [] at tick-top).
+    watchdog_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "[watchdog]" in r.getMessage()
+    ]
+    assert not watchdog_msgs, (
+        f"watchdog should be silent with no in-flight; got: {watchdog_msgs}"
+    )
+    # And no state event.
+    events = [e for e in orch.state.events if e["kind"] == "wave_no_progress"]
+    assert not events, f"unexpected wave_no_progress events: {events}"
