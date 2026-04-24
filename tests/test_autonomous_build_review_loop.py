@@ -545,6 +545,69 @@ def test_extract_verdict_priority_order():
     )
 
 
+# ── AB-17-r: priority-0 — intended_event short-circuits state ──────────────
+
+
+def test_extract_verdict_respects_intended_event_request_changes():
+    """COMMENTED_FALLBACK + intended_event=REQUEST_CHANGES → REQUEST_CHANGES.
+
+    SAL-2663 (2026-04-24): hawkman emitted REQUEST_CHANGES via pr_review,
+    GitHub 422'd the self-authored review, tools.py persisted
+    state=COMMENTED_FALLBACK + intended_event=REQUEST_CHANGES. Pre-AB-17-r,
+    _extract_verdict returned "COMMENTED_FALLBACK" (priority-1 state) and the
+    fallback decoder couldn't see it from the orchestrator's first hop;
+    silent-retry kicked in and the ticket cycled forever.
+    """
+    r = {
+        "tool_calls": [
+            {
+                "name": "pr_review",
+                "result": {
+                    "state": "COMMENTED_FALLBACK",
+                    "intended_event": "REQUEST_CHANGES",
+                    "fallback_reason": "self-authored PR; used issue-comment",
+                },
+            }
+        ]
+    }
+    assert (
+        AutonomousBuildOrchestrator._extract_verdict(r) == "REQUEST_CHANGES"
+    )
+
+
+def test_extract_verdict_respects_intended_event_approve():
+    """Same as above but APPROVE — fallback path mustn't lose APPROVE either."""
+    r = {
+        "tool_calls": [
+            {
+                "name": "pr_review",
+                "result": {
+                    "state": "COMMENTED_FALLBACK",
+                    "intended_event": "approve",  # case-insensitive.
+                },
+            }
+        ]
+    }
+    assert AutonomousBuildOrchestrator._extract_verdict(r) == "APPROVE"
+
+
+def test_extract_verdict_intended_event_absent_falls_through():
+    """COMMENTED_FALLBACK with NO intended_event must hit priority-1 state and
+    return ``COMMENTED_FALLBACK`` so _handle_review_verdict's existing
+    silent/COMMENT-ish branch keeps working."""
+    r = {
+        "tool_calls": [
+            {
+                "name": "pr_review",
+                "result": {"state": "COMMENTED_FALLBACK"},
+            }
+        ]
+    }
+    assert (
+        AutonomousBuildOrchestrator._extract_verdict(r) == "COMMENTED_FALLBACK"
+    )
+
+
 def test_parse_fallback_verdict_finds_intended_event():
     rec = {
         "result": {
