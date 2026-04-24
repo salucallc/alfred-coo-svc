@@ -1667,6 +1667,13 @@ class AutonomousBuildOrchestrator:
 
         Priority (matches AB-08 design doc §4):
 
+        0. Truthy ``intended_event`` on a ``pr_review`` tool-call result
+           (or top-level of the envelope). AB-17-r: when the GitHub
+           reviews API rejects a self-authored review, ``pr_review``
+           returns ``state=COMMENTED_FALLBACK`` + ``intended_event``
+           carrying the verdict the reviewer tried to land. Trust that
+           directly so the orchestrator doesn't cycle forever
+           (SAL-2663, 2026-04-24).
         1. ``result.tool_calls[*].result.state`` where the tool was
            ``pr_review`` (values: ``APPROVE`` / ``REQUEST_CHANGES`` /
            ``COMMENT`` / ``COMMENTED_FALLBACK``).
@@ -1680,6 +1687,27 @@ class AutonomousBuildOrchestrator:
         """
         if not isinstance(result, dict):
             return None
+
+        # Priority 0: AB-17-r — honor `intended_event` regardless of `state`.
+        tc0 = result.get("tool_calls") or []
+        if isinstance(tc0, list):
+            for call in tc0:
+                if not isinstance(call, dict):
+                    continue
+                if (call.get("name") or "").lower() != "pr_review":
+                    continue
+                out = call.get("result") or call.get("output") or {}
+                if isinstance(out, dict):
+                    intended = out.get("intended_event")
+                    if isinstance(intended, str) and intended.strip():
+                        ev = intended.strip().upper()
+                        if ev in ("APPROVE", "REQUEST_CHANGES"):
+                            return ev
+        top_intended = result.get("intended_event")
+        if isinstance(top_intended, str) and top_intended.strip():
+            ev = top_intended.strip().upper()
+            if ev in ("APPROVE", "REQUEST_CHANGES"):
+                return ev
 
         # Priority 1: structured tool-call result.
         tc = result.get("tool_calls") or []
