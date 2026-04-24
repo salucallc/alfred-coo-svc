@@ -369,6 +369,90 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="introduce asyncpg repository layer; db/ dir is new (soul-svc has no db/ today); swap Supabase SDK in routers/memory.py",
     ),
 
+    # ── AB-19 · wave-0 no_hint closure (SS-*/OPS-22/ALT-01) ─────────────
+    # Graph._parse_code emits `SS-NN` for `SAL-SS-NN` titles (regex at
+    # graph.py:67 alternates `SS` before `S`). The pre-AB-19 `S-NN` entries
+    # above were never hit in practice — the mesh titles always parse to
+    # `SS-NN`. Mirror the authoritative data under the `SS-*` keys so
+    # verify hits `ok`/`path_conflict` instead of `no_hint`. See
+    # Z:/_planning/v1-ga/E_soul_svc_gaps.md §5 for source.
+
+    "SS-01": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("routers/memory.py",),
+        new_paths=("tests/test_bulk_import_topics_queryable.py",),
+        base_branch="main",
+        branch_hint="feature/ss01-index-topics-on-import",
+        notes="fix: /v1/memory/import must index TKHR topics; plan E §5.1 S-01; keyed as SS-01 because title 'SAL-SS-01' parses to SS-01 (graph.py:67)",
+    ),
+
+    "SS-02": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("routers/memory.py",),
+        new_paths=("tests/test_memory_dup_409.py",),
+        base_branch="main",
+        branch_hint="feature/ss02-dup-409",
+        notes="fix: duplicate content_hash returns 409 not 500; map asyncpg 23505 UniqueViolation; plan E §5.1 S-02",
+    ),
+
+    "SS-06": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(),
+        new_paths=(
+            "scripts/apply_migrations.py",
+            "tests/test_apply_migrations_idempotent.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss06-apply-migrations",
+        notes="new scripts/ dir + migration runner with _soul_migration_log table; --dry-run default; idempotent re-runs; plan E §5.1 S-06 (note: S-11 later supersedes with asyncpg variant but SS-06 ships the initial script)",
+    ),
+
+    "SS-09": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("routers/memory.py",),
+        new_paths=(
+            "db/__init__.py",
+            "db/pool.py",
+            "db/repository.py",
+            "tests/test_asyncpg_pool_init.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss09-asyncpg-repository",
+        notes="introduce asyncpg repository layer; db/ dir is new (soul-svc has no db/ today); swap Supabase SDK in routers/memory.py; plan E §5.2 S-09 (SAL-2670 critical-path)",
+    ),
+
+    "OPS-22": TargetHint(
+        owner="salucallc",
+        repo="tiresias",
+        paths=("alembic.ini",),
+        new_paths=(
+            "alembic/versions/0039_add_cost_usd_column.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-22-cost-usd-migration",
+        notes="add cost_usd numeric(10,6) column to tiresias_audit_log via new alembic revision; plan D §5 Wave 5 #22 calls it 'migration 019' but tiresias/alembic/versions/0019_team_rbac.py already exists — next free revision is 0039 (last shipped 0038_add_dek_id_to_aletheia_cot_content.py). Child must verify before authoring.",
+    ),
+
+    "ALT-01": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "aletheia/Dockerfile",
+            "aletheia/app/__init__.py",
+            "aletheia/app/main.py",
+            "aletheia/pyproject.toml",
+            "aletheia/tests/test_healthz.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-01-scaffold",
+        notes="scaffold standalone aletheia-svc; new aletheia/ package at repo root (no separate repo exists; plan B §2 locks standalone-in-compose decision); append aletheia-svc service block to deploy/appliance/docker-compose.yml; healthz must return {status:'ok'}",
+    ),
+
     # ── Epic A · Tiresias in appliance ──────────────────────────────────
     # AB-17-a: `salucallc/tiresias-sovereign` does not exist YET. Per the
     # audit, TIR-01 is the repo-scaffold ticket; AB-20 / the human operator
