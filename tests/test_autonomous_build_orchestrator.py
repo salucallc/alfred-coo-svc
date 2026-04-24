@@ -25,6 +25,9 @@ from alfred_coo.autonomous_build.graph import (
 )
 from alfred_coo.autonomous_build.orchestrator import (
     AutonomousBuildOrchestrator,
+    TargetHint,
+    _TARGET_HINTS,
+    _render_target_block,
 )
 
 
@@ -584,3 +587,129 @@ async def test_poll_children_marks_failed_when_no_pr_url(monkeypatch):
     assert not any(state == "Done" for _, state in linear_calls), (
         f"ticket was falsely moved to Done: {linear_calls}"
     )
+
+
+# ── AB-13: ## Target block + _TARGET_HINTS table (Plan H §2 G-2) ────────────
+
+
+def test_target_hint_dataclass_roundtrip():
+    """TargetHint is a frozen dataclass; fields round-trip and it is
+    hashable (so it can sit in a tuple / set if future code needs it)."""
+    h = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yaml",),
+        branch_hint="feature/sal-2634-mc-ops-network",
+        notes="add mc-ops network + 4 volumes",
+    )
+    assert h.owner == "salucallc"
+    assert h.repo == "alfred-coo-svc"
+    assert h.paths == ("deploy/appliance/docker-compose.yaml",)
+    assert h.base_branch == "main"  # default
+    assert h.branch_hint == "feature/sal-2634-mc-ops-network"
+    assert h.notes == "add mc-ops network + 4 volumes"
+    # Frozen dataclass: hashable + immutable
+    {h}  # must not raise
+    with pytest.raises(Exception):
+        h.owner = "someone-else"  # type: ignore[misc]
+
+
+def test_child_task_body_renders_target_block_for_ops_01():
+    """Plan H §2 G-2 regression: OPS-01's child body must contain a
+    ``## Target`` block pinning `salucallc/alfred-coo-svc` at
+    `deploy/appliance/docker-compose.yaml` — the live run on 2026-04-24
+    produced a phantom root `docker-compose.yml` because this was not
+    pinned (PR #32, SAL-2634)."""
+    orch = _mk_orchestrator()
+    ticket = _t("u-ops-01", "SAL-2634", "OPS-01", 0, "ops", size="S")
+    body = orch._child_task_body(ticket)
+
+    assert "## Target" in body
+    assert "owner: salucallc" in body
+    assert "repo:  alfred-coo-svc" in body
+    assert "deploy/appliance/docker-compose.yaml" in body
+    assert "base_branch: main" in body
+    assert "branch_hint: feature/sal-2634-mc-ops-network" in body
+    assert "notes: add mc-ops network + 4 volumes" in body
+    # The Target block must land BEFORE the APE/V section so the sub
+    # reads target-pinning before the acceptance criteria.
+    assert body.index("## Target") < body.index("## Acceptance (APE/V)")
+    # Must NOT degrade to the unresolved fallback.
+    assert "(unresolved" not in body
+
+
+def test_child_task_body_target_block_unresolved_for_unmapped_code():
+    """When `_TARGET_HINTS` has no entry for the ticket code, the body
+    must render the ``(unresolved)`` escalation prompt rather than
+    guessing — child handles Step-0 escalation per Plan H §5 R-d."""
+    orch = _mk_orchestrator()
+    ticket = _t("u-x", "SAL-9999", "ZZZ-99", 0, "other", size="M")
+    body = orch._child_task_body(ticket)
+
+    assert "## Target" in body
+    assert "(unresolved" in body
+    assert "linear_create_issue" in body
+    assert "STOP" in body
+    # No owner/repo leak when unresolved.
+    assert "owner: salucallc" not in body.split("## Acceptance")[0]
+
+
+def test_child_task_body_target_block_empty_code_unresolved():
+    """If ticket.code is empty (e.g., `F`/`D`/`E` prefixes that pre-AB-14
+    `_CODE_RE` drops), we must still emit an unresolved block, not crash."""
+    orch = _mk_orchestrator()
+    ticket = _t("u-nocode", "SAL-2616", "", 0, "fleet", size="M")
+    body = orch._child_task_body(ticket)
+
+    assert "## Target" in body
+    assert "(unresolved" in body
+
+
+def test_target_hints_populated_for_wave_0_epics():
+    """Regression guard: the MVP wave-0 tickets for each major v1-GA epic
+    must be resolvable. If someone deletes an entry by accident, CI
+    catches it before the next live autonomous_build dispatch."""
+    required_codes = [
+        # Epic D: Ops
+        "OPS-01", "OPS-02", "OPS-03",
+        # Epic C/F: Fleet mode endpoint
+        "F01", "F02", "F07", "F08",
+        # Epic E: soul-svc gap closure
+        "S-01", "S-02", "S-04", "S-09",
+        # Epic A: Tiresias
+        "TIR-01", "TIR-02", "TIR-07", "TIR-08",
+    ]
+    missing = [c for c in required_codes if c not in _TARGET_HINTS]
+    assert not missing, (
+        f"_TARGET_HINTS missing wave-0/1 codes: {missing}. "
+        f"Plan H §2 G-2 requires every wave-0 ticket to be resolvable."
+    )
+    # Every hint must name a Saluca-org repo with at least one path.
+    for code, hint in _TARGET_HINTS.items():
+        assert hint.owner == "salucallc", f"{code}: non-saluca owner"
+        assert hint.repo, f"{code}: empty repo"
+        assert hint.paths, f"{code}: empty paths tuple"
+        assert all(p and not p.startswith("/") for p in hint.paths), (
+            f"{code}: absolute/empty path in {hint.paths}"
+        )
+
+
+def test_render_target_block_f08_soul_lite():
+    """F08 must pin `salucallc/soul-svc` — it's the new `soul-lite`
+    service and the previous child guessed `alfred-coo-svc` (SAL-2616 /
+    PR #31 regression, 2026-04-24)."""
+    block = _render_target_block("F08")
+    assert "owner: salucallc" in block
+    assert "repo:  soul-svc" in block
+    assert "soul_lite/" in block
+    assert "(unresolved" not in block
+
+
+def test_render_target_block_case_insensitive():
+    """Plan docs use uppercase codes (`OPS-01`), but graph._CODE_RE may
+    emit lowercase if the Linear title is lowercased. The lookup must be
+    case-insensitive so we don't silently fall to (unresolved)."""
+    upper = _render_target_block("OPS-01")
+    lower = _render_target_block("ops-01")
+    assert upper == lower
+    assert "deploy/appliance/docker-compose.yaml" in lower
