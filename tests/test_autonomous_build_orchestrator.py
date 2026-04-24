@@ -1363,3 +1363,524 @@ async def test_verify_hint_respects_base_branch(monkeypatch):
     ref_params = [c["params"].get("ref") for c in _FakeClient._calls_shared
                   if c.get("params")]
     assert "develop" in ref_params
+
+
+# ── AB-17-f · _verify_hint 8-case matrix (Plan I §5.1) ─────────────────────
+#
+# Plan I §1.2 aggregation axes: repo {200, 404, 5xx×2, 429} × paths × new_paths
+# → {OK, PATH_MISSING, PATH_CONFLICT, UNVERIFIED, REPO_MISSING}. AB-17-b has
+# partial coverage (cases 1, 2, 3, 5, 6, 8 already exist). AB-17-f adds the
+# missing tiebreak + combined-mixed case + path-5xx case + "all new_paths
+# absent only" and "mixed" variants to lock in the aggregation contract.
+#
+# Tiebreak note (Plan I §1.2, lines 2620-2640 in orchestrator.py): when BOTH
+# `any_conflict_in_new_paths` and `any_missing_in_paths` fire, the aggregator
+# checks conflict FIRST → status is PATH_CONFLICT. We document that here.
+
+
+async def test_verify_hint_new_paths_absent_only_status_ok(monkeypatch):
+    """AB-17-f · Case variant: `paths` empty, `new_paths` all absent → OK.
+    Confirms the new-file-only hint shape (e.g. F08 soul-lite) aggregates
+    cleanly when every new_paths probe returns 404."""
+    hint = TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(),
+        new_paths=("soul_lite/service.py", "soul_lite/routes.py"),
+    )
+    script = {
+        ("repos/salucallc/soul-svc", None): [_FakeResp(200, {})],
+        ("contents/soul_lite/service.py", "main"): [_FakeResp(404)],
+        ("contents/soul_lite/routes.py", "main"): [_FakeResp(404)],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("F08", hint)
+
+    assert vr.status is HintStatus.OK
+    assert vr.repo_exists is True
+    assert vr.error is None
+    assert len(vr.path_results) == 2
+    assert all(pr.expected == "absent" and pr.observed == "absent" and pr.ok
+               for pr in vr.path_results)
+
+
+async def test_verify_hint_mixed_conflict_and_missing_prefers_conflict(
+    monkeypatch,
+):
+    """AB-17-f · Case 4 (tiebreak): one `paths` entry returns 404 AND one
+    `new_paths` entry returns 200. The aggregator checks conflict before
+    missing (orchestrator.py §1.2 lines 2624-2630), so the locked tiebreak
+    is PATH_CONFLICT."""
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {})],
+        # paths entry MISSING (expected exist, observed absent).
+        ("contents/deploy/appliance/docker-compose.yml", "main"): [
+            _FakeResp(404),
+        ],
+        # new_paths entry CONFLICT (expected absent, observed exist).
+        ("contents/deploy/appliance/IMAGE_PINS.md", "main"): [
+            _FakeResp(200, {}),
+        ],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("OPS-02", hint)
+
+    # Tiebreak: conflict wins over missing.
+    assert vr.status is HintStatus.PATH_CONFLICT
+    assert vr.repo_exists is True
+    # Both non-ok results present in path_results.
+    non_ok = [pr for pr in vr.path_results if not pr.ok]
+    assert len(non_ok) == 2
+    # Error populated for non-OK.
+    assert vr.error is not None and "new_paths already exist" in vr.error
+
+
+async def test_verify_hint_path_5xx_twice_status_unverified(monkeypatch):
+    """AB-17-f · Case 7: repo probe 200, but ONE path probe returns 5xx
+    twice (retry exhausted). `_gh_contents` swallows to "unknown"; aggregator
+    with `any_unknown=True` and no missing/conflict → UNVERIFIED."""
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("README.md",),
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {})],
+        # _gh_contents retries once on 5xx → supply TWO 503s to exhaust.
+        ("contents/README.md", "main"): [_FakeResp(503), _FakeResp(503)],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("X-PATH-5XX", hint)
+
+    assert vr.status is HintStatus.UNVERIFIED
+    assert vr.repo_exists is True
+    assert len(vr.path_results) == 1
+    assert vr.path_results[0].observed == "unknown"
+    assert vr.path_results[0].ok is False
+    # Error populated; points at the unknown path.
+    assert vr.error is not None
+    assert "unknown" in vr.error
+
+
+# ── AB-17-f · _render_target_block snapshot-style variants (Plan I §3) ─────
+#
+# Eleven cases covering every rendering branch. Each constructs a minimal
+# VerificationResult and asserts substring markers — NOT byte-for-byte
+# snapshots — so AB-17-e persona vocabulary tweaks don't have to repeat
+# here.
+
+
+def _hint(
+    *,
+    owner="salucallc",
+    repo="alfred-coo-svc",
+    paths=("deploy/appliance/docker-compose.yml",),
+    new_paths=(),
+    base_branch="main",
+    branch_hint="",
+    notes="",
+) -> TargetHint:
+    return TargetHint(
+        owner=owner, repo=repo, paths=paths, new_paths=new_paths,
+        base_branch=base_branch, branch_hint=branch_hint, notes=notes,
+    )
+
+
+def test_render_target_block_ok_paths_only_has_verified_exists_marker():
+    """Plan I §3 variant: OK with paths only. Every `paths` entry must
+    carry the `# verified exists @ main` comment."""
+    hint = _hint(paths=("deploy/appliance/docker-compose.yml",))
+    vr = VerificationResult(
+        code="OPS-01",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="deploy/appliance/docker-compose.yml",
+                       expected="exist", observed="exist", ok=True),
+        ),
+    )
+    block = _render_target_block("OPS-01", vr=vr)
+    assert "## Target" in block
+    assert "deploy/appliance/docker-compose.yml" in block
+    assert "# verified exists @ main" in block
+    # No new_paths section.
+    assert "new_paths:" not in block
+    # No warning banner for OK.
+    assert "VERIFICATION WARNING" not in block
+
+
+def test_render_target_block_ok_new_paths_only_has_verified_absent_marker():
+    """Plan I §3 variant: OK with new_paths only (e.g. F08). Every
+    `new_paths` entry must carry `verified absent @ main — you will CREATE
+    this file` and NO `paths:` section."""
+    hint = _hint(
+        paths=(),
+        new_paths=("soul_lite/service.py",),
+        repo="soul-svc",
+    )
+    vr = VerificationResult(
+        code="F08",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="soul_lite/service.py",
+                       expected="absent", observed="absent", ok=True),
+        ),
+    )
+    block = _render_target_block("F08", vr=vr)
+    assert "new_paths:" in block
+    assert "verified absent @ main — you will CREATE this file" in block
+    # Must NOT show a paths: section when hint.paths is empty.
+    assert "\npaths:\n" not in block
+    assert "VERIFICATION WARNING" not in block
+
+
+def test_render_target_block_ok_mixed_paths_and_new_paths_markers():
+    """Plan I §3 variant: OK mixed — both paths and new_paths present and
+    all verified. Both marker strings must appear in the same block."""
+    hint = _hint(
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+    )
+    vr = VerificationResult(
+        code="OPS-02",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="deploy/appliance/docker-compose.yml",
+                       expected="exist", observed="exist", ok=True),
+            PathResult(path="deploy/appliance/IMAGE_PINS.md",
+                       expected="absent", observed="absent", ok=True),
+        ),
+    )
+    block = _render_target_block("OPS-02", vr=vr)
+    assert "# verified exists @ main" in block
+    assert "verified absent @ main — you will CREATE this file" in block
+    assert "paths:" in block
+    assert "new_paths:" in block
+    assert "VERIFICATION WARNING" not in block
+
+
+def test_render_target_block_path_missing_shows_unresolved_and_stop():
+    """Plan I §3 variant: PATH_MISSING — the missing path line must be
+    `(unresolved — file ...)` + `STOP and escalate per Step 0`."""
+    hint = _hint(paths=("deploy/appliance/Caddyfile",))
+    vr = VerificationResult(
+        code="OPS-03",
+        hint=hint,
+        status=HintStatus.PATH_MISSING,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="deploy/appliance/Caddyfile",
+                       expected="exist", observed="absent", ok=False),
+        ),
+        error="one or more paths missing",
+    )
+    block = _render_target_block("OPS-03", vr=vr)
+    assert "(unresolved — file" in block
+    assert "deploy/appliance/Caddyfile" in block
+    assert "STOP and escalate per Step 0" in block
+
+
+def test_render_target_block_path_conflict_shows_conflict_and_already_exists():
+    """Plan I §3 variant: PATH_CONFLICT — the conflicting new_paths line
+    must say `(conflict — file ...)` + `already exists in`."""
+    hint = _hint(
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+    )
+    vr = VerificationResult(
+        code="OPS-02",
+        hint=hint,
+        status=HintStatus.PATH_CONFLICT,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="deploy/appliance/docker-compose.yml",
+                       expected="exist", observed="exist", ok=True),
+            PathResult(path="deploy/appliance/IMAGE_PINS.md",
+                       expected="absent", observed="exist", ok=False),
+        ),
+        error="one or more new_paths already exist",
+    )
+    block = _render_target_block("OPS-02", vr=vr)
+    assert "(conflict — file" in block
+    assert "already exists in" in block
+    assert "deploy/appliance/IMAGE_PINS.md" in block
+
+
+def test_render_target_block_unverified_prepends_warning_banner():
+    """Plan I §3 variant: UNVERIFIED — the block must be prefixed with a
+    `# VERIFICATION WARNING:` banner AND every `unknown` path line must
+    show `(unverified — <error>)` with the vr.error string."""
+    hint = _hint(paths=("README.md",))
+    vr = VerificationResult(
+        code="X",
+        hint=hint,
+        status=HintStatus.UNVERIFIED,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="README.md", expected="exist",
+                       observed="unknown", ok=False),
+        ),
+        error="one or more paths returned unknown status",
+    )
+    block = _render_target_block("X", vr=vr)
+    assert "# VERIFICATION WARNING:" in block
+    # Banner must precede the `## Target` header.
+    assert block.index("VERIFICATION WARNING") < block.index("## Target")
+    # Unknown-path line carries the error string.
+    assert "(unverified — one or more paths returned unknown status" in block
+
+
+def test_render_target_block_no_hint_has_unresolved_with_code():
+    """Plan I §3 variant: NO_HINT — render the `(unresolved — no hint for
+    code X)` escalation block. AB-17-c enriched the legacy string with the
+    triggering code."""
+    vr = VerificationResult(
+        code="ZZZ-99",
+        hint=None,
+        status=HintStatus.NO_HINT,
+        repo_exists=False,
+        path_results=(),
+        error="no hint for code ZZZ-99",
+    )
+    block = _render_target_block("ZZZ-99", vr=vr)
+    assert "(unresolved — no hint for code ZZZ-99" in block
+    assert "linear_create_issue" in block
+    assert "STOP" in block
+
+
+def test_render_target_block_repo_missing_defensive_fallback():
+    """Plan I §3 variant: REPO_MISSING (defensive) — AB-17-d is supposed
+    to skip dispatch for REPO_MISSING, so this branch should be unreachable
+    in prod. The renderer still emits `(blocked — repo ...)` +
+    `dispatch should not have happened` so any misuse is visible."""
+    hint = _hint(repo="nonexistent-repo")
+    vr = VerificationResult(
+        code="X-99",
+        hint=hint,
+        status=HintStatus.REPO_MISSING,
+        repo_exists=False,
+        path_results=(),
+        error="repo salucallc/nonexistent-repo returned 404 at ref main",
+    )
+    block = _render_target_block("X-99", vr=vr)
+    assert "(blocked — repo" in block
+    assert "salucallc/nonexistent-repo" in block
+    assert "dispatch should not have happened" in block
+
+
+def test_render_target_block_vr_none_known_code_matches_legacy_format():
+    """Plan I §3 variant: vr=None with known code — must render the
+    pre-AB-17 legacy block byte-for-byte (static `_TARGET_HINTS` lookup,
+    no verification comments). Locked so AB-17-c back-compat snapshot
+    tests keep passing."""
+    block = _render_target_block("OPS-01", vr=None)
+    # Legacy shape: owner/repo/paths/base_branch, no verification markers.
+    assert "## Target\n" in block
+    assert "owner: salucallc" in block
+    assert "repo:  alfred-coo-svc" in block
+    assert "paths:" in block
+    assert "base_branch: main" in block
+    # Absolutely NO verification-mode markers.
+    assert "# verified" not in block
+    assert "VERIFICATION WARNING" not in block
+    assert "(unresolved" not in block
+    assert "(conflict" not in block
+    assert "(unverified" not in block
+
+
+def test_render_target_block_vr_none_unknown_code_matches_legacy_unresolved():
+    """Plan I §3 variant: vr=None with unknown code — must render the
+    pre-AB-17 legacy `(unresolved — consult plan doc; STOP and escalate
+    via linear_create_issue per Step 0 of your persona protocol)` block.
+    Byte-for-byte preservation prevents snapshot-test drift."""
+    block = _render_target_block("NOPE-404", vr=None)
+    expected = (
+        "## Target\n"
+        "(unresolved — consult plan doc; STOP and escalate via "
+        "linear_create_issue per Step 0 of your persona protocol)\n"
+    )
+    assert block == expected
+
+
+# ── AB-17-f · _mark_repo_missing_tickets integration (Plan I §1.4 + §2.3) ──
+
+
+async def test_mark_repo_missing_tickets_blocks_only_repo_missing(
+    monkeypatch, caplog,
+):
+    """AB-17-d wiring: `_mark_repo_missing_tickets` must (a) emit a
+    grounding-gap Linear issue exactly once for each REPO_MISSING ticket,
+    (b) mark only those tickets FAILED, (c) record their ids in
+    `_repo_missing_tickets`, (d) NOT touch tickets with OK status,
+    (e) NOT call _update_linear_state (parent stays Backlog per §5.1 R-d),
+    (f) dedupe via `_emitted_blocks` on a second invocation."""
+    orch = _mk_orchestrator()
+
+    # Two tickets — OPS-01 (OK) and OPS-03 (REPO_MISSING).
+    t_ok = _t("u-ok", "SAL-1001", "OPS-01", 1, "ops")
+    t_blocked = _t("u-blocked", "SAL-1002", "OPS-03", 1, "ops")
+    _seed_graph(orch, [t_ok, t_blocked])
+
+    # Pre-populate _verified_hints to simulate wave-start verification.
+    ok_hint = _TARGET_HINTS["OPS-01"]
+    blocked_hint = TargetHint(
+        owner="salucallc",
+        repo="phantom-repo",
+        paths=("README.md",),
+    )
+    orch._verified_hints = {
+        "OPS-01": VerificationResult(
+            code="OPS-01", hint=ok_hint, status=HintStatus.OK,
+            repo_exists=True,
+            path_results=(
+                PathResult(path="deploy/appliance/docker-compose.yml",
+                           expected="exist", observed="exist", ok=True),
+            ),
+        ),
+        "OPS-03": VerificationResult(
+            code="OPS-03", hint=blocked_hint, status=HintStatus.REPO_MISSING,
+            repo_exists=False, path_results=(),
+            error="repo salucallc/phantom-repo returned 404 at ref main",
+        ),
+    }
+
+    # Mock linear_create_issue via BUILTIN_TOOLS.
+    from alfred_coo import tools as _tools_mod
+    calls: list[dict] = []
+
+    async def _fake_linear_create(
+        title, description="", priority=3, due_date=None, labels=None,
+    ):
+        calls.append({
+            "title": title, "description": description,
+            "priority": priority, "labels": labels,
+        })
+        return {"identifier": "SAL-9999", "url": "https://linear.app/x"}
+
+    original_spec = _tools_mod.BUILTIN_TOOLS["linear_create_issue"]
+    # Substitute the handler — keep everything else intact.
+    from alfred_coo.tools import ToolSpec
+    fake_spec = ToolSpec(
+        name=original_spec.name,
+        description=original_spec.description,
+        parameters=original_spec.parameters,
+        handler=_fake_linear_create,
+    )
+    monkeypatch.setitem(
+        _tools_mod.BUILTIN_TOOLS, "linear_create_issue", fake_spec,
+    )
+
+    # Also guard against accidental _update_linear_state by patching it to
+    # raise. If _mark_repo_missing_tickets ever calls it we fail loudly.
+    async def _boom(*a, **kw):
+        raise AssertionError(
+            "_update_linear_state must NOT be called by "
+            "_mark_repo_missing_tickets (parent ticket stays Backlog)"
+        )
+    monkeypatch.setattr(orch, "_update_linear_state", _boom, raising=False)
+
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING,
+                         logger="alfred_coo.autonomous_build.orchestrator"):
+        await orch._mark_repo_missing_tickets([t_ok, t_blocked])
+
+    # (a) one grounding-gap issue emitted.
+    assert len(calls) == 1
+    assert "[grounding-gap] BLOCKED" in calls[0]["title"]
+    assert "SAL-1002" in calls[0]["title"]
+    # labels forward-compat marker.
+    assert "grounding-gap" in (calls[0]["labels"] or [])
+
+    # (b) FAILED applied only to blocked ticket.
+    assert t_blocked.status is TicketStatus.FAILED
+    assert t_ok.status is TicketStatus.PENDING  # unchanged
+
+    # (c) `_repo_missing_tickets` contains the blocked ticket UUID, NOT OK.
+    assert t_blocked.id in orch._repo_missing_tickets
+    assert t_ok.id not in orch._repo_missing_tickets
+
+    # (d) WARN log line emitted with reason=repo_missing.
+    warn_lines = [r for r in caplog.records
+                  if r.levelname == "WARNING"
+                  and "reason=repo_missing" in r.getMessage()]
+    assert len(warn_lines) == 1, (
+        f"expected exactly one reason=repo_missing warning, got "
+        f"{[r.getMessage() for r in warn_lines]}"
+    )
+
+    # (f) dedupe: second invocation must NOT re-emit (via _emitted_blocks).
+    await orch._mark_repo_missing_tickets([t_ok, t_blocked])
+    assert len(calls) == 1, (
+        "linear_create_issue should NOT be re-called on second invocation "
+        f"(dedupe via _emitted_blocks), got {len(calls)} total calls"
+    )
+    # Blocked ticket UUID still recorded.
+    assert t_blocked.id in orch._repo_missing_tickets
+
+
+async def test_mark_repo_missing_tickets_noop_when_verified_hints_empty():
+    """AB-17-d guard: if verification was skipped (empty `_verified_hints`)
+    we must NOT treat any ticket as blocked. Plan I §1.4: dispatch as
+    today rather than mass-blocking on a verifier crash."""
+    orch = _mk_orchestrator()
+    t = _t("u-ok", "SAL-1", "OPS-01", 1, "ops")
+    _seed_graph(orch, [t])
+
+    assert orch._verified_hints == {}
+    await orch._mark_repo_missing_tickets([t])
+
+    # Nothing changed.
+    assert t.status is TicketStatus.PENDING
+    assert orch._repo_missing_tickets == set()
+    assert orch._emitted_blocks == set()
+
+
+async def test_child_task_body_uses_verified_hints_without_hasattr_guard(
+    monkeypatch,
+):
+    """AB-17-f init tweak: `_verified_hints` is always present on the
+    orchestrator (initialized in __init__), so `_child_task_body` passes
+    the verification result through without needing a `hasattr` guard.
+    This test pre-populates _verified_hints and asserts the rendered
+    block shows the verified marker."""
+    orch = _mk_orchestrator()
+    # Sanity: attribute is always present on freshly-constructed orchestrator.
+    assert hasattr(orch, "_verified_hints")
+    assert orch._verified_hints == {}
+
+    # Build an OK verification result for OPS-01.
+    hint = _TARGET_HINTS["OPS-01"]
+    orch._verified_hints["OPS-01"] = VerificationResult(
+        code="OPS-01",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=tuple(
+            PathResult(path=p, expected="exist", observed="exist", ok=True)
+            for p in hint.paths
+        ),
+    )
+    ticket = _t("u-ops-01", "SAL-2634", "OPS-01", 0, "ops", size="S")
+    body = orch._child_task_body(ticket)
+
+    # When vr is present, the verified-exists marker appears.
+    assert "# verified exists @ main" in body
+    # And no legacy fallthrough to `(unresolved)`.
+    assert "(unresolved" not in body
