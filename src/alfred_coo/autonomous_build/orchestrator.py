@@ -420,33 +420,175 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
 }
 
 
-def _render_target_block(code: str) -> str:
+def _render_target_block(
+    code: str,
+    vr: Optional[VerificationResult] = None,
+) -> str:
     """Render a ``## Target`` markdown block for the given plan-doc code.
 
-    If ``code`` is not in ``_TARGET_HINTS`` (or is empty), returns an
-    ``(unresolved)`` block so the child knows to escalate at Step 0 of its
-    persona grounding protocol (Plan H §2 G-1) rather than guessing.
+    Two rendering modes:
+
+    * ``vr is None`` — legacy AB-13 behaviour: render hint verbatim from
+      the static ``_TARGET_HINTS`` table, no verification comments. If
+      ``code`` is not in ``_TARGET_HINTS``, emit the pre-existing
+      ``(unresolved)`` escalation block so the child falls through to
+      Step 0 of its persona grounding protocol. Preserved byte-for-byte
+      so downstream snapshot tests keep passing.
+    * ``vr is not None`` — AB-17-c verified-render mode: drive the block
+      off ``vr.path_results``, rendering per the Plan I §3 decision
+      table (``expected`` × ``observed`` ∈ {exist, absent, unknown}).
+      Prepend a ``# VERIFICATION WARNING`` banner when
+      ``vr.status == HintStatus.UNVERIFIED``. Defensive single-line
+      fallback when ``vr.status == HintStatus.REPO_MISSING`` (should
+      not happen — AB-17-d skips dispatch for REPO_MISSING — but keep
+      it so a misuse surfaces loudly instead of rendering garbage).
     """
-    hint = _TARGET_HINTS.get((code or "").upper())
-    if hint is None:
+    # ── vr is None — legacy AB-13 path (must remain byte-identical) ─
+    if vr is None:
+        hint = _TARGET_HINTS.get((code or "").upper())
+        if hint is None:
+            return (
+                "## Target\n"
+                "(unresolved — consult plan doc; STOP and escalate via "
+                "linear_create_issue per Step 0 of your persona protocol)\n"
+            )
+        paths_block = "\n".join(f"  - {p}" for p in hint.paths)
+        lines = [
+            "## Target",
+            f"owner: {hint.owner}",
+            f"repo:  {hint.repo}",
+            "paths:",
+            paths_block,
+            f"base_branch: {hint.base_branch}",
+        ]
+        if hint.branch_hint:
+            lines.append(f"branch_hint: {hint.branch_hint}")
+        if hint.notes:
+            lines.append(f"notes: {hint.notes}")
+        return "\n".join(lines) + "\n"
+
+    # ── vr is not None — AB-17-c verified-render path ───────────────
+
+    # NO_HINT: mirror the legacy "no hint" escalation block so Plan I §3
+    # "No hint (pre-existing behaviour, unchanged)" variant shows the
+    # code that triggered it (tiny diagnostic upgrade — the legacy
+    # string said "consult plan doc" with no code; the Plan I §3
+    # example explicitly includes "no hint for code X").
+    if vr.status == HintStatus.NO_HINT:
         return (
             "## Target\n"
-            "(unresolved — consult plan doc; STOP and escalate via "
-            "linear_create_issue per Step 0 of your persona protocol)\n"
+            f"(unresolved — no hint for code {code}; consult plan doc; STOP "
+            "and escalate via linear_create_issue per Step 0 of your "
+            "persona protocol)\n"
         )
-    paths_block = "\n".join(f"  - {p}" for p in hint.paths)
-    lines = [
-        "## Target",
-        f"owner: {hint.owner}",
-        f"repo:  {hint.repo}",
-        "paths:",
-        paths_block,
-        f"base_branch: {hint.base_branch}",
+
+    # REPO_MISSING defensive fallback: AB-17-d is supposed to skip
+    # dispatch entirely, so this function should never be called with a
+    # REPO_MISSING vr. Render a one-liner instead of raising so a misuse
+    # is visible in the child task body rather than crashing the
+    # orchestrator mid-dispatch.
+    if vr.status == HintStatus.REPO_MISSING:
+        owner_repo = (
+            f"{vr.hint.owner}/{vr.hint.repo}"
+            if vr.hint is not None
+            else f"(code {code})"
+        )
+        return (
+            "## Target\n"
+            f"(blocked — repo {owner_repo} missing; dispatch should not "
+            "have happened; report bug)\n"
+        )
+
+    # From here on we need a hint — every non-NO_HINT / non-REPO_MISSING
+    # status carries one (VerificationResult.hint is Optional only
+    # because NO_HINT has no hint to attach).
+    hint = vr.hint
+    if hint is None:
+        # Belt-and-braces: should be unreachable given the status enum
+        # invariants, but don't let a None deref crash dispatch.
+        return (
+            "## Target\n"
+            f"(blocked — verification result for code {code} has no hint "
+            "but status is not NO_HINT; report bug)\n"
+        )
+
+    # Comment-alignment padding target. 48 chars matches the Plan I §3
+    # rendered examples (``deploy/appliance/docker-compose.yml`` + a
+    # handful of spaces + ``# verified exists @ main``).
+    _PAD_WIDTH = 48
+
+    def _pad(path: str) -> str:
+        return " " * max(0, _PAD_WIDTH - len(path))
+
+    # Split PathResults by expected axis so we can drive the two
+    # sections (paths: / new_paths:) independently, and omit either
+    # entirely if empty.
+    exist_results: List[PathResult] = [
+        pr for pr in vr.path_results if pr.expected == "exist"
     ]
+    absent_results: List[PathResult] = [
+        pr for pr in vr.path_results if pr.expected == "absent"
+    ]
+
+    def _render_exist(pr: PathResult) -> str:
+        # expected=exist × observed={exist,absent,unknown}
+        if pr.observed == "exist":
+            return f"  - {pr.path}{_pad(pr.path)}# verified exists @ {hint.base_branch}"
+        if pr.observed == "absent":
+            return (
+                f"  - (unresolved — file {pr.path} missing in "
+                f"{hint.owner}/{hint.repo}@{hint.base_branch}; "
+                f"check extension / casing / path; STOP and escalate per Step 0)"
+            )
+        # observed == "unknown"
+        return (
+            f"  - {pr.path}{_pad(pr.path)}# (unverified — {vr.error})"
+        )
+
+    def _render_absent(pr: PathResult) -> str:
+        # expected=absent × observed={absent,exist,unknown}
+        if pr.observed == "absent":
+            return (
+                f"  - {pr.path}{_pad(pr.path)}"
+                f"# verified absent @ {hint.base_branch} — you will CREATE this file"
+            )
+        if pr.observed == "exist":
+            return (
+                f"  - (conflict — file {pr.path} already exists in "
+                f"{hint.owner}/{hint.repo}@{hint.base_branch}; "
+                f"was it created by an earlier wave? STOP and escalate per Step 0)"
+            )
+        # observed == "unknown"
+        return (
+            f"  - {pr.path}{_pad(pr.path)}# (unverified — {vr.error}) — expected NEW"
+        )
+
+    lines: List[str] = []
+    if vr.status == HintStatus.UNVERIFIED:
+        lines.append(
+            "# VERIFICATION WARNING: hint could not be verified against "
+            "live repo state. Child MUST re-verify in Step 2."
+        )
+    lines.append("## Target")
+    lines.append(f"owner: {hint.owner}")
+    lines.append(f"repo:  {hint.repo}")
+
+    if exist_results:
+        lines.append("paths:")
+        for pr in exist_results:
+            lines.append(_render_exist(pr))
+
+    if absent_results:
+        lines.append("new_paths:")
+        for pr in absent_results:
+            lines.append(_render_absent(pr))
+
+    lines.append(f"base_branch: {hint.base_branch}")
     if hint.branch_hint:
         lines.append(f"branch_hint: {hint.branch_hint}")
     if hint.notes:
         lines.append(f"notes: {hint.notes}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -1029,7 +1171,21 @@ class AutonomousBuildOrchestrator:
         # up front via _TARGET_HINTS so the child knows which repo + which
         # files to edit. Unmapped codes emit an (unresolved) block telling
         # the child to open a grounding-gap Linear issue.
-        target_block = _render_target_block(ticket.code)
+        #
+        # AB-17-c (SAL — Plan I §3): pass the per-wave VerificationResult
+        # through so the render can decorate the block with verified /
+        # unresolved / conflict / unverified markers. ``hasattr`` guard
+        # preserves back-compat for code paths that instantiate this
+        # orchestrator without going through ``_start_wave`` →
+        # ``_verify_wave_hints`` (e.g. older unit tests); AB-17-f will
+        # tighten this by initializing ``_verified_hints = {}`` in
+        # ``__init__`` and removing the guard.
+        target_block = _render_target_block(
+            ticket.code,
+            vr=self._verified_hints.get(ticket.code)
+            if hasattr(self, "_verified_hints")
+            else None,
+        )
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
