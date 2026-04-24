@@ -16,6 +16,7 @@ import asyncio
 import importlib
 import json
 import logging
+import re
 from typing import Optional
 
 import uvicorn
@@ -24,13 +25,18 @@ from . import config, log, dispatch, health
 from .mesh import MeshClient, parse_persona_tag
 from .soul import SoulClient
 from .persona import Persona, get_persona
-from .dispatch import Dispatcher
+from .dispatch import Dispatcher, DispatchContext
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
 from .tools import resolve_tools, set_current_task_id, reset_current_task_id
 
 
 logger = logging.getLogger(__name__)
+
+# AB-21: Linear ticket identifier pattern — "SAL-" (or similar team prefix)
+# followed by 1-6 digits. Used by `_peek_linear_ticket` to pull a correlation
+# id out of the mesh task title for the observability header contract.
+_LINEAR_TICKET_RE = re.compile(r"\b([A-Z]{2,5}-\d{1,6})\b")
 
 
 # Module-level registry of long-running orchestrator tasks, keyed by the mesh
@@ -86,6 +92,27 @@ def _peek_kickoff_project_id(task: dict) -> Optional[str]:
     if pid is None:
         return None
     return str(pid)
+
+
+def _peek_linear_ticket(task: dict) -> Optional[str]:
+    """Best-effort extraction of a Linear ticket id (e.g. "SAL-2698") from
+    the mesh task title or description. Returns None if no match.
+
+    Used by the AB-21 dispatch path to stamp `X-Linear-Ticket` on the gateway
+    call so traces can be joined back to Linear. Never raises — a missing
+    ticket id must not block dispatch.
+    """
+    title = task.get("title") or ""
+    m = _LINEAR_TICKET_RE.search(title)
+    if m:
+        return m.group(1)
+    desc = task.get("description") or ""
+    if not desc:
+        return None
+    m = _LINEAR_TICKET_RE.search(desc)
+    if m:
+        return m.group(1)
+    return None
 
 
 def _resolve_handler(handler_name: str):
@@ -296,6 +323,9 @@ async def main() -> None:
         ollama_url=settings.ollama_url,
         anthropic_key=settings.anthropic_api_key,
         openrouter_key=settings.openrouter_api_key,
+        gateway_url=settings.gateway_url,
+        autobuild_soulkey=settings.autobuild_soulkey,
+        tiresias_tenant=settings.tiresias_tenant,
     )
 
     # Health endpoint in a background task.
@@ -385,9 +415,18 @@ async def main() -> None:
 
                 model = dispatch.select_model(task, persona)
                 tool_specs = resolve_tools(persona.tools or [])
+                # AB-21: stamp persona + linear ticket + mesh task id on every
+                # LLM call so the gateway trace middleware can correlate.
+                dispatch_ctx = DispatchContext(
+                    persona=persona.name,
+                    linear_ticket=_peek_linear_ticket(task),
+                    mesh_task_id=str(task.get("id")) if task.get("id") else None,
+                )
                 logger.info("dispatching",
                             extra={"task_id": task.get("id"),
                                    "model": model,
+                                   "persona": persona.name,
+                                   "linear_ticket": dispatch_ctx.linear_ticket,
                                    "tools_enabled": len(tool_specs) > 0,
                                    "tool_count": len(tool_specs)})
 
@@ -401,6 +440,7 @@ async def main() -> None:
                                 task.get("description") or task.get("title", "") or "(no content)",
                                 tools=tool_specs,
                                 fallback_model=persona.fallback_model,
+                                context=dispatch_ctx,
                             )
                         finally:
                             reset_current_task_id(ctx_token)
@@ -410,6 +450,7 @@ async def main() -> None:
                             system_prompt,
                             task.get("description") or task.get("title", "") or "(no content)",
                             fallback_model=persona.fallback_model,
+                            context=dispatch_ctx,
                         )
                 except Exception as e:
                     logger.exception("dispatch failed for task %s", task.get("id"))

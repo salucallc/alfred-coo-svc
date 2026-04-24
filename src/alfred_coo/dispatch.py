@@ -1,17 +1,34 @@
 """
 Model dispatcher with multi-provider fallback support.
 
-Phase B.3.1 adds OpenAI-compatible tool-use (`call_with_tools`) for models that
-support it (deepseek, qwen, kimi, llama via Ollama Cloud; any OpenRouter model
-that advertises tool support). Tool-use is opt-in via the caller passing a
-non-empty tools list.
+AB-21-coo (2026-04-23): all LLM traffic unified through the alfred-chat-stack
+gateway's OpenAI-compatible router. Previously three branches bypassed the
+gateway for claude-* (direct Anthropic SDK) and openrouter/* (direct
+openrouter.ai); now every family funnels through `_call_gateway`, which
+stamps the AB-21 observability header contract on every request:
+
+    Authorization: Bearer <autobuild_soulkey>     # from settings, optional
+    X-Tiresias-Tenant: <tenant>                   # default "alfred-coo-mc"
+    X-Alfred-Persona: <persona>                   # from DispatchContext
+    X-Linear-Ticket: <SAL-xxxx>                   # optional
+    X-Mesh-Task-Id: <uuid>                        # optional
+
+The gateway's OpenAI-compat layer handles Anthropic routing (requires
+ANTHROPIC_API_KEY on the gateway side) and OpenRouter routing (requires
+OPENROUTER_API_KEY on the gateway side) transparently. The dispatcher only
+knows one endpoint: `{gateway_url}/v1/chat/completions`.
+
+Phase B.3.1 OpenAI-compatible tool-use (`call_with_tools`) remains: the loop
+bodies now post to the gateway too and carry the same stamped headers across
+every iteration, so the full tool chain is observable end-to-end.
 """
 
 import json
 import logging
+from dataclasses import dataclass
+from typing import Optional
 
 import httpx
-from anthropic import AsyncAnthropic
 
 from .tools import ToolSpec, execute_tool, openai_tool_schema
 
@@ -19,6 +36,7 @@ from .tools import ToolSpec, execute_tool, openai_tool_schema
 logger = logging.getLogger("alfred_coo.dispatch")
 
 MAX_TOOL_ITERATIONS = 8
+
 
 def select_model(task: dict, persona) -> str:
     title = task.get("title", "")
@@ -31,12 +49,153 @@ def select_model(task: dict, persona) -> str:
     else:
         return "deepseek-v3.2:cloud"
 
+
+@dataclass
+class DispatchContext:
+    """Caller-supplied observability metadata stamped on every gateway call.
+
+    `persona` is always required (stamped as `X-Alfred-Persona`). The other
+    two are optional — when set, they produce `X-Linear-Ticket` and
+    `X-Mesh-Task-Id` headers respectively, which the AB-21-gw trace
+    middleware uses to correlate LLM calls back to the mesh task and the
+    Linear ticket that spawned it.
+    """
+
+    persona: str
+    linear_ticket: Optional[str] = None
+    mesh_task_id: Optional[str] = None
+
+
+# Sentinel context used when a caller doesn't supply one. Emits a single
+# warning per process so we notice un-annotated call sites in production
+# without spamming the log for every call.
+_UNKNOWN_CONTEXT = DispatchContext(persona="unknown")
+_warned_missing_context = False
+
+
+def _default_context() -> DispatchContext:
+    global _warned_missing_context
+    if not _warned_missing_context:
+        logger.warning(
+            "dispatch call made without DispatchContext; headers will use "
+            "persona=unknown and omit Linear/mesh correlation. "
+            "Fix by passing context= at the call site."
+        )
+        _warned_missing_context = True
+    return _UNKNOWN_CONTEXT
+
+
+def _derive_gateway_base(gateway_url: str, ollama_url: str) -> str:
+    """Resolve the gateway base URL.
+
+    Prefers the explicit `gateway_url` setting. Falls back to stripping a
+    trailing `/v1` (or `/v1/`) from `ollama_url` so existing Oracle envs
+    that only set OLLAMA_URL keep working without a config flip day.
+    """
+    if gateway_url:
+        return gateway_url.rstrip("/")
+    base = ollama_url.rstrip("/")
+    for suffix in ("/v1", "/v1/"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)].rstrip("/")
+    return base
+
+
 class Dispatcher:
-    def __init__(self, ollama_url: str, anthropic_key: str, openrouter_key: str, timeout: float = 300.0):
+    def __init__(
+        self,
+        ollama_url: str,
+        anthropic_key: str = "",
+        openrouter_key: str = "",
+        timeout: float = 300.0,
+        *,
+        gateway_url: str = "",
+        autobuild_soulkey: str = "",
+        tiresias_tenant: str = "alfred-coo-mc",
+    ):
+        # Kept for backwards compatibility with any caller that still passes
+        # them; neither is used now that all routing is gateway-side. The
+        # gateway owns both keys.
         self.ollama_url = ollama_url.rstrip("/")
-        self.anthropic_client = AsyncAnthropic(api_key=anthropic_key)
-        self.openrouter_key = openrouter_key
+        self.anthropic_key = anthropic_key  # unused post AB-21, retained for ctor compat
+        self.openrouter_key = openrouter_key  # ditto
         self.timeout = timeout
+
+        # AB-21 gateway plumbing.
+        self.gateway_base = _derive_gateway_base(gateway_url, ollama_url)
+        self.autobuild_soulkey = autobuild_soulkey
+        self.tiresias_tenant = tiresias_tenant
+
+        if not self.autobuild_soulkey:
+            logger.warning(
+                "AUTOBUILD_SOULKEY not set; dispatch calls will skip the "
+                "Authorization header and rely on the gateway's allow-all "
+                "policy. Acceptable for pre-AB-21-gw rollout; tighten "
+                "before the gateway flips to deny-by-default."
+            )
+
+    # ── Header stamping ────────────────────────────────────────────────
+
+    def _build_headers(self, context: DispatchContext) -> dict:
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "X-Tiresias-Tenant": self.tiresias_tenant,
+            "X-Alfred-Persona": context.persona or "unknown",
+        }
+        if self.autobuild_soulkey:
+            headers["Authorization"] = f"Bearer {self.autobuild_soulkey}"
+        if context.linear_ticket:
+            headers["X-Linear-Ticket"] = context.linear_ticket
+        if context.mesh_task_id:
+            headers["X-Mesh-Task-Id"] = context.mesh_task_id
+        return headers
+
+    # ── Gateway call ────────────────────────────────────────────────────
+
+    def _gateway_model(self, model: str) -> str:
+        """Return the model string the gateway expects.
+
+        The gateway's OpenAI-compat router dispatches on model prefix:
+          * `openrouter/<upstream>` → forwarded to openrouter.ai; the prefix
+            is preserved so the gateway can parse `openrouter/` off.
+          * `claude-*`              → forwarded to Anthropic via its key.
+          * everything else         → Ollama cloud / local.
+
+        This stays a trivial pass-through today; kept as its own method so
+        if the gateway contract changes (e.g. wants `anthropic/<model>` for
+        claude), we only edit here.
+        """
+        return model
+
+    async def _call_gateway(
+        self,
+        model: str,
+        messages: list[dict],
+        context: Optional[DispatchContext] = None,
+        tools: Optional[list[dict]] = None,
+    ) -> dict:
+        """Single chokepoint for every LLM call made by alfred-coo.
+
+        All three legacy paths (Anthropic direct, Ollama, OpenRouter direct)
+        are unified here. Returns the raw OpenAI-compat response JSON so
+        callers that need `tool_calls` / `usage` / etc. can introspect.
+        """
+        ctx = context or _default_context()
+        url = f"{self.gateway_base}/v1/chat/completions"
+        headers = self._build_headers(ctx)
+        body: dict = {
+            "model": self._gateway_model(model),
+            "messages": messages,
+        }
+        if tools:
+            body["tools"] = tools
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(url, headers=headers, json=body)
+            resp.raise_for_status()
+            return resp.json()
+
+    # ── One-shot call ───────────────────────────────────────────────────
 
     async def call(
         self,
@@ -44,66 +203,41 @@ class Dispatcher:
         system: str,
         prompt: str,
         fallback_model: str | None = None,
+        context: Optional[DispatchContext] = None,
     ) -> dict:
         try:
-            return await self._call_model(model, system, prompt)
+            return await self._call_model(model, system, prompt, context=context)
         except Exception:
             fb = fallback_model or "deepseek-v3.2:cloud"
             if fb == model:
                 raise
-            result = await self._call_model(fb, system, prompt)
+            result = await self._call_model(fb, system, prompt, context=context)
             result["model_used"] = f"{model} -> {fb}"
             return result
 
-    async def _call_model(self, model: str, system: str, prompt: str) -> dict:
+    async def _call_model(
+        self,
+        model: str,
+        system: str,
+        prompt: str,
+        context: Optional[DispatchContext] = None,
+    ) -> dict:
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ]
-
-        if model.startswith("claude-"):
-            response = await self.anthropic_client.messages.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                system=system,
-                max_tokens=4096
-            )
-            content = response.content[0].text
-            tokens_in = response.usage.input_tokens
-            tokens_out = response.usage.output_tokens
-        elif ":cloud" in model or model.startswith(("qwen", "deepseek", "llama")):
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{self.ollama_url}/chat/completions",
-                    json={"model": model, "messages": messages}
-                )
-                response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                tokens_in = data.get("usage", {}).get("prompt_tokens", 0)
-                tokens_out = data.get("usage", {}).get("completion_tokens", 0)
-        elif model.startswith("openrouter/"):
-            actual_model = model[len("openrouter/"):]
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {self.openrouter_key}"},
-                    json={"model": actual_model, "messages": messages}
-                )
-                response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                tokens_in = data.get("usage", {}).get("prompt_tokens", 0)
-                tokens_out = data.get("usage", {}).get("completion_tokens", 0)
-        else:
-            raise ValueError(f"Unsupported model: {model}")
-
+        data = await self._call_gateway(model, messages, context=context)
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        usage = data.get("usage") or {}
         return {
-            "content": content,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-            "model_used": model
+            "content": msg.get("content", "") or "",
+            "tokens_in": usage.get("prompt_tokens", 0),
+            "tokens_out": usage.get("completion_tokens", 0),
+            "model_used": model,
         }
+
+    # ── Tool-use loop ───────────────────────────────────────────────────
 
     async def call_with_tools(
         self,
@@ -112,6 +246,7 @@ class Dispatcher:
         prompt: str,
         tools: list[ToolSpec],
         fallback_model: str | None = None,
+        context: Optional[DispatchContext] = None,
     ) -> dict:
         """Multi-turn OpenAI-compatible tool-use loop.
 
@@ -125,16 +260,19 @@ class Dispatcher:
         be meaningfully resumed on another.
         """
         if not tools:
-            return await self.call(model, system, prompt, fallback_model=fallback_model)
+            return await self.call(
+                model, system, prompt,
+                fallback_model=fallback_model, context=context,
+            )
 
         try:
-            return await self._tool_loop(model, system, prompt, tools)
+            return await self._tool_loop(model, system, prompt, tools, context=context)
         except Exception as e:
             fb = fallback_model or "deepseek-v3.2:cloud"
             if fb == model:
                 raise
             logger.warning("tool-use primary %s failed (%s); retrying on %s", model, e, fb)
-            result = await self._tool_loop(fb, system, prompt, tools)
+            result = await self._tool_loop(fb, system, prompt, tools, context=context)
             result["model_used"] = f"{model} -> {fb}"
             return result
 
@@ -144,8 +282,8 @@ class Dispatcher:
         system: str,
         prompt: str,
         tools: list[ToolSpec],
+        context: Optional[DispatchContext] = None,
     ) -> dict:
-        url, auth_header = self._openai_endpoint(model)
         messages: list[dict] = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -156,58 +294,49 @@ class Dispatcher:
         total_out = 0
         tool_call_log: list[dict] = []
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for iteration in range(MAX_TOOL_ITERATIONS):
-                resp = await client.post(
-                    url,
-                    headers=auth_header,
-                    json={
-                        "model": self._strip_openrouter_prefix(model),
-                        "messages": messages,
-                        "tools": tool_schemas,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                choice = (data.get("choices") or [{}])[0]
-                msg = choice.get("message") or {}
-                usage = data.get("usage") or {}
-                total_in += usage.get("prompt_tokens", 0)
-                total_out += usage.get("completion_tokens", 0)
+        for iteration in range(MAX_TOOL_ITERATIONS):
+            data = await self._call_gateway(
+                model, messages, context=context, tools=tool_schemas,
+            )
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            usage = data.get("usage") or {}
+            total_in += usage.get("prompt_tokens", 0)
+            total_out += usage.get("completion_tokens", 0)
 
-                tool_calls = msg.get("tool_calls") or []
-                if not tool_calls:
-                    return {
-                        "content": msg.get("content", "") or "",
-                        "tokens_in": total_in,
-                        "tokens_out": total_out,
-                        "model_used": model,
-                        "tool_calls": tool_call_log,
-                        "iterations": iteration + 1,
-                    }
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                return {
+                    "content": msg.get("content", "") or "",
+                    "tokens_in": total_in,
+                    "tokens_out": total_out,
+                    "model_used": model,
+                    "tool_calls": tool_call_log,
+                    "iterations": iteration + 1,
+                }
 
-                messages.append(msg)
-                for call in tool_calls:
-                    call_id = call.get("id") or ""
-                    fn = call.get("function") or {}
-                    name = fn.get("name") or ""
-                    args_json = fn.get("arguments") or "{}"
-                    spec = tool_index.get(name)
-                    if spec is None:
-                        result_str = json.dumps({"error": f"unknown tool: {name}"})
-                    else:
-                        result_str = await execute_tool(spec, args_json)
-                    tool_call_log.append({
-                        "iteration": iteration,
-                        "name": name,
-                        "arguments": args_json,
-                        "result": result_str,
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": result_str,
-                    })
+            messages.append(msg)
+            for call in tool_calls:
+                call_id = call.get("id") or ""
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                args_json = fn.get("arguments") or "{}"
+                spec = tool_index.get(name)
+                if spec is None:
+                    result_str = json.dumps({"error": f"unknown tool: {name}"})
+                else:
+                    result_str = await execute_tool(spec, args_json)
+                tool_call_log.append({
+                    "iteration": iteration,
+                    "name": name,
+                    "arguments": args_json,
+                    "result": result_str,
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result_str,
+                })
 
         logger.warning("tool-use hit MAX_TOOL_ITERATIONS (%d); returning partial", MAX_TOOL_ITERATIONS)
         return {
@@ -219,16 +348,3 @@ class Dispatcher:
             "iterations": MAX_TOOL_ITERATIONS,
             "truncated": True,
         }
-
-    def _openai_endpoint(self, model: str) -> tuple[str, dict]:
-        """Pick the OpenAI-compatible endpoint + auth header for a given model."""
-        if model.startswith("openrouter/"):
-            return (
-                "https://openrouter.ai/api/v1/chat/completions",
-                {"Authorization": f"Bearer {self.openrouter_key}"},
-            )
-        return (f"{self.ollama_url}/chat/completions", {})
-
-    @staticmethod
-    def _strip_openrouter_prefix(model: str) -> str:
-        return model[len("openrouter/"):] if model.startswith("openrouter/") else model
