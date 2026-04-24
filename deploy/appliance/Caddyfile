@@ -1,4 +1,5 @@
 # Caddyfile for Mission Control Appliance
+# APE/V: SAL-2636 – see D_ops_layer.md
 # Routes internal services under a single hostname with path-based routing.
 # MCP services are routed per-service; /soul/* → soul-svc; /chat/* → open-webui.
 

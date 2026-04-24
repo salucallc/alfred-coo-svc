@@ -1,5 +1,6 @@
 # deploy/appliance/docker-compose.yml
 # Mission Control Appliance bundle — SAL-2557 + SAL-2582 Phase 3b
+# APE/V: SAL-2636 – ops layer implementation
 # Single `docker compose up` stands up all services behind Caddy reverse proxy.
 # Paired with deploy/appliance/Caddyfile.
 
