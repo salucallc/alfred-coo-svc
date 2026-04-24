@@ -101,6 +101,14 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "result describing: (a) the APE/V you will satisfy, (b) each file "
             "you will create or modify, (c) the smallest diff that meets "
             "APE/V.\n\n"
+            "**Investigation budget.** You have 10 tool-call turns total "
+            "per dispatch. After your 4th http_get, commit to one of the "
+            "two emit paths (propose_pr or linear_create_issue) within 3 "
+            "more turns — if you still need more exploration, open the "
+            "issue rather than keep probing. Deep investigation of every "
+            "edge case burns the turn budget before the emit, leaving the "
+            "ticket in an ambiguous \"researched but not acted on\" state, "
+            "which the orchestrator cannot distinguish from a hang.\n\n"
             "STEP 4: Call propose_pr with a files dict whose keys match "
             "## Target exactly. If you believe the plan requires a path "
             "outside ## Target, STOP and open a grounding-gap Linear issue "
@@ -278,8 +286,20 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "offending evidence (missing APE/V block, raw additions count, "
             "absent justification paragraph, off-target file path) in your "
             "pr_review body so the merge log is auditable."
+            "\n\n"
+            "── AB-17-i VERDICT-EMIT DISCIPLINE (load-bearing) ──\n"
+            "**How you emit the verdict.** The only way the orchestrator "
+            "sees your verdict is the `pr_review` tool call. Call "
+            "`pr_review` with verdict=`APPROVE` for a pass, or "
+            "`REQUEST_CHANGES` with an `event`+`body` argument for a "
+            "rejection. Do NOT state the verdict in prose only — the "
+            "orchestrator does not read prose review bodies. Before you "
+            "emit the structured-output envelope, self-check: have you "
+            "called `pr_review` this turn with an explicit verdict? If no "
+            "→ STOP, call it now, then include the resulting verdict "
+            "string in your `summary`."
         ),
-        preferred_model="qwen3-coder:480b-cloud",
+        preferred_model="gpt-oss:120b-cloud",
         fallback_model="deepseek-v3.2:cloud",
         topics=[
             "qa",
