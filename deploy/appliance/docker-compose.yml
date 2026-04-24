@@ -91,7 +91,7 @@ services:
     networks:
       - appliance
 
-  # — MCP Services (curated: github, slack, linear, notion) ————
+  # MCP Services (curated: github, slack, linear, notion) —————
   mcp-github:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
     restart: unless-stopped
@@ -166,6 +166,36 @@ services:
     networks:
       - appliance
 
+  # New ops services
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "3000:3000"
+    networks:
+      - appliance
+
+  authelia:
+    image: authelia/authelia:4.38.17
+    restart: unless-stopped
+    environment:
+      AUTHELIA_JWT_SECRET: ${AUTHELIA_JWT_SECRET:?must set}
+    networks:
+      - appliance
+
+  infisical:
+    image: infisical/infisical:v0.124.0-postgres
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://appliance:${POSTGRES_PASSWORD:?must set}@postgres:5432/infisical
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - appliance
+
   # New aletheia service
   aletheia-svc:
     image: ghcr.io/salucallc/aletheia-svc:latest
@@ -182,8 +212,6 @@ services:
       retries: 5
     networks:
       - appliance
-
-  # — end services
 
 volumes:
   caddy_data:
