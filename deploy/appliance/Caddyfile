@@ -1,4 +1,8 @@
 # Caddyfile for Mission Control Appliance
+# APE/V Citation
+# Ticket: SAL-2636 (OPS-03)
+# Acceptance: see plan doc D_ops_layer.md section "Acceptance (APE/V)"
+
 # Routes internal services under a single hostname with path-based routing.
 # MCP services are routed per-service; /soul/* → soul-svc; /chat/* → open-webui.
 
