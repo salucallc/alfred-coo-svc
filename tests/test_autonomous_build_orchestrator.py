@@ -839,8 +839,10 @@ def test_target_hints_s04_uses_serve_py():
 
 
 def test_target_hints_entry_count_unchanged():
-    """AB-17-a is data correctness only: still 16 entries after the fix."""
-    assert len(_TARGET_HINTS) == 16
+    """AB-19 adds 6 wave-0 entries (SS-01/02/06/09 + OPS-22 + ALT-01) to
+    close the `no_hint: 6` gap observed in v8-full-v4 (mesh task 83dd216d,
+    2026-04-24). Pre-AB-19 baseline was 16; post is 22."""
+    assert len(_TARGET_HINTS) == 22
 
 
 # ── AB-17-a · new result types (HintStatus / PathResult / VerificationResult)
