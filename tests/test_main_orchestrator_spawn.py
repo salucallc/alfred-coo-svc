@@ -476,3 +476,95 @@ def test_peek_kickoff_project_id_handles_non_json_desc():
     assert main_mod._peek_kickoff_project_id(
         {"id": "X", "description": '{"linear_project_id": "P-OK"}'}
     ) == "P-OK"
+
+
+# ── AB-17-n: orchestrator done-callback hardening ──────────────────────────
+
+
+async def test_orchestrator_done_callback_reports_handler_exception(
+    monkeypatch, caplog
+):
+    """AB-17-n: when `orchestrator.run()` raises (escaping its own
+    `except Exception` guard, or crashing inside the final
+    `mesh.complete`), the spawn-time done-callback must log the
+    unexpected death AND issue `mesh.complete(status="failed", ...)` so
+    the kickoff task is reconciled on the mesh. Without this, v8-full +
+    v8-full-v2-style "silent deaths" leave the task dangling forever.
+    """
+    import logging
+
+    class _BoomOrchestrator:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self):
+            raise RuntimeError("boom")
+
+    _install_fake_handler_module(
+        monkeypatch, _BoomOrchestrator, attr_name="BoomOrchestrator"
+    )
+
+    mesh = _FakeMesh()
+    # Kickoff has a linear_project_id so the project-slot path is also
+    # exercised (the _clear_project_slot callback must coexist with our
+    # new _orch_done callback without either clobbering the other).
+    task = _kickoff_task("T-boom", "P-boom")
+    persona = _make_persona("BoomOrchestrator")
+
+    with caplog.at_level(logging.ERROR, logger="alfred_coo.main"):
+        spawned = await main_mod._spawn_long_running_handler(
+            task=task,
+            persona=persona,
+            mesh=mesh,
+            soul=object(),
+            dispatcher=object(),
+            settings=_FakeSettings(),
+        )
+
+        assert spawned is True
+        stashed = main_mod._running_orchestrators["T-boom"]
+
+        # Await the task — it will raise; swallow the exception so the
+        # done-callback gets its chance. The callback's mesh.complete is
+        # scheduled via asyncio.create_task, so yield a couple of ticks
+        # for that to run.
+        with pytest.raises(RuntimeError, match="boom"):
+            await stashed
+        # Let the fire-and-forget mesh.complete task run.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    # The done-callback logged the unexpected death.
+    died_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.ERROR
+        and "died unexpectedly" in r.getMessage()
+    ]
+    assert died_msgs, (
+        f"expected an ERROR log containing 'died unexpectedly'; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    # And that log cites the task id + the exception repr.
+    assert any("T-boom" in m and "boom" in m for m in died_msgs), (
+        f"expected task id + 'boom' in death log; got: {died_msgs}"
+    )
+
+    # mesh.complete was called with status='failed' and an error string
+    # carrying both the exception type (RuntimeError) and message (boom).
+    assert mesh.completions, "mesh.complete was never called"
+    comp = mesh.completions[-1]
+    assert comp["task_id"] == "T-boom"
+    assert comp["session_id"] == "test-session"
+    assert comp["status"] == "failed"
+    err = (comp.get("result") or {}).get("error", "")
+    assert "boom" in err, f"expected 'boom' in error, got {err!r}"
+    assert "RuntimeError" in err, (
+        f"expected 'RuntimeError' in error, got {err!r}"
+    )
+    assert err.startswith("handler_died:"), (
+        f"expected error to start with 'handler_died:', got {err!r}"
+    )
+
+    # The existing _clear_project_slot callback still fired — project
+    # slot is released (belt + suspenders coexist).
+    assert main_mod._orchestrators_by_project.get("P-boom") is None
