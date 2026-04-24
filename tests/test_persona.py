@@ -16,7 +16,11 @@ def test_default_persona_returned_on_unknown():
 def test_alfred_coo_a_resolves():
     p = get_persona("alfred-coo-a")
     assert p.name == "alfred-coo-a"
-    assert p.preferred_model == "qwen3-coder:480b-cloud"
+    # AB-17-h: swapped from qwen3-coder:480b-cloud to kimi-k2-thinking:cloud
+    # after v8-smoke-b showed persistent hallucination under qwen on
+    # SAL-2634 (OPS-01) despite AB-17-g "tool output is ground truth"
+    # clause. kimi chain-of-thought should catch hint-vs-tool contradictions.
+    assert p.preferred_model == "kimi-k2-thinking:cloud"
     assert p.fallback_model == "deepseek-v3.2:cloud"
     assert "coo-daemon" in p.topics
 
