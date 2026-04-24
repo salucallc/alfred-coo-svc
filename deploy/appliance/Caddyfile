@@ -37,6 +37,22 @@
     reverse_proxy open-webui:8080
   }
 
+  # New ops routes per OPS-03
+  handle /ops/* {
+    uri strip_prefix /ops
+    reverse_proxy grafana:3000
+  }
+
+  handle /auth/* {
+    uri strip_prefix /auth
+    reverse_proxy authelia:9091
+  }
+
+  handle /vault/* {
+    uri strip_prefix /vault
+    reverse_proxy infisical:8080
+  }
+
   handle {
     reverse_proxy alfred-portal:3000
   }
