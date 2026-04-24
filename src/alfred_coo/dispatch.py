@@ -35,7 +35,12 @@ from .tools import ToolSpec, execute_tool, openai_tool_schema
 
 logger = logging.getLogger("alfred_coo.dispatch")
 
-MAX_TOOL_ITERATIONS = 8
+# AB-17-l (2026-04-24): raised 8 -> 12 after v8-full children truncated mid-investigation
+# on tickets with 4+ http_get probes + propose_pr finalisation (mesh task e7f85521,
+# warnings at 16:46:18 and 16:49:29 UTC on gpt-oss:120b-cloud). AB-17-i already bounds
+# alfred-coo-a investigation to commit within 3 turns after 4 http_gets, so runaway cost
+# stays capped.
+MAX_TOOL_ITERATIONS = 12
 
 
 def select_model(task: dict, persona) -> str:
