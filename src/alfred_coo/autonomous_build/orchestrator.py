@@ -24,11 +24,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
+
+import httpx
 
 from .budget import BudgetTracker, make_tracker
 from .cadence import SlackCadence
@@ -528,6 +532,14 @@ class AutonomousBuildOrchestrator:
         # `apply_dry_run` so tests + operators can inspect it.
         self._dry_run_adapter = maybe_apply_dry_run(self)
 
+        # AB-17-b · Plan I §1 — pre-dispatch hint verification. Populated
+        # at the top of each wave by `_verify_wave_hints`; read by AB-17-c's
+        # `_render_target_block` to decorate the child target block with
+        # live-GitHub state. The semaphore caps concurrent GitHub API
+        # fan-out so we don't trip abuse detection on a 16-ticket wave.
+        self._verified_hints: Dict[str, "VerificationResult"] = {}
+        self._verify_semaphore: asyncio.Semaphore = asyncio.Semaphore(8)
+
     # ── public entry point ─────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -573,6 +585,30 @@ class AutonomousBuildOrchestrator:
             self.state.current_wave = wave
             logger.info("entering wave %d", wave)
             self.state.record_event("wave_enter", wave=wave)
+            # AB-17-b · Plan I §1: verify every ticket's TargetHint against
+            # live GitHub state BEFORE dispatch so the rendered ## Target
+            # block in the child task body can carry an `observed:` row.
+            # Verification is best-effort — UNVERIFIED / NO_HINT still
+            # dispatch (BLOCKED handling is AB-17-d). Logged as a status
+            # histogram so operators can spot a wave with lots of
+            # REPO_MISSING / PATH_CONFLICT before children start.
+            try:
+                self._verified_hints = await self._verify_wave_hints(wave)
+                status_counts = Counter(
+                    vr.status for vr in self._verified_hints.values()
+                )
+                logger.info(
+                    "wave %d hint verification: %s",
+                    wave,
+                    {k.value: v for k, v in status_counts.items()},
+                )
+            except Exception:
+                logger.exception(
+                    "wave %d hint verification crashed; dispatching without "
+                    "verified hints",
+                    wave,
+                )
+                self._verified_hints = {}
             await self._dispatch_wave(wave)
             await self._wait_for_wave_gate(wave)
             self.state.record_event("wave_exit", wave=wave)
@@ -2208,3 +2244,254 @@ class AutonomousBuildOrchestrator:
                 "events_tail": self.state.events[-10:],
             },
         }
+
+    # ── AB-17-b · hint verification (Plan I §1) ────────────────────────────
+
+    async def _gh_api(self, path: str) -> Optional[dict]:
+        """``GET https://api.github.com/{path}`` → JSON on 200, ``None`` on 404.
+
+        Raises ``httpx.HTTPStatusError`` for any other non-2xx response so
+        callers can distinguish a clean-miss 404 from a transient 5xx /
+        429 / timeout and decide whether to retry or mark UNVERIFIED.
+
+        Retries once on 5xx / connection errors with a 2s sleep. On 429,
+        returns by raising so the caller can decide (``_gh_contents`` maps
+        it to ``"unknown"`` without retry — we don't want to hammer an
+        already-rate-limited endpoint).
+        """
+        url = f"https://api.github.com/{path.lstrip('/')}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        last_exc: Optional[Exception] = None
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(url, headers=headers)
+            except (httpx.NetworkError, httpx.TimeoutException) as e:
+                last_exc = e
+                if attempt == 1:
+                    await asyncio.sleep(2.0)
+                    continue
+                raise
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                # Don't retry rate-limit hits; propagate so caller marks
+                # the path "unknown" and we move on.
+                resp.raise_for_status()
+            if 500 <= resp.status_code < 600 and attempt == 1:
+                await asyncio.sleep(2.0)
+                continue
+            resp.raise_for_status()
+        # Unreachable: either returned or raised above.
+        if last_exc is not None:
+            raise last_exc  # noqa: RSE102 — belt-and-braces
+        raise RuntimeError("unreachable")
+
+    async def _gh_contents(
+        self, owner: str, repo: str, path: str, ref: str
+    ) -> Literal["exist", "absent", "unknown"]:
+        """Probe a repo path at a ref. Returns ``"exist"`` on 200,
+        ``"absent"`` on 404, ``"unknown"`` on any transient failure
+        (5xx after retry, 429, timeout). Never raises — Plan I §1.2
+        wants a best-effort per-path outcome, not a wave-wide crash.
+        """
+        # URL-encode ref so `feature/foo` branches survive the query param
+        # round-trip. The path itself is part of the URL so we keep it raw.
+        api_path = f"repos/{owner}/{repo}/contents/{path.lstrip('/')}"
+        url = f"https://api.github.com/{api_path}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(
+                        url, headers=headers, params={"ref": ref}
+                    )
+            except (httpx.NetworkError, httpx.TimeoutException):
+                if attempt == 1:
+                    await asyncio.sleep(2.0)
+                    continue
+                return "unknown"
+            if resp.status_code == 200:
+                return "exist"
+            if resp.status_code == 404:
+                return "absent"
+            if resp.status_code == 429:
+                return "unknown"
+            if 500 <= resp.status_code < 600 and attempt == 1:
+                await asyncio.sleep(2.0)
+                continue
+            return "unknown"
+        return "unknown"
+
+    async def _verify_hint(
+        self, code: str, hint: TargetHint
+    ) -> VerificationResult:
+        """Verify a single ``TargetHint`` against live GitHub state.
+
+        Plan I §1.2 decision flow:
+
+        1. ``GET repos/{owner}/{repo}`` — if 404, short-circuit to
+           ``REPO_MISSING``. Other errors → ``UNVERIFIED`` so we dispatch
+           anyway (transient issues shouldn't freeze a wave).
+        2. For each path in ``hint.paths`` (expected to exist) and
+           ``hint.new_paths`` (expected to be absent), probe contents and
+           build a ``PathResult``.
+        3. Aggregate: all-ok → ``OK``; any conflict in ``new_paths`` →
+           ``PATH_CONFLICT``; any missing in ``paths`` → ``PATH_MISSING``;
+           else ``UNVERIFIED`` (transient).
+        """
+        async with self._verify_semaphore:
+            started_at = time.time()
+            # 1. Repo existence check.
+            try:
+                repo_data = await self._gh_api(f"repos/{hint.owner}/{hint.repo}")
+            except Exception as e:  # noqa: BLE001 — network classification
+                return VerificationResult(
+                    code=code,
+                    hint=hint,
+                    status=HintStatus.UNVERIFIED,
+                    repo_exists=False,
+                    path_results=(),
+                    error=f"repo probe failed: {type(e).__name__}: {str(e)[:200]}",
+                    verified_at=started_at,
+                )
+            if repo_data is None:
+                return VerificationResult(
+                    code=code,
+                    hint=hint,
+                    status=HintStatus.REPO_MISSING,
+                    repo_exists=False,
+                    path_results=(),
+                    error=(
+                        f"repo {hint.owner}/{hint.repo} returned 404 at "
+                        f"ref {hint.base_branch}"
+                    ),
+                    verified_at=started_at,
+                )
+
+            # 2. Path checks.
+            path_results: List[PathResult] = []
+            any_missing_in_paths = False
+            any_conflict_in_new_paths = False
+            any_unknown = False
+
+            for path in hint.paths:
+                observed = await self._gh_contents(
+                    hint.owner, hint.repo, path, hint.base_branch
+                )
+                if observed == "exist":
+                    path_results.append(PathResult(
+                        path=path, expected="exist", observed="exist", ok=True,
+                    ))
+                elif observed == "absent":
+                    path_results.append(PathResult(
+                        path=path, expected="exist", observed="absent", ok=False,
+                    ))
+                    any_missing_in_paths = True
+                else:
+                    path_results.append(PathResult(
+                        path=path, expected="exist", observed="unknown", ok=False,
+                    ))
+                    any_unknown = True
+
+            for path in hint.new_paths:
+                observed = await self._gh_contents(
+                    hint.owner, hint.repo, path, hint.base_branch
+                )
+                if observed == "exist":
+                    path_results.append(PathResult(
+                        path=path, expected="absent", observed="exist", ok=False,
+                    ))
+                    any_conflict_in_new_paths = True
+                elif observed == "absent":
+                    path_results.append(PathResult(
+                        path=path, expected="absent", observed="absent", ok=True,
+                    ))
+                else:
+                    path_results.append(PathResult(
+                        path=path, expected="absent", observed="unknown", ok=False,
+                    ))
+                    any_unknown = True
+
+            # 3. Status aggregation.
+            if all(pr.ok for pr in path_results):
+                status = HintStatus.OK
+                error: Optional[str] = None
+            elif any_conflict_in_new_paths:
+                status = HintStatus.PATH_CONFLICT
+                error = "one or more new_paths already exist"
+            elif any_missing_in_paths:
+                status = HintStatus.PATH_MISSING
+                error = "one or more paths missing"
+            else:
+                status = HintStatus.UNVERIFIED
+                error = "one or more paths returned unknown status"
+
+            # Short-circuit: if truly all unknown (no missing, no conflict,
+            # but paths also aren't all ok), surface that explicitly.
+            if not any_missing_in_paths and not any_conflict_in_new_paths \
+                    and any_unknown and status != HintStatus.OK:
+                status = HintStatus.UNVERIFIED
+
+            return VerificationResult(
+                code=code,
+                hint=hint,
+                status=status,
+                repo_exists=True,
+                path_results=tuple(path_results),
+                error=error,
+                verified_at=started_at,
+            )
+
+    async def _verify_wave_hints(
+        self, wave: int
+    ) -> Dict[str, VerificationResult]:
+        """Verify every ticket in the wave. Keyed by ticket code.
+
+        Tickets with no code or whose code is not in ``_TARGET_HINTS``
+        return a ``NO_HINT`` result so the renderer can emit the
+        ``(unresolved)`` block deterministically. Fan-out is bounded by
+        ``self._verify_semaphore``; the outer gather just waits for every
+        per-ticket coroutine to settle.
+        """
+        tickets = self.graph.tickets_in_wave(wave)
+        results: Dict[str, VerificationResult] = {}
+
+        async def verify_one(ticket) -> None:
+            code = (ticket.code or "").upper()
+            if not code:
+                # Unparseable/missing code — nothing to key on. Skip so
+                # downstream rendering falls through to (unresolved).
+                return
+            hint = _TARGET_HINTS.get(code)
+            if hint is None:
+                results[code] = VerificationResult(
+                    code=code,
+                    hint=None,
+                    status=HintStatus.NO_HINT,
+                    repo_exists=False,
+                    path_results=(),
+                    error=f"no hint for code {code}",
+                    verified_at=time.time(),
+                )
+                return
+            results[code] = await self._verify_hint(code, hint)
+
+        await asyncio.gather(*[verify_one(t) for t in tickets])
+        return results
