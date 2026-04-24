@@ -38,9 +38,46 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("alfred_coo.autonomous_build.dry_run")
 
 
+#: Default child-task result used when no per-task override is scripted.
+#:
+#: The orchestrator's live `_poll_children` path (post-2026-04-23 hotfix
+#: in commit e163daf, "no-PR=FAILED") now marks any completed child with a
+#: missing PR URL as FAILED — the rationale being that a real child that
+#: silently completed without calling `propose_pr` is buggy, not successful.
+#: That hotfix broke the dry-run happy path: the original
+#: `DEFAULT_DRY_RUN_RESULT` had `pr_url: None`, which made every dry-run
+#: child get marked FAILED on the very next `_poll_children` tick.
+#:
+#: Fix: the default dry-run result now carries a fake PR URL (matches
+#: `_PR_URL_RE`), a verdict-ready summary so the review polling path sees
+#: APPROVE, and the same tokens/model so `BudgetTracker` still ticks.
+#: `apply_dry_run` additionally patches `orch._merge_pr` so the GitHub
+#: merge call is also a no-op in dry-run.
+#: Fake PR URL used by the dry-run default envelope. Must match the
+#: orchestrator's `_PR_URL_RE` (`https://github\.com/[^\s)]+/pull/\d+`).
+_DRY_RUN_FAKE_PR_URL = "https://github.com/salucallc/alfred-coo-svc/pull/9999"
+
+
+#: Default child-task result envelope used when no per-task override is
+#: scripted. The orchestrator's `_extract_pr_url` reads from `summary`,
+#: `content`, `tool_calls[].result.pr_url`, and `follow_up_tasks`, NOT
+#: from a top-level `pr_url` field, so the fake URL is embedded inside
+#: `summary`. The `APPROVE` keyword in `summary` also drives
+#: `_extract_verdict` -> APPROVE on the review path, which combined with
+#: the `_merge_pr` swap in `apply_dry_run` lets the full dispatch → PR
+#: → review → merge flow reach MERGED_GREEN.
+#:
+#: This changed in 2026-04-23's "no-PR=FAILED" hotfix (commit e163daf):
+#: before, the orchestrator treated a completed child with no PR URL as
+#: MERGED_GREEN; after, it marks FAILED. The original dry-run default
+#: (`pr_url: None`, summary with no URL) was silently broken by that
+#: hotfix, leaving the smoke test red for every PR thereafter.
 DEFAULT_DRY_RUN_RESULT: Dict[str, Any] = {
-    "summary": "DRY-RUN auto-complete",
-    "pr_url": None,
+    "summary": (
+        f"DRY-RUN auto-complete APPROVE — opened PR at "
+        f"{_DRY_RUN_FAKE_PR_URL} and ready to merge."
+    ),
+    "pr_url": _DRY_RUN_FAKE_PR_URL,
     "tokens": {"in": 100, "out": 50},
     "model": "qwen3-coder:480b-cloud",
 }
@@ -373,6 +410,29 @@ def apply_dry_run(orch: Any, adapter: Optional[DryRunAdapter] = None) -> DryRunA
         )
 
     orch._update_linear_state = _dry_update_linear_state  # type: ignore[assignment]
+
+    # 5. _merge_pr swap. The dry-run default child result now carries a
+    # fake PR URL so _poll_children doesn't mark the ticket FAILED, but
+    # the review verdict path calls _merge_pr -> github_merge_pr tool
+    # which hits real GitHub. Swap it for a no-op that returns True +
+    # seeds state.merged_pr_urls with a fake SHA so restart-idempotency
+    # bookkeeping is exercised in dry-run too.
+    async def _dry_merge_pr(ticket: Any) -> bool:
+        fake_sha = f"dryrun-sha-{adapter._counter}"
+        try:
+            ticket_id = getattr(ticket, "id", "") or ""
+            state = getattr(orch, "state", None)
+            if state is not None and ticket_id:
+                state.merged_pr_urls[ticket_id] = fake_sha
+        except Exception:
+            logger.exception("dry-run _merge_pr bookkeeping failed")
+        logger.info(
+            "[DRY-RUN github] merge_pr id=%s sha=%s",
+            getattr(ticket, "identifier", "?"), fake_sha,
+        )
+        return True
+
+    orch._merge_pr = _dry_merge_pr  # type: ignore[assignment]
 
     # Stash on the orchestrator so tests / operators can reach the
     # adapter off the instance.

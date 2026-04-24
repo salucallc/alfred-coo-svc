@@ -223,30 +223,44 @@ async def test_smoke_3_ticket_end_to_end_happy_path(capsys):
         )
 
     # -- 3 ticket children dispatched + kickoff completion ---------------
-    # adapter._tasks includes the 3 child dispatches. The kickoff mesh
-    # task is a DIFFERENT id (kick-smoke), completed via mesh.complete;
-    # it lands in adapter.completions.
+    # adapter._tasks includes the 3 child dispatches PLUS the hawkman-qa-a
+    # review tasks that the orchestrator auto-fires when each child opens
+    # a PR (added in AB-08). Filter to the alfred-coo-a (builder) persona
+    # for the wave-ordering assertions; count reviews separately for the
+    # sanity checks below.
+    # The kickoff mesh task is a DIFFERENT id (kick-smoke), completed via
+    # mesh.complete; it lands in adapter.completions.
     child_titles = [e["record"]["title"] for e in adapter._tasks.values()]
-    assert len(child_titles) >= 3, child_titles
+    builder_titles = [t for t in child_titles if "[persona:alfred-coo-a]" in t]
+    review_titles = [t for t in child_titles if "[persona:hawkman-qa-a]" in t]
+    assert len(builder_titles) >= 3, builder_titles
+    # One review fires per PR opened, so we expect ≥3 review tasks too in
+    # the happy-path dry-run (APPROVE on first review).
+    assert len(review_titles) >= 3, review_titles
 
     # -- wave ordering ---------------------------------------------------
-    # First two dispatches are wave-0; the wave-1 ticket only dispatches
-    # after SAL-501 reaches merged_green.
-    titles_in_order = sorted(
+    # First two builder dispatches are wave-0; the wave-1 ticket only
+    # dispatches after SAL-501 reaches merged_green.
+    tasks_in_order = sorted(
         adapter._tasks.items(),
         key=lambda kv: kv[1]["created_at"],
     )
-    titles_in_order = [e[1]["record"]["title"] for e in titles_in_order]
-    wave_0_titles = [t for t in titles_in_order if "wave-0" in t]
-    wave_1_titles = [t for t in titles_in_order if "wave-1" in t]
-    assert len(wave_0_titles) == 2, titles_in_order
-    assert len(wave_1_titles) == 1, titles_in_order
+    titles_in_order = [e[1]["record"]["title"] for e in tasks_in_order]
+    builder_titles_in_order = [
+        t for t in titles_in_order if "[persona:alfred-coo-a]" in t
+    ]
+    wave_0_titles = [t for t in builder_titles_in_order if "[wave-0]" in t]
+    wave_1_titles = [t for t in builder_titles_in_order if "[wave-1]" in t]
+    assert len(wave_0_titles) == 2, builder_titles_in_order
+    assert len(wave_1_titles) == 1, builder_titles_in_order
 
     # The wave-1 dispatch must appear AFTER both wave-0 dispatches.
-    wave_1_index = titles_in_order.index(wave_1_titles[0])
-    wave_0_max_index = max(titles_in_order.index(t) for t in wave_0_titles)
+    wave_1_index = builder_titles_in_order.index(wave_1_titles[0])
+    wave_0_max_index = max(
+        builder_titles_in_order.index(t) for t in wave_0_titles
+    )
     assert wave_1_index > wave_0_max_index, (
-        f"wave-1 dispatched before wave-0 finished: {titles_in_order}"
+        f"wave-1 dispatched before wave-0 finished: {builder_titles_in_order}"
     )
 
     # -- all 3 tickets merged_green -------------------------------------
