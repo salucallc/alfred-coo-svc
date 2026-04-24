@@ -133,7 +133,7 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "WITHOUT calling propose_pr leaves the task with no PR, which "
             "the orchestrator marks FAILED."
         ),
-        preferred_model="kimi-k2-thinking:cloud",
+        preferred_model="gpt-oss:120b-cloud",
         fallback_model="deepseek-v3.2:cloud",
         topics=[
             "coo-daemon",
