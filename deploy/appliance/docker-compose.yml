@@ -68,7 +68,7 @@ services:
     volumes:
       - soul_data:/var/lib/soul-svc
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8080/v1/healthz\", timeout=3).status == 200 else 1)"]
+      test: ["CMD", "python", "-E", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/v1/healthz', timeout=3).status == 200 else 1)"]
       interval: 15s
       timeout: 3s
       retries: 5
@@ -91,7 +91,7 @@ services:
     networks:
       - appliance
 
-  # ── MCP Services (curated: github, slack, linear, notion) ─────────────────
+  # —— MCP Services (curated: github, slack, linear, notion) —————————————
   mcp-github:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
     restart: unless-stopped
@@ -172,7 +172,13 @@ volumes:
   soul_data:
   postgres_data:
   open_webui_data:
+  grafana_data:
+  prometheus_data:
+  loki_data:
+  restic_repo:
 
 networks:
   appliance:
+    driver: bridge
+  mc-ops:
     driver: bridge
