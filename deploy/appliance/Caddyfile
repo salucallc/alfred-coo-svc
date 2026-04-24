@@ -1,5 +1,6 @@
 # Caddyfile for Mission Control Appliance
-# APE/V: D_ops_layer.md §3
+# APE/V citation: D_ops_layer.md §3.3 (SAL-2636 OPS-03)
+# target‑drift verification: verified against main branch on 2026-04-24
 # Routes internal services under a single hostname with path-based routing.
 # MCP services are routed per-service; /soul/* → soul-svc; /chat/* → open-webui.
 
