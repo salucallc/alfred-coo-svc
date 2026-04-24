@@ -26,7 +26,8 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .budget import BudgetTracker, make_tracker
 from .cadence import SlackCadence
@@ -83,6 +84,245 @@ _VERDICT_REQUEST_CHANGES_RE = re.compile(r"\bREQUEST_CHANGES\b")
 _NO_REVIEW_BODY_NOTE = (
     "(no review body captured; see the review task record in soul memory)"
 )
+
+
+# AB-13 · Target grounding ---------------------------------------------------
+#
+# `_child_task_body` used to tell the sub "open ONE PR to the target Saluca
+# repo" without pinning owner/repo/paths. Children guessed, producing
+# phantom root `docker-compose.yml` files (PR #32, SAL-2634, 2026-04-24).
+#
+# This table pre-resolves `{owner, repo, paths}` for every wave-0 / wave-1
+# ticket in the v1-GA plan docs. The orchestrator renders a ``## Target``
+# block into the child body so the sub has an exact file list to touch,
+# and — per Plan H §2 G-2 + Plan H §5 R-d (child-side escalation) — an
+# unmapped code emits an `(unresolved)` block telling the child to STOP
+# and open a grounding-gap Linear issue instead of guessing.
+
+
+@dataclass(frozen=True)
+class TargetHint:
+    """Pre-resolved repo + paths for a v1-GA plan-doc ticket code.
+
+    Consumed by ``AutonomousBuildOrchestrator._child_task_body`` to emit a
+    ``## Target`` block in the dispatched child task body. Fields map
+    one-to-one to the block's keys so rendering is trivial.
+    """
+
+    owner: str
+    repo: str
+    paths: Tuple[str, ...]
+    base_branch: str = "main"
+    branch_hint: Optional[str] = None
+    notes: Optional[str] = None
+
+
+#: Keyed by plan-doc ticket code (e.g. ``OPS-01``, ``F08``, ``TIR-01``,
+#: ``S-01``). Codes MUST be uppercase with the canonical separator used
+#: in the plan doc (``OPS-01`` with dash, ``F08`` with no separator —
+#: matching the titles the mesh will actually see).
+#:
+#: Source of truth: ``Z:/_planning/v1-ga/{A,C,D,E}_*.md`` on minipc, or
+#: ``https://raw.githubusercontent.com/salucallc/alfred-coo-svc/main/
+#: plans/v1-ga/*.md`` (added by the children fetch).
+_TARGET_HINTS: Mapping[str, TargetHint] = {
+    # ── Epic D · OPS layer (salucallc/alfred-coo-svc, deploy/appliance) ─
+    "OPS-01": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yaml",),
+        branch_hint="feature/sal-2634-mc-ops-network",
+        notes="add mc-ops network + 4 volumes (grafana, prometheus, loki, restic)",
+    ),
+    "OPS-02": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/docker-compose.yaml",
+            "deploy/appliance/IMAGE_PINS.md",
+        ),
+        branch_hint="feature/ops-02-pin-images",
+        notes="pin all image versions; grep ':latest' must return 0 matches",
+    ),
+    "OPS-03": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/caddy/Caddyfile",
+            "deploy/appliance/docker-compose.yaml",
+        ),
+        branch_hint="feature/ops-03-caddy-routes",
+        notes="Caddy routes /ops /auth /vault → grafana/authelia/infisical",
+    ),
+    # ── Epic C/F · Fleet mode endpoint (multi-repo) ─────────────────────
+    "F01": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("db/migrations/0007_fleet_endpoints.sql",),
+        branch_hint="feature/f01-fleet-migration",
+        notes="soul-svc migration 0007 for fleet tables (4 tables)",
+    ),
+    "F02": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "routers/fleet.py",
+            "tests/test_fleet_register.py",
+        ),
+        branch_hint="feature/f02-fleet-register",
+        notes="/v1/fleet/register endpoint; valid token -> 201",
+    ),
+    "F03": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/mcctl/commands/token.py",
+            "tests/test_mcctl_token.py",
+        ),
+        branch_hint="feature/f03-mcctl-token-create",
+        notes="mcctl token create CLI (one-shot bootstrap tokens)",
+    ),
+    "F07": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/persona_loader.py",
+            "src/alfred_coo/main.py",
+        ),
+        branch_hint="feature/f07-coo-mode",
+        notes="COO_MODE env var (hub|endpoint) + persona_loader.py",
+    ),
+    "F08": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "soul_lite/__init__.py",
+            "soul_lite/service.py",
+            "soul_lite/Dockerfile",
+            "tests/test_soul_lite.py",
+        ),
+        branch_hint="feature/f08-soul-lite",
+        notes="new soul-lite service: sqlite + /v1/memory/* API for endpoints",
+    ),
+    # ── Epic E · soul-svc gap closure (salucallc/soul-svc prod variant) ─
+    "S-01": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "routers/memory.py",
+            "tests/test_bulk_import_topics_queryable.py",
+        ),
+        branch_hint="feature/s01-index-topics-on-import",
+        notes="fix: /v1/memory/import must index TKHR topics",
+    ),
+    "S-02": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "routers/memory.py",
+            "tests/test_memory_dup_409.py",
+        ),
+        branch_hint="feature/s02-dup-409",
+        notes="fix: duplicate content_hash returns 409 not 500",
+    ),
+    "S-04": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "routers/metrics.py",
+            "main.py",
+            "tests/test_metrics_endpoint.py",
+        ),
+        branch_hint="feature/s04-metrics",
+        notes="new /metrics endpoint with prometheus counters + histograms",
+    ),
+    "S-09": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "db/pool.py",
+            "db/repository.py",
+            "routers/memory.py",
+            "tests/test_asyncpg_pool_init.py",
+        ),
+        branch_hint="feature/s09-asyncpg-repository",
+        notes="introduce asyncpg repository layer; swap Supabase SDK in routers/memory.py",
+    ),
+    # ── Epic A · Tiresias in appliance ──────────────────────────────────
+    "TIR-01": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(
+            "README.md",
+            "pyproject.toml",
+            "src/tiresias_sovereign/__init__.py",
+            ".github/workflows/ci.yml",
+        ),
+        branch_hint="feature/tir-01-scaffold",
+        notes="scaffold new salucallc/tiresias-sovereign repo + CI",
+    ),
+    "TIR-02": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(
+            "src/tiresias_sovereign/principles/registry.json",
+            "src/tiresias_sovereign/principles/loader.py",
+            "tests/test_principle_registry.py",
+        ),
+        branch_hint="feature/tir-02-principle-registry",
+        notes="embed principle_registry.json + hash-chain loader",
+    ),
+    "TIR-07": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(
+            "db/migrations/0001_tiresias_audit.sql",
+            "tests/test_audit_schema.py",
+        ),
+        branch_hint="feature/tir-07-audit-migration",
+        notes="DB migrations for tiresias_audit schema",
+    ),
+    "TIR-08": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(
+            "src/tiresias_sovereign/mcp_llm/router.py",
+            "tests/test_mcp_llm_cascade.py",
+        ),
+        branch_hint="feature/tir-08-mcp-llm-cascade",
+        notes="mcp-llm cascade router (principle-aware routing)",
+    ),
+}
+
+
+def _render_target_block(code: str) -> str:
+    """Render a ``## Target`` markdown block for the given plan-doc code.
+
+    If ``code`` is not in ``_TARGET_HINTS`` (or is empty), returns an
+    ``(unresolved)`` block so the child knows to escalate at Step 0 of its
+    persona grounding protocol (Plan H §2 G-1) rather than guessing.
+    """
+    hint = _TARGET_HINTS.get((code or "").upper())
+    if hint is None:
+        return (
+            "## Target\n"
+            "(unresolved — consult plan doc; STOP and escalate via "
+            "linear_create_issue per Step 0 of your persona protocol)\n"
+        )
+    paths_block = "\n".join(f"  - {p}" for p in hint.paths)
+    lines = [
+        "## Target",
+        f"owner: {hint.owner}",
+        f"repo:  {hint.repo}",
+        "paths:",
+        paths_block,
+        f"base_branch: {hint.base_branch}",
+    ]
+    if hint.branch_hint:
+        lines.append(f"branch_hint: {hint.branch_hint}")
+    if hint.notes:
+        lines.append(f"notes: {hint.notes}")
+    return "\n".join(lines) + "\n"
 
 
 class AutonomousBuildOrchestrator:
@@ -603,6 +843,13 @@ class AutonomousBuildOrchestrator:
         """Build the APE/V acceptance block for the child. For AB-04 we
         embed a template + ticket facts; a future enhancement (AB-07 or
         later) can load the matching plan-doc section via http_get.
+
+        AB-13 (Plan H §2 G-2): emits a ``## Target`` block pre-resolving
+        ``{owner, repo, paths}`` from the static ``_TARGET_HINTS`` table,
+        so the child no longer has to guess its target repo and path
+        from the plan doc alone. Unmapped codes produce an
+        ``(unresolved)`` block that tells the child to STOP and open a
+        grounding-gap Linear issue per its Step 0 protocol.
         """
         plan_doc = self._plan_doc_for_epic(ticket.epic)
         size_line = f"Size: {ticket.size}" if ticket.size else "Size: unspecified"
@@ -621,6 +868,11 @@ class AutonomousBuildOrchestrator:
                 "Plan-doc code: (unparseable — escalate per Step 0 of your "
                 "persona protocol)\n"
             )
+        # AB-13 (SAL-2698, Plan H §2 G-2): resolve target owner/repo/paths
+        # up front via _TARGET_HINTS so the child knows which repo + which
+        # files to edit. Unmapped codes emit an (unresolved) block telling
+        # the child to open a grounding-gap Linear issue.
+        target_block = _render_target_block(ticket.code)
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -630,6 +882,8 @@ class AutonomousBuildOrchestrator:
             f"Estimate: {ticket.estimate}\n"
             f"Parent autonomous_build kickoff: {self.task_id}\n"
             f"{plan_doc_code_line}"
+            f"\n"
+            f"{target_block}"
             f"\n"
             f"## Acceptance (APE/V)\n"
             f"- [ ] Implementation matches the plan section for this ticket.\n"
@@ -648,7 +902,10 @@ class AutonomousBuildOrchestrator:
             f"## Deliverable\n"
             f"Open ONE PR to the target Saluca repo on a feature branch named "
             f"`feature/{ticket.identifier.lower()}-<short-slug>`. Respect the "
-            f"APE/V block above. Keep the diff scoped to this ticket.\n"
+            f"APE/V block above. Keep the diff scoped to this ticket. The "
+            f"`## Target` block above pins the repo + paths — do NOT edit "
+            f"files outside those paths without opening a grounding-gap "
+            f"Linear issue first.\n"
         )
 
     #: Base URL where v1-GA plan docs live in the alfred-coo-svc repo.
