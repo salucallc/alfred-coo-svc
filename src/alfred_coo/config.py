@@ -25,6 +25,19 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openrouter_api_key: str = ""
     ollama_url: str = "http://172.17.0.1:8185/v1"
+    # AB-21: all LLM traffic funnels through alfred-chat-stack gateway so the
+    # concurrent trace middleware can capture it. `gateway_url` is the base
+    # (no `/v1`); `_call_gateway` always hits `{gateway_url}/v1/chat/completions`.
+    # If empty, dispatch falls back to deriving a base from `ollama_url`
+    # (strip trailing `/v1`) so existing Oracle envs keep working unchanged.
+    gateway_url: str = "http://172.17.0.1:8185"
+    # Soul-key stamped in Authorization header for every gateway call. Shared
+    # secret the gateway's allow-all policy will accept and the AB-21-gw trace
+    # middleware will log. Empty = warn-and-continue (gateway still serves).
+    autobuild_soulkey: str = ""
+    # Tenant header value; fixed for the COO daemon. Overrideable for staging
+    # but the production value must match the AB-21-gw pre-specified contract.
+    tiresias_tenant: str = "alfred-coo-mc"
     mesh_poll_interval_seconds: int = 30
     health_port: int = 8090
     log_level: str = "INFO"
