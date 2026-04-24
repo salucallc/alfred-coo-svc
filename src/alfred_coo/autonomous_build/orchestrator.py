@@ -682,6 +682,18 @@ class AutonomousBuildOrchestrator:
         self._verified_hints: Dict[str, "VerificationResult"] = {}
         self._verify_semaphore: asyncio.Semaphore = asyncio.Semaphore(8)
 
+        # AB-17-d · Plan I §1.4 + §2.3 — orchestrator-side BLOCKED handling
+        # for REPO_MISSING hints. `_repo_missing_tickets` holds Ticket.id
+        # (UUID) values for tickets the wave gate must exclude from pass/fail
+        # bookkeeping (they were never dispatched). `_emitted_blocks` dedupes
+        # grounding-gap Linear emissions within a single orchestrator process
+        # so a ticket that lingers across multiple wave re-entries doesn't
+        # spam duplicate issues. Both reset on restart — re-emission on the
+        # next process is acceptable per Plan I §5.1 R-d (idempotent enough
+        # for MVP).
+        self._repo_missing_tickets: set[str] = set()
+        self._emitted_blocks: set[str] = set()
+
     # ── public entry point ─────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -966,6 +978,20 @@ class AutonomousBuildOrchestrator:
         if not wave_tickets:
             logger.info("wave %d has no tickets; skipping", wave_n)
             return
+
+        # AB-17-d · Plan I §1.4 + §2.3 — skip dispatch for tickets whose
+        # hint verification returned REPO_MISSING. The repo does not exist
+        # on GitHub (verified at wave start by `_verify_wave_hints`), so
+        # any child we spawned would open a PR against a non-existent
+        # base, fail `gh pr create`, and loop into zombie-guard retries.
+        # Instead: emit a grounding-gap Linear issue (idempotent per
+        # process via `_emitted_blocks`) and mark the ticket FAILED
+        # internally so the wave loop can terminate. Linear state is NOT
+        # mutated — the parent ticket stays Backlog (per Plan I §5.1 R-d,
+        # MVP keeps BLOCKED implicit; no new Linear state or label). The
+        # wave gate (`_wait_for_wave_gate`) excludes these from the
+        # soft-green numerator/denominator via `_repo_missing_tickets`.
+        await self._mark_repo_missing_tickets(wave_tickets)
 
         while True:
             # ── select ready ────────────────────────────────────────────
@@ -1959,10 +1985,21 @@ class AutonomousBuildOrchestrator:
             # directly between ticks.
 
         # Wave is terminal. Classify.
-        failed = [t for t in wave_tickets if t.status == TicketStatus.FAILED]
+        # AB-17-d · Plan I §1.4 — tickets that were skipped due to
+        # REPO_MISSING are marked FAILED internally so the wave loop
+        # terminates, but they represent a grounding gap (missing repo),
+        # not an execution failure. Exclude them from both the `failed`
+        # list (so they don't trip critical-path halt or soft-green
+        # denominator) and the ratio denominator (so a wave that is 5/5
+        # green + 1 repo-missing still reports 100% green).
+        effective = [
+            t for t in wave_tickets
+            if t.id not in self._repo_missing_tickets
+        ]
+        failed = [t for t in effective if t.status == TicketStatus.FAILED]
         cp_failed = [t for t in failed if t.is_critical_path]
-        green = [t for t in wave_tickets if t.status == TicketStatus.MERGED_GREEN]
-        green_ratio = len(green) / max(1, len(wave_tickets))
+        green = [t for t in effective if t.status == TicketStatus.MERGED_GREEN]
+        green_ratio = len(green) / max(1, len(effective))
 
         if cp_failed:
             msg = (
@@ -1977,7 +2014,7 @@ class AutonomousBuildOrchestrator:
         if failed and green_ratio >= SOFT_GREEN_THRESHOLD:
             logger.warning(
                 "wave %d soft-green: %d/%d merged, non-critical failures: %s",
-                wave_n, len(green), len(wave_tickets),
+                wave_n, len(green), len(effective),
                 [t.identifier for t in failed],
             )
             self.state.record_event(
@@ -2651,3 +2688,148 @@ class AutonomousBuildOrchestrator:
 
         await asyncio.gather(*[verify_one(t) for t in tickets])
         return results
+
+    # ── AB-17-d · BLOCKED on REPO_MISSING ────────────────────────────────────
+
+    async def _mark_repo_missing_tickets(
+        self, wave_tickets: List[Ticket]
+    ) -> None:
+        """Filter `wave_tickets` against `self._verified_hints` and handle
+        any whose `VerificationResult.status == REPO_MISSING` per Plan I
+        §1.4 + §2.3:
+
+        1. Emit a grounding-gap Linear issue (idempotent via
+           ``self._emitted_blocks``).
+        2. Mark the ticket ``FAILED`` internally (so the wave loop can
+           reach a terminal state) without mutating Linear state — the
+           parent ticket stays ``Backlog`` per Plan I §5.1 R-d / §7.
+        3. Record the ticket UUID in ``self._repo_missing_tickets`` so
+           ``_wait_for_wave_gate`` excludes it from the soft-green
+           numerator/denominator (these tickets were never dispatched
+           and must not count toward pass/fail).
+
+        No-op when `_verified_hints` is empty (e.g. verification crashed
+        upstream and was caught in `_run_inner`) — we dispatch as today
+        in that degraded mode, because "skip everything" is worse than
+        "let the child's Step-0 protocol catch the bad hint".
+        """
+        if not self._verified_hints:
+            return
+        for ticket in wave_tickets:
+            code = (ticket.code or "").upper()
+            vr = self._verified_hints.get(code)
+            if vr is None or vr.status != HintStatus.REPO_MISSING:
+                continue
+            # Best-effort grounding-gap issue. Failure is logged but
+            # non-fatal — re-emission on the next wave boundary is
+            # acceptable per Plan I §5.1 R-d (idempotent enough for MVP).
+            await self._emit_grounding_gap_repo_missing(ticket, vr)
+            # Mark internally so the wave loop terminates. Do NOT call
+            # `_update_linear_state` — ticket stays Backlog per §5.1 R-d.
+            ticket.status = TicketStatus.FAILED
+            self._repo_missing_tickets.add(ticket.id)
+            self.state.record_event(
+                "ticket_blocked_repo_missing",
+                identifier=ticket.identifier,
+                code=code,
+                repo=f"{vr.hint.owner}/{vr.hint.repo}" if vr.hint else "unknown",
+            )
+
+    async def _emit_grounding_gap_repo_missing(
+        self, ticket: Ticket, vr: VerificationResult
+    ) -> None:
+        """Emit a `[grounding-gap]` Linear issue for a ticket whose hint
+        verification returned REPO_MISSING. Dedupes within the current
+        orchestrator process via ``self._emitted_blocks``. Also emits a
+        structured WARN log line so the mesh operator can spot the block
+        without opening Linear. Failures (network, API, missing key) are
+        logged at ERROR but never raised — the wave loop continues and
+        the next wave boundary will re-verify + re-emit.
+        """
+        hint = vr.hint
+        owner = hint.owner if hint else "unknown"
+        repo = hint.repo if hint else "unknown"
+        base_branch = hint.base_branch if hint else "main"
+        repo_slug = f"{owner}/{repo}"
+
+        # Structured WARN — mirrors the JSON-ish key=value shape used by
+        # other orchestrator logs (e.g. `_dispatch_child`'s "dispatching
+        # %s %s (wave %d, ...)" line).
+        logger.warning(
+            "blocked ticket=%s reason=repo_missing repo=%s code=%s",
+            ticket.identifier, repo_slug, ticket.code or "(unparseable)",
+        )
+
+        # Optional dedupe: don't re-emit if we already reported this
+        # ticket during the current orchestrator process. Reset happens
+        # on restart — acceptable per Plan I §5.1 R-d.
+        if ticket.identifier in self._emitted_blocks:
+            logger.debug(
+                "grounding-gap already emitted for %s; skipping duplicate",
+                ticket.identifier,
+            )
+            return
+
+        try:
+            from alfred_coo.tools import BUILTIN_TOOLS
+        except Exception:
+            logger.exception(
+                "alfred_coo.tools not importable; cannot emit grounding-gap "
+                "for %s", ticket.identifier,
+            )
+            return
+        spec = BUILTIN_TOOLS.get("linear_create_issue")
+        if spec is None:
+            logger.error(
+                "linear_create_issue not in BUILTIN_TOOLS; cannot emit "
+                "grounding-gap for %s", ticket.identifier,
+            )
+            return
+
+        title = (
+            f"[grounding-gap] BLOCKED · {ticket.identifier} · repo missing"
+        )
+        body = (
+            "## BLOCKED by orchestrator (AB-17-d)\n"
+            "\n"
+            f"Ticket **{ticket.identifier}** could not be dispatched because its\n"
+            f"`_TARGET_HINTS` entry points at repo `{repo_slug}` which does\n"
+            "not exist (GitHub 404 on repo existence probe at wave start).\n"
+            "\n"
+            f"- Plan-doc code: `{ticket.code or '(unparseable)'}`\n"
+            f"- Base branch hinted: `{base_branch}`\n"
+            f"- Verifier diagnostic: `{vr.error or '(none)'}`\n"
+            f"- Verified at: `{vr.verified_at}` (epoch seconds)\n"
+            f"- Parent ticket: https://linear.app/saluca/issue/{ticket.identifier}\n"
+            "\n"
+            "**Resolution paths** (for the human / next session):\n"
+            "1. Repo typo in `_TARGET_HINTS` → fix the hint and restart orchestrator\n"
+            "2. Repo legitimately missing → create repo (e.g. via `gh repo create`), then restart\n"
+            "3. Plan-doc targets wrong repo → fix plan doc + hint + restart\n"
+            "\n"
+            "The parent ticket stays Backlog and will be re-verified on the next wave kickoff.\n"
+        )
+
+        try:
+            # `labels` arg is accepted by the handler signature but the
+            # current GraphQL mutation does not yet forward it; passing
+            # here is forward-compat for when it does.
+            resp = await spec.handler(
+                title=title,
+                description=body,
+                priority=2,
+                labels=["grounding-gap"],
+            )
+            if isinstance(resp, dict) and resp.get("error"):
+                logger.error(
+                    "linear_create_issue returned error for grounding-gap "
+                    "%s: %s", ticket.identifier, resp["error"],
+                )
+                return
+            self._emitted_blocks.add(ticket.identifier)
+        except Exception:
+            logger.exception(
+                "linear_create_issue raised while emitting grounding-gap "
+                "for %s; wave continues, will re-emit on next wave boundary",
+                ticket.identifier,
+            )
