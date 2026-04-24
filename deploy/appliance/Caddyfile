@@ -1,5 +1,5 @@
+# APE/V citation: SAL-OPS-03 (Ops Layer) – adds Caddy routes /ops, /auth, /vault per D_ops_layer plan (https://raw.githubusercontent.com/salucallc/alfred-coo-svc/main/plans/v1-ga/D_ops_layer.md)
 # Caddyfile for Mission Control Appliance
-# APE/V: SAL-2636 - OPS-03 Caddy routes implementation
 # Routes internal services under a single hostname with path-based routing.
 # MCP services are routed per-service; /soul/* → soul-svc; /chat/* → open-webui.
 
