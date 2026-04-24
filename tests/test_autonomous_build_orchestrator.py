@@ -25,7 +25,10 @@ from alfred_coo.autonomous_build.graph import (
 )
 from alfred_coo.autonomous_build.orchestrator import (
     AutonomousBuildOrchestrator,
+    HintStatus,
+    PathResult,
     TargetHint,
+    VerificationResult,
     _TARGET_HINTS,
     _render_target_block,
 )
@@ -617,9 +620,10 @@ def test_target_hint_dataclass_roundtrip():
 def test_child_task_body_renders_target_block_for_ops_01():
     """Plan H §2 G-2 regression: OPS-01's child body must contain a
     ``## Target`` block pinning `salucallc/alfred-coo-svc` at
-    `deploy/appliance/docker-compose.yaml` — the live run on 2026-04-24
-    produced a phantom root `docker-compose.yml` because this was not
-    pinned (PR #32, SAL-2634)."""
+    `deploy/appliance/docker-compose.yml` (AB-17-a: typo-fix from the
+    original `.yaml` that did not match the real file on main). The
+    original live run on 2026-04-24 produced a phantom root
+    `docker-compose.yml` because this was not pinned (PR #32, SAL-2634)."""
     orch = _mk_orchestrator()
     ticket = _t("u-ops-01", "SAL-2634", "OPS-01", 0, "ops", size="S")
     body = orch._child_task_body(ticket)
@@ -627,7 +631,7 @@ def test_child_task_body_renders_target_block_for_ops_01():
     assert "## Target" in body
     assert "owner: salucallc" in body
     assert "repo:  alfred-coo-svc" in body
-    assert "deploy/appliance/docker-compose.yaml" in body
+    assert "deploy/appliance/docker-compose.yml" in body
     assert "base_branch: main" in body
     assert "branch_hint: feature/sal-2634-mc-ops-network" in body
     assert "notes: add mc-ops network + 4 volumes" in body
@@ -684,25 +688,42 @@ def test_target_hints_populated_for_wave_0_epics():
         f"_TARGET_HINTS missing wave-0/1 codes: {missing}. "
         f"Plan H §2 G-2 requires every wave-0 ticket to be resolvable."
     )
-    # Every hint must name a Saluca-org repo with at least one path.
+    # Every hint must name a Saluca-org repo and satisfy the AB-17-a
+    # invariant (at least one of paths / new_paths non-empty).
     for code, hint in _TARGET_HINTS.items():
         assert hint.owner == "salucallc", f"{code}: non-saluca owner"
         assert hint.repo, f"{code}: empty repo"
-        assert hint.paths, f"{code}: empty paths tuple"
-        assert all(p and not p.startswith("/") for p in hint.paths), (
-            f"{code}: absolute/empty path in {hint.paths}"
+        assert hint.paths or hint.new_paths, (
+            f"{code}: both paths and new_paths are empty"
+        )
+        all_paths = tuple(hint.paths) + tuple(hint.new_paths)
+        assert all(p and not p.startswith("/") for p in all_paths), (
+            f"{code}: absolute/empty path in {all_paths}"
         )
 
 
 def test_render_target_block_f08_soul_lite():
     """F08 must pin `salucallc/soul-svc` — it's the new `soul-lite`
     service and the previous child guessed `alfred-coo-svc` (SAL-2616 /
-    PR #31 regression, 2026-04-24)."""
+    PR #31 regression, 2026-04-24).
+
+    AB-17-a: F08 is pure-creation, so `soul_lite/*` paths now live in
+    `new_paths` on the hint. AB-17-c will extend `_render_target_block`
+    to emit a `new_paths:` section; until then the renderer only shows
+    `paths:` + notes. We still validate repo + notes pinning here (the
+    `soul_lite/` marker survives via `notes:`). A full `new_paths:`
+    render assertion lands with AB-17-c."""
     block = _render_target_block("F08")
     assert "owner: salucallc" in block
     assert "repo:  soul-svc" in block
-    assert "soul_lite/" in block
+    # Notes still mention the soul-lite subpackage path so the child
+    # can orient even before the renderer grows a new_paths section.
+    assert "soul-lite" in block
     assert "(unresolved" not in block
+    # And the hint data itself carries the four soul_lite paths in
+    # the AB-17-a-canonical new_paths axis.
+    assert "soul_lite/service.py" in _TARGET_HINTS["F08"].new_paths
+    assert _TARGET_HINTS["F08"].paths == ()
 
 
 def test_render_target_block_case_insensitive():
@@ -712,4 +733,195 @@ def test_render_target_block_case_insensitive():
     upper = _render_target_block("OPS-01")
     lower = _render_target_block("ops-01")
     assert upper == lower
-    assert "deploy/appliance/docker-compose.yaml" in lower
+    assert "deploy/appliance/docker-compose.yml" in lower
+
+
+# ── AB-17-a · schema extension + corrected _TARGET_HINTS ───────────────────
+#
+# Plan I §2.1–2.2 (`Z:/_planning/v1-ga/I_target_verification.md`). Data diff
+# from `Z:/_planning/v1-ga/hints_audit_2026-04-24.md` §4. AB-17-b adds
+# `_verify_hint` / `_verify_wave_hints`; AB-17-c extends `_render_target_block`
+# to consume a `VerificationResult`. This ticket is schema + data only.
+
+
+def test_target_hint_post_init_rejects_empty_paths_and_new_paths():
+    """AB-17-a (Plan I §2.1): the invariant `len(paths) + len(new_paths) >= 1`
+    must be enforced at dataclass construction so empty hints crash at
+    module-import time rather than silently rendering a borked `## Target`
+    block."""
+    with pytest.raises(ValueError, match="at least one of paths or new_paths"):
+        TargetHint(
+            owner="salucallc",
+            repo="alfred-coo-svc",
+            paths=(),
+            new_paths=(),
+        )
+
+
+def test_target_hint_accepts_new_paths_only():
+    """AB-17-a: a pure-creation ticket (e.g. OPS-02's IMAGE_PINS.md) must
+    be able to omit `paths` entirely and still construct successfully."""
+    h = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+    )
+    assert h.paths == ()
+    assert h.new_paths == ("deploy/appliance/IMAGE_PINS.md",)
+    assert h.base_branch == "main"
+    # Frozen — still hashable so orchestrator state dicts work.
+    {h}
+
+
+def test_target_hint_accepts_both_paths_and_new_paths():
+    """AB-17-a: mixed-mode ticket (e.g. F07 modifies main.py + creates
+    persona_loader.py) must support both fields simultaneously."""
+    h = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/main.py",),
+        new_paths=("src/alfred_coo/persona_loader.py",),
+    )
+    assert h.paths == ("src/alfred_coo/main.py",)
+    assert h.new_paths == ("src/alfred_coo/persona_loader.py",)
+
+
+def test_target_hints_ops_01_uses_yml_extension():
+    """AB-17-a data fix (audit §4, C1 class): OPS-01's compose path is
+    `docker-compose.yml` not `.yaml` — the real file on main uses `.yml`.
+    The original table typo caused SAL-2634 child to fabricate a phantom
+    root `docker-compose.yml` on 2026-04-24."""
+    assert _TARGET_HINTS["OPS-01"].paths == (
+        "deploy/appliance/docker-compose.yml",
+    )
+    # new_paths stays empty: OPS-01 is modify-only.
+    assert _TARGET_HINTS["OPS-01"].new_paths == ()
+
+
+def test_target_hints_ops_02_image_pins_in_new_paths():
+    """AB-17-a data fix (audit §4, C4 class): OPS-02's `IMAGE_PINS.md` is
+    a brand-new file created by this ticket per plan D §5 W1 #2. It must
+    live in `new_paths` so AB-17-b's verifier asserts 404, not 200."""
+    hint = _TARGET_HINTS["OPS-02"]
+    assert "deploy/appliance/IMAGE_PINS.md" in hint.new_paths
+    # And the compose file (which the ticket MODIFIES) must be in paths.
+    assert "deploy/appliance/docker-compose.yml" in hint.paths
+    # Must not appear under the wrong axis.
+    assert "deploy/appliance/IMAGE_PINS.md" not in hint.paths
+
+
+def test_target_hints_f01_flat_migrations_020():
+    """AB-17-a data fix (audit §4, C3 class): soul-svc has a FLAT
+    migrations/ dir (no db/ prefix) and the next free number on main is
+    020 (005..019 exist). The original `db/migrations/0007_*.sql` hint
+    was wrong on two axes simultaneously."""
+    assert _TARGET_HINTS["F01"].paths == ()
+    assert _TARGET_HINTS["F01"].new_paths == (
+        "migrations/020_fleet_endpoints.sql",
+    )
+
+
+def test_target_hints_s04_uses_serve_py():
+    """AB-17-a data fix (audit §4, S-04 weak-evidence fix): soul-svc's
+    FastAPI entry point is `serve.py` not `main.py`. The original table
+    named `main.py` which does not exist on main; a real S-04 child
+    would 404 at Step 2 http_get and have to escalate."""
+    hint = _TARGET_HINTS["S-04"]
+    assert hint.paths == ("serve.py",)
+    # Negative: no residual main.py reference leaked anywhere.
+    assert "main.py" not in hint.paths
+    assert "main.py" not in hint.new_paths
+    # routers/metrics.py is new per plan E §3 item 4.
+    assert "routers/metrics.py" in hint.new_paths
+    assert "tests/test_metrics_endpoint.py" in hint.new_paths
+
+
+def test_target_hints_entry_count_unchanged():
+    """AB-17-a is data correctness only: still 16 entries after the fix."""
+    assert len(_TARGET_HINTS) == 16
+
+
+# ── AB-17-a · new result types (HintStatus / PathResult / VerificationResult)
+
+
+def test_hint_status_enum_has_six_values():
+    """Plan I §2.2: exactly six terminal states — OK, REPO_MISSING,
+    PATH_MISSING, PATH_CONFLICT, UNVERIFIED, NO_HINT."""
+    values = {m.value for m in HintStatus}
+    assert values == {
+        "ok",
+        "repo_missing",
+        "path_missing",
+        "path_conflict",
+        "unverified",
+        "no_hint",
+    }
+    assert len(HintStatus) == 6
+    # HintStatus is a str-Enum so JSON / soul-memory serialisation works.
+    assert HintStatus.OK == "ok"
+    assert isinstance(HintStatus.REPO_MISSING.value, str)
+
+
+def test_path_result_dataclass_constructs():
+    """Plan I §2.2: PathResult carries per-path expected / observed state
+    plus the ok flag that the render decision table in §3 greps on."""
+    pr = PathResult(
+        path="deploy/appliance/docker-compose.yml",
+        expected="exist",
+        observed="exist",
+        ok=True,
+    )
+    assert pr.path == "deploy/appliance/docker-compose.yml"
+    assert pr.expected == "exist"
+    assert pr.observed == "exist"
+    assert pr.ok is True
+    # Frozen → hashable.
+    {pr}
+
+
+def test_verification_result_dataclass_constructs():
+    """Plan I §2.2: VerificationResult is the wave-boundary artifact the
+    orchestrator stashes in `_verified_hints` and the renderer reads."""
+    hint = _TARGET_HINTS["OPS-01"]
+    vr = VerificationResult(
+        code="OPS-01",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=(
+            PathResult(
+                path="deploy/appliance/docker-compose.yml",
+                expected="exist",
+                observed="exist",
+                ok=True,
+            ),
+        ),
+        error=None,
+        verified_at=1776997000.0,
+    )
+    assert vr.code == "OPS-01"
+    assert vr.hint is hint
+    assert vr.status is HintStatus.OK
+    assert vr.repo_exists is True
+    assert len(vr.path_results) == 1
+    assert vr.error is None
+    assert vr.verified_at == 1776997000.0
+    # Frozen dataclass → hashable.
+    {vr}
+
+
+def test_verification_result_allows_none_hint_for_no_hint_status():
+    """Plan I §2.2: when `status == NO_HINT` (code not in _TARGET_HINTS)
+    the hint field must accept None — there's literally nothing to
+    reference."""
+    vr = VerificationResult(
+        code="UNKNOWN-99",
+        hint=None,
+        status=HintStatus.NO_HINT,
+        repo_exists=False,
+        path_results=(),
+        error="no hint for code UNKNOWN-99",
+    )
+    assert vr.hint is None
+    assert vr.status is HintStatus.NO_HINT

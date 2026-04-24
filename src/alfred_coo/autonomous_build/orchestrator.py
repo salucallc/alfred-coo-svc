@@ -26,8 +26,9 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 from .budget import BudgetTracker, make_tracker
 from .cadence import SlackCadence
@@ -107,14 +108,80 @@ class TargetHint:
     Consumed by ``AutonomousBuildOrchestrator._child_task_body`` to emit a
     ``## Target`` block in the dispatched child task body. Fields map
     one-to-one to the block's keys so rendering is trivial.
+
+    AB-17-a (Plan I §2.1): split ``paths`` into two axes so the child
+    can distinguish files that MUST already exist from files it will
+    CREATE. ``paths`` default relaxed to ``()`` so a pure-creation ticket
+    (e.g. OPS-02 ``IMAGE_PINS.md``) can omit it. Invariant enforced by
+    ``__post_init__``: at least one of ``paths`` / ``new_paths`` must be
+    non-empty — catches empty hints at module-import time.
     """
 
     owner: str
     repo: str
-    paths: Tuple[str, ...]
+    paths: Tuple[str, ...] = ()         # must exist at dispatch
+    new_paths: Tuple[str, ...] = ()     # must NOT exist at dispatch (child creates)
     base_branch: str = "main"
     branch_hint: Optional[str] = None
     notes: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.paths and not self.new_paths:
+            raise ValueError(
+                f"TargetHint for {self.owner}/{self.repo}: at least one of "
+                "paths or new_paths must be non-empty"
+            )
+
+
+class HintStatus(str, Enum):
+    """Per-hint verification status produced by AB-17-b's ``_verify_hint``.
+
+    Plan I §2.2. The string-valued enum serialises cleanly into Linear
+    issue bodies / soul memory without a custom encoder.
+    """
+
+    OK = "ok"                         # repo + all paths verified
+    REPO_MISSING = "repo_missing"     # fatal — block dispatch
+    PATH_MISSING = "path_missing"     # informative — render diagnostic
+    PATH_CONFLICT = "path_conflict"   # informative — render diagnostic
+    UNVERIFIED = "unverified"         # transient — render banner, dispatch
+    NO_HINT = "no_hint"               # code not in _TARGET_HINTS (pre-existing)
+
+
+@dataclass(frozen=True)
+class PathResult:
+    """Single-path verification outcome. Plan I §2.2.
+
+    ``expected`` mirrors whether the path came from ``TargetHint.paths``
+    (expect ``exist``) or ``TargetHint.new_paths`` (expect ``absent``).
+    ``observed`` is the live GitHub state at verification time, or
+    ``unknown`` if the http call failed.
+    """
+
+    path: str
+    expected: Literal["exist", "absent"]
+    observed: Literal["exist", "absent", "unknown"]
+    ok: bool
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """Aggregate per-hint verification output. Plan I §2.2.
+
+    Produced by AB-17-b's ``_verify_hint`` / ``_verify_wave_hints``; read
+    by AB-17-c's ``_render_target_block(code, vr=None)``. ``hint`` is
+    ``None`` only when ``status == NO_HINT`` (the code was not in the
+    static table at all). ``error`` is a short human-readable diagnostic
+    for logs and rendered banners; empty on the happy path.
+    """
+
+    code: str
+    hint: Optional[TargetHint]
+    status: HintStatus
+    repo_exists: bool
+    path_results: Tuple[PathResult, ...]
+    error: Optional[str] = None
+    verified_at: float = 0.0
 
 
 #: Keyed by plan-doc ticket code (e.g. ``OPS-01``, ``F08``, ``TIR-01``,
@@ -127,170 +194,224 @@ class TargetHint:
 #: plans/v1-ga/*.md`` (added by the children fetch).
 _TARGET_HINTS: Mapping[str, TargetHint] = {
     # ── Epic D · OPS layer (salucallc/alfred-coo-svc, deploy/appliance) ─
+    # AB-17-a data fix (Plan I §2 + hints_audit_2026-04-24.md §4):
+    #   C1 class — OPS-01/02/03 `.yaml` typo → real file is `.yml`.
+    #   C4 class — OPS-02 IMAGE_PINS.md is a NEW file; belongs in new_paths.
+    #   OPS-03 path `deploy/appliance/caddy/Caddyfile` does not exist; real
+    #   file lives at `deploy/appliance/Caddyfile` (no `caddy/` subdir).
     "OPS-01": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yaml",),
+        paths=("deploy/appliance/docker-compose.yml",),
+        base_branch="main",
         branch_hint="feature/sal-2634-mc-ops-network",
         notes="add mc-ops network + 4 volumes (grafana, prometheus, loki, restic)",
     ),
+
     "OPS-02": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(
-            "deploy/appliance/docker-compose.yaml",
-            "deploy/appliance/IMAGE_PINS.md",
-        ),
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+        base_branch="main",
         branch_hint="feature/ops-02-pin-images",
-        notes="pin all image versions; grep ':latest' must return 0 matches",
+        notes="pin all image versions; grep ':latest' must return 0 matches; IMAGE_PINS.md is new per plan D §5 W1 #2",
     ),
+
     "OPS-03": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
         paths=(
-            "deploy/appliance/caddy/Caddyfile",
-            "deploy/appliance/docker-compose.yaml",
+            "deploy/appliance/Caddyfile",                 # existing, no caddy/ subdir
+            "deploy/appliance/docker-compose.yml",
         ),
+        base_branch="main",
         branch_hint="feature/ops-03-caddy-routes",
-        notes="Caddy routes /ops /auth /vault → grafana/authelia/infisical",
+        notes="Caddy path-routes /ops /auth /vault -> grafana/authelia/infisical; compose adds 3 labels or env",
     ),
+
     # ── Epic C/F · Fleet mode endpoint (multi-repo) ─────────────────────
+    # AB-17-a data fix: soul-svc is FLAT (no db/ prefix); next free migration
+    # number is 020 (005..019 already exist). Routers + tests that don't yet
+    # exist move to new_paths.
+
     "F01": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=("db/migrations/0007_fleet_endpoints.sql",),
+        paths=(),
+        new_paths=("migrations/020_fleet_endpoints.sql",),  # soul-svc is FLAT; next number is 020
+        base_branch="main",
         branch_hint="feature/f01-fleet-migration",
-        notes="soul-svc migration 0007 for fleet tables (4 tables)",
+        notes="soul-svc migration 020 for fleet tables (4 tables); soul-svc has flat migrations/ dir; existing 005..019",
     ),
+
     "F02": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(
+        paths=(),
+        new_paths=(
             "routers/fleet.py",
             "tests/test_fleet_register.py",
         ),
+        base_branch="main",
         branch_hint="feature/f02-fleet-register",
-        notes="/v1/fleet/register endpoint; valid token -> 201",
+        notes="/v1/fleet/register endpoint; valid token -> 201; both new files; register new router in serve.py (modify path added at implementation time)",
     ),
+
     "F03": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(
+        paths=(),
+        new_paths=(
+            "src/mcctl/__init__.py",
+            "src/mcctl/__main__.py",
+            "src/mcctl/commands/__init__.py",
             "src/mcctl/commands/token.py",
             "tests/test_mcctl_token.py",
         ),
+        base_branch="main",
         branch_hint="feature/f03-mcctl-token-create",
-        notes="mcctl token create CLI (one-shot bootstrap tokens)",
+        notes="first mcctl ticket; whole subtree is new; pyproject.toml entry-point update likely required (flag to child)",
     ),
+
     "F07": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(
-            "src/alfred_coo/persona_loader.py",
-            "src/alfred_coo/main.py",
-        ),
+        paths=("src/alfred_coo/main.py",),
+        new_paths=("src/alfred_coo/persona_loader.py",),
+        base_branch="main",
         branch_hint="feature/f07-coo-mode",
-        notes="COO_MODE env var (hub|endpoint) + persona_loader.py",
+        notes="COO_MODE env var (hub|endpoint); persona_loader.py is new per F-plan §1 Arch; main.py gains branch on COO_MODE",
     ),
+
     "F08": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(
+        paths=(),
+        new_paths=(
             "soul_lite/__init__.py",
             "soul_lite/service.py",
             "soul_lite/Dockerfile",
             "tests/test_soul_lite.py",
         ),
+        base_branch="main",
         branch_hint="feature/f08-soul-lite",
-        notes="new soul-lite service: sqlite + /v1/memory/* API for endpoints",
+        notes="new soul-lite subpackage at repo root (soul-svc is flat, no src/); sqlite + /v1/memory/* API for endpoints",
     ),
+
     # ── Epic E · soul-svc gap closure (salucallc/soul-svc prod variant) ─
+    # AB-17-a data fix: routers/memory.py EXISTS (modify); tests are NEW.
+    # S-04 critical: soul-svc entry is serve.py NOT main.py.
+
     "S-01": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(
-            "routers/memory.py",
-            "tests/test_bulk_import_topics_queryable.py",
-        ),
+        paths=("routers/memory.py",),
+        new_paths=("tests/test_bulk_import_topics_queryable.py",),
+        base_branch="main",
         branch_hint="feature/s01-index-topics-on-import",
-        notes="fix: /v1/memory/import must index TKHR topics",
+        notes="fix: /v1/memory/import must index TKHR topics; see plan E §3 item 1 for exact line ranges (424-480)",
     ),
+
     "S-02": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(
-            "routers/memory.py",
-            "tests/test_memory_dup_409.py",
-        ),
+        paths=("routers/memory.py",),
+        new_paths=("tests/test_memory_dup_409.py",),
+        base_branch="main",
         branch_hint="feature/s02-dup-409",
-        notes="fix: duplicate content_hash returns 409 not 500",
+        notes="fix: duplicate content_hash returns 409 not 500; map asyncpg/postgres 23505 UniqueViolation",
     ),
+
     "S-04": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(
+        paths=("serve.py",),                              # not main.py — soul-svc entry is serve.py
+        new_paths=(
             "routers/metrics.py",
-            "main.py",
             "tests/test_metrics_endpoint.py",
         ),
+        base_branch="main",
         branch_hint="feature/s04-metrics",
-        notes="new /metrics endpoint with prometheus counters + histograms",
+        notes="new /metrics endpoint with prometheus counters + histograms; register router in serve.py; NO tenant_id label (R3 in plan E risk register)",
     ),
+
     "S-09": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(
+        paths=("routers/memory.py",),
+        new_paths=(
+            "db/__init__.py",
             "db/pool.py",
             "db/repository.py",
-            "routers/memory.py",
             "tests/test_asyncpg_pool_init.py",
         ),
+        base_branch="main",
         branch_hint="feature/s09-asyncpg-repository",
-        notes="introduce asyncpg repository layer; swap Supabase SDK in routers/memory.py",
+        notes="introduce asyncpg repository layer; db/ dir is new (soul-svc has no db/ today); swap Supabase SDK in routers/memory.py",
     ),
+
     # ── Epic A · Tiresias in appliance ──────────────────────────────────
+    # AB-17-a: `salucallc/tiresias-sovereign` does not exist YET. Per the
+    # audit, TIR-01 is the repo-scaffold ticket; AB-20 / the human operator
+    # must pre-create the empty repo (`gh repo create salucallc/tiresias-
+    # sovereign --private --add-readme`) BEFORE TIR-* dispatch. Paths stay
+    # as new_paths (greenfield) so AB-17-b will render them correctly once
+    # the repo itself exists.
+
     "TIR-01": TargetHint(
         owner="salucallc",
-        repo="tiresias-sovereign",
-        paths=(
+        repo="tiresias-sovereign",           # DOES NOT EXIST YET — pre-create via AB-20
+        paths=(),
+        new_paths=(
             "README.md",
             "pyproject.toml",
             "src/tiresias_sovereign/__init__.py",
             ".github/workflows/ci.yml",
         ),
+        base_branch="main",
         branch_hint="feature/tir-01-scaffold",
-        notes="scaffold new salucallc/tiresias-sovereign repo + CI",
+        notes="BLOCKER: salucallc/tiresias-sovereign repo does not exist on GitHub. TIR-01 is the create-repo ticket. Child cannot propose_pr against a 404 repo. Two options: (a) pre-create empty repo before dispatching TIR-01 (operator one-liner: gh repo create salucallc/tiresias-sovereign --private --add-readme); or (b) add 'repo_create' primitive to AB-10/AB-11 tool surface. Recommend (a) for speed.",
     ),
+
     "TIR-02": TargetHint(
         owner="salucallc",
         repo="tiresias-sovereign",
-        paths=(
+        paths=(),
+        new_paths=(
             "src/tiresias_sovereign/principles/registry.json",
             "src/tiresias_sovereign/principles/loader.py",
             "tests/test_principle_registry.py",
         ),
+        base_branch="main",
         branch_hint="feature/tir-02-principle-registry",
-        notes="embed principle_registry.json + hash-chain loader",
+        notes="BLOCKED on TIR-01 (repo must exist); then 12 principles + hash-chain loader",
     ),
+
     "TIR-07": TargetHint(
         owner="salucallc",
         repo="tiresias-sovereign",
-        paths=(
+        paths=(),
+        new_paths=(
             "db/migrations/0001_tiresias_audit.sql",
             "tests/test_audit_schema.py",
         ),
+        base_branch="main",
         branch_hint="feature/tir-07-audit-migration",
-        notes="DB migrations for tiresias_audit schema",
+        notes="BLOCKED on TIR-01; greenfield db/migrations/ dir — note that real salucallc/tiresias uses alembic/versions/; TIR-01 must commit to a migration convention before TIR-07 can sensibly land",
     ),
+
     "TIR-08": TargetHint(
         owner="salucallc",
         repo="tiresias-sovereign",
-        paths=(
+        paths=(),
+        new_paths=(
             "src/tiresias_sovereign/mcp_llm/router.py",
             "tests/test_mcp_llm_cascade.py",
         ),
+        base_branch="main",
         branch_hint="feature/tir-08-mcp-llm-cascade",
-        notes="mcp-llm cascade router (principle-aware routing)",
+        notes="BLOCKED on TIR-01; mcp-llm cascade router (principle-aware routing)",
     ),
 }
 
