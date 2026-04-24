@@ -79,11 +79,22 @@ DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 # logic handles the rest.
 MAX_REVIEW_CYCLES = 3
 
-# AB-08: compiled regexes for verdict extraction. Uppercase-only keywords
-# keep false positives low (hawkman prompt spec: shout the verdict, not
-# "we approve of this idea in prose").
-_VERDICT_APPROVE_RE = re.compile(r"\bAPPROVE\b")
-_VERDICT_REQUEST_CHANGES_RE = re.compile(r"\bREQUEST_CHANGES\b")
+# AB-08: compiled regexes for verdict extraction. Safety-net only — the
+# explicit pr_review tool-call path (see _extract_verdict) has higher
+# precedence and remains the canonical channel.
+#
+# AB-17-i hardening (2026-04-24): the original uppercase-only, underscore-only
+# patterns missed hawkman's v8-smoke-c prose like "Requesting changes" and
+# "request-changes", which caused all three smoke tickets to land silent-FAIL
+# despite 2/3 producing clean PRs. Broaden to case-insensitive, tolerate
+# space/hyphen/underscore between the two words, accept plural and -ing forms:
+#   APPROVE   matches: APPROVE, approve, Approved, approves
+#   REQ-CH    matches: REQUEST_CHANGES, request-changes, request changes,
+#                      Requesting changes, Request Change, request_change
+_VERDICT_APPROVE_RE = re.compile(r"\bapprove[ds]?\b", re.IGNORECASE)
+_VERDICT_REQUEST_CHANGES_RE = re.compile(
+    r"\brequest(?:ing)?[ _-]?changes?\b", re.IGNORECASE
+)
 
 # Placeholder used when a REQUEST_CHANGES review body is empty/missing.
 _NO_REVIEW_BODY_NOTE = (
