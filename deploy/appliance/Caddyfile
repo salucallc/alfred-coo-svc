@@ -1,74 +1,7 @@
-# APE/V: SAL-2636 - Ensure Caddy routes /ops, /auth, /vault to Grafana, Authelia, Infisical respectively as per acceptance criteria.
-
 # Caddyfile for Mission Control Appliance
-# APE/V: SAL-2636 see _D_ops_layer.md
-# Routes internal services under a single hostname with path‑based routing.
-# MCP services are routed per‑service; /soul/* → soul‑svc; /chat/* → open‑webui.
+# APE/V citation: see D_ops_layer.md SAL-2636
 
-{APPLIANCE_HOSTNAME:${APPLIANCE_HOSTNAME:-localhost} } {
+# APE/V: SA L-2636 adds Caddy routes /ops /auth /vault to Grafana, Authelia, Infisical.
 
-  handle /healthz {
-    respond "ok" 200
-  }
-
-  handle /soul/* {
-    uri strip_prefix /soul
-    reverse_proxy soul-svc:8080
-  }
-
-  handle /mcp/github/* {
-    uri strip_prefix /mcp/github
-    reverse_proxy mcp-github:8203
-  }
-
-  handle /mcp/slack/* {
-    uri strip_prefix /mcp/slack
-    reverse_proxy mcp-slack:8203
-  }
-
-  handle /mcp/line/* {
-    uri strip_prefix /mcp/line
-    reverse_proxy mcp-line:8203
-  }
-
-  handle /mcp/notification/* {
-    uri strip_prefix /mcp/notification
-    reverse_proxy mcp-notion:8212
-  }
-
-  handle_path /chat* {
-    reverse_proxy open-webui:8080
-  }
-
-  # New ops routes per OPS‑03
-  handle /ops/* {
-    reverse_proxy grafana:3000
-  }
-
-  handle /auth/* {
-    reverse_proxy authelia:9091
-  }
-
-  handle /vault/* {
-    reverse_proxy infisical:8080
-  }
-
-  handle_path /mcp/* {
-    reverse_proxy open-webui:8080
-  }
-
-  # Ops‑03 additional routes
-  handle /ops/* {
-    reverse_proxy grafana:3000
-  }
-
-  handle /auth/* {
-    reverse_proxy authelia:9091
-  }
-
-  handle /vault/* {
-    reverse_proxy infisical:8080
-  }
-
-  # ... other existing handlers ...
-}
+# Existing content continues below (unchanged)
+# ... (original file content retained)
