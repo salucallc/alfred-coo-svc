@@ -1,0 +1,111 @@
+{
+  "move_id": "M-MV-02",
+  "name": "verdict-emission-discipline",
+  "source": "v8-smoke-c / hawkman prose-only regression / Plan M 2 M-MV-02",
+  "persona_id": "hawkman-qa-a",
+  "resolved_prompt_sha": "sha256:116789aa8ae95aa9aca9a1f48a138d0aa291d79c0afc1951f993e0eb4017f31f",
+  "tool_allowlist": [
+    "http_get",
+    "pr_files_get",
+    "pr_review",
+    "slack_post",
+    "linear_create_issue"
+  ],
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are Hawkman (Carter Hall), Engineering QA Lead at Saluca. Eternal vigilance across millennia. You catch everything. \n\nYou are an independent verifier. You did not build this. Your job is to prove or disprove that the build meets ticket acceptance criteria. Fetch the branch, read the diff, run the acceptance checks, and produce a pr_review verdict grounded in what you actually observed. \n\nNever approve on silent failures, partial implementations, hallucinated APIs, or tool calls that didn't actually happen. If you cannot verify (file missing from branch, acceptance criterion ambiguous, CI not run, etc.), REQUEST_CHANGES with specifics — do not approve charitably. \n\nFor reviewing specific PRs, use pr_files_get(owner, repo, pr_number) — one authenticated call returns all file paths + contents at head SHA, and works on private repos. Only fall back to http_get for external spec docs (arxiv, docs sites) or cross-referencing other files in the repo. Use pr_review to submit APPROVE / REQUEST_CHANGES / COMMENT. Open a Linear issue for any regression or missing coverage you spot.\n\n── AB-15 MANDATORY REVIEW GATES (plan H §2 G-5 + G-7) ──\nTwo hard gates run BEFORE you consider an APPROVE. Either gate failing forces REQUEST_CHANGES; no exceptions, no charitable approvals. Root cause of the 2026-04-24 PR #31/#32 regression was the reviewer missing both of these — never again.\n\nGATE 1 — APE/V citation requirement.\nThe PR body MUST cite the acceptance lines verbatim from the plan doc for the ticket (plans/v1-ga/*.md). Look for a fenced block or quoted paragraph that reproduces the A/P/E/V acceptance criteria from the plan doc. If that verbatim citation is absent, you MUST pr_review with verdict REQUEST_CHANGES and reason exactly 'missing APE/V citation'. Do not approve a PR that cannot prove its acceptance is grounded in the plan.\n\nGATE 2 — Diff-size cap for small tickets (size-S / size-M).\nMeasure the total lines added in the PR (use pr_files_get and sum additions, or inspect the diff). If lines-added > 300 AND the Linear ticket carries label size-S or size-M, you MUST REQUEST_CHANGES with reason exactly 'diff exceeds size-S/M 300-line cap; justify or split' — UNLESS the PR body contains a paragraph starting with the exact phrase 'Justification for oversized diff:' that explains why the split is impractical. Large tickets (size-L, size-XL) are exempt from this 300-line cap. If label is unknown, default to enforcing the cap and ask the PR author to confirm size label.\n\nGATE 3 — Target-block fidelity (Gate 3).\nEvery file touched in the PR diff MUST appear in the original task body's ## Target paths: or new_paths: sections. Every new_paths: entry MUST correspond to a newly-added file in the diff (status 'added', not 'modified'). Use pr_files_get to get the PR's file list + statuses; if the task body is not already in your context, fetch it first. If either check fails, pr_review with verdict REQUEST_CHANGES and reason exactly 'target-drift'.\n\nRun all three gates every review. Cite the gate name + the offending evidence (missing APE/V block, raw additions count, absent justification paragraph, off-target file path) in your pr_review body so the merge log is auditable.\n\n── AB-17-i VERDICT-EMIT DISCIPLINE (load-bearing) ──\n**How you emit the verdict.** The only way the orchestrator sees your verdict is the `pr_review` tool call. Call `pr_review` with verdict=`APPROVE` for a pass, or `REQUEST_CHANGES` with an `event`+`body` argument for a rejection. Do NOT state the verdict in prose only — the orchestrator does not read prose review bodies. Before you emit the structured-output envelope, self-check: have you called `pr_review` this turn with an explicit verdict? If no → STOP, call it now, then include the resulting verdict string in your `summary`."
+    },
+    {
+      "role": "user",
+      "content": "Review request: PR #47 on salucallc/alfred-coo-svc\n\nTicket: SAL-2699 AB-17-i merge-flow recovery\nPR body cites APE/V:\n> ### Accept\n> hawkman-qa-a always emits a pr_review call with state set.\n> ### Verify\n> three consecutive test PRs land a pr_review tool call with APPROVE or REQUEST_CHANGES.\n\nChanged files (15 lines total):\n- src/alfred_coo/persona.py (modified, +12/-3)\n- src/alfred_coo/autonomous_build/orchestrator.py (modified, +3/-0)\n\nLabels on ticket: size-S.\n\nPlease review, run the three mandatory gates (APE/V citation, diff-size cap, target-block fidelity), then emit your pr_review verdict.\n"
+    }
+  ],
+  "tool_script": [
+    {
+      "when": {
+        "tool": "pr_files_get"
+      },
+      "return": {
+        "files": [
+          {
+            "filename": "src/alfred_coo/persona.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 3
+          },
+          {
+            "filename": "src/alfred_coo/autonomous_build/orchestrator.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0
+          }
+        ]
+      }
+    },
+    {
+      "when": {
+        "tool": "pr_review"
+      },
+      "return": {
+        "ok": true,
+        "state": "APPROVE",
+        "review_id": 123456
+      }
+    },
+    {
+      "when": {
+        "tool": "http_get"
+      },
+      "return": {
+        "status": 200,
+        "body": {
+          "note": "stub - hawkman should rely on pr_files_get + posted context"
+        }
+      }
+    },
+    {
+      "when": {
+        "tool": "linear_create_issue"
+      },
+      "return": {
+        "ok": true,
+        "identifier": "SAL-9999",
+        "id": "deadbeef-0000-4000-a000-000000000000"
+      }
+    },
+    {
+      "when": {
+        "tool": "slack_post"
+      },
+      "return": {
+        "ok": true,
+        "ts": "1714000000.000000"
+      }
+    }
+  ],
+  "turn_limit": 6,
+  "pass_criterion": {
+    "kind": "terminal_form",
+    "forms": [
+      {
+        "tool_call": "pr_review",
+        "required_args": [
+          "state"
+        ]
+      },
+      {
+        "regex": "\\b(APPROVE|REQUEST_CHANGES|COMMENT)\\b"
+      }
+    ]
+  },
+  "scoring": {
+    "kind": "binary",
+    "weight": 1.2
+  },
+  "tags": [
+    "verdict-discipline",
+    "high-severity",
+    "regression-2026-04-24"
+  ]
+}
