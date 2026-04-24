@@ -11,6 +11,7 @@ import pytest
 
 from alfred_coo.autonomous_build.graph import (
     TicketStatus,
+    _parse_code,
     build_ticket_graph,
 )
 
@@ -160,3 +161,53 @@ async def test_graph_error_surfaces_runtime_error():
 
     with pytest.raises(RuntimeError, match="linear_list_project_issues error"):
         await build_ticket_graph(project_id="p", list_project_issues=errfetch)
+
+
+# ── AB-14 (SAL-2699): _CODE_RE widen for F/D/E/H plan-doc prefixes ─────────
+#
+# Regression: live-run on 2026-04-23 showed `F08: soul-lite service...`
+# (SAL-2616) parsed to an empty ticket.code because _CODE_RE only
+# recognised TIR/ALT/C/FLEET/OPS/SS/AB/MC/SG. Children lost their
+# plan-doc grep anchor and fabricated scope (off-scope PR rolled back).
+# Widening to include F/D/E/H closes that defect; regex group 0 now also
+# preserves the original separator so plan-doc searches match verbatim.
+
+
+@pytest.mark.parametrize(
+    "title, expected",
+    [
+        # AB-14 additions — single-letter F/D/E/H plan-doc prefixes.
+        ("F08: soul-lite service...", "F08"),
+        ("D03: ops layer seed...", "D03"),
+        ("E02: soul-svc gap close...", "E02"),
+        ("H01: child grounding...", "H01"),
+        # Existing prefixes must still round-trip.
+        ("OPS-01: mc-ops network...", "OPS-01"),
+        ("C-26: multi-tenant...", "C-26"),
+        ("TIR-05: sovereign healthcheck...", "TIR-05"),
+        # SAL-OPS-01 should match the inner OPS-01 (SAL is not in the
+        # prefix set; the \b-anchored second match wins).
+        ("SAL-OPS-01: ...", "OPS-01"),
+        # No code present → empty string (orchestrator will emit the
+        # "(unparseable — escalate...)" fallback line).
+        ("random no code here", ""),
+    ],
+)
+def test_parse_code_widened_prefixes(title: str, expected: str) -> None:
+    """AB-14: _CODE_RE must match F/D/E/H plus all existing prefixes, and
+    _parse_code must preserve the original separator so plan-doc greps
+    match verbatim (``F08`` stays ``F08``, not ``F-08``)."""
+    assert _parse_code(title) == expected
+
+
+def test_parse_code_underscore_normalised_to_dash() -> None:
+    """Underscored separators are normalised to dashes. Plan docs use the
+    dash form exclusively for multi-char prefixes, so this keeps
+    downstream greps consistent without losing a match on legacy titles."""
+    assert _parse_code("C_26: legacy underscore") == "C-26"
+
+
+def test_parse_code_empty_title_returns_empty() -> None:
+    """Empty-title guard: no crash, empty string, orchestrator fallback
+    emits the escalate line."""
+    assert _parse_code("") == ""

@@ -607,6 +607,20 @@ class AutonomousBuildOrchestrator:
         plan_doc = self._plan_doc_for_epic(ticket.epic)
         size_line = f"Size: {ticket.size}" if ticket.size else "Size: unspecified"
         cp_line = " CRITICAL-PATH" if ticket.is_critical_path else ""
+        # AB-14 (SAL-2699): emit the plan-doc code verbatim so the child can
+        # grep the plan-doc markdown for its exact section anchor (F08, OPS-01,
+        # C-26, ...). Empty-code tickets must escalate — the child has no
+        # grounding and would otherwise fabricate scope.
+        if ticket.code:
+            plan_doc_code_line = (
+                f"Plan-doc code: {ticket.code} "
+                f"(search for this string in the plan-doc markdown)\n"
+            )
+        else:
+            plan_doc_code_line = (
+                "Plan-doc code: (unparseable — escalate per Step 0 of your "
+                "persona protocol)\n"
+            )
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -615,6 +629,7 @@ class AutonomousBuildOrchestrator:
             f"{size_line}\n"
             f"Estimate: {ticket.estimate}\n"
             f"Parent autonomous_build kickoff: {self.task_id}\n"
+            f"{plan_doc_code_line}"
             f"\n"
             f"## Acceptance (APE/V)\n"
             f"- [ ] Implementation matches the plan section for this ticket.\n"
