@@ -149,3 +149,78 @@ def test_handler_field_defaults_to_none_for_existing_personas():
             "only autonomous-build-a should opt into the long-running path "
             "in AB-01."
         )
+
+
+# ── AB-12: alfred-coo-a 6-step grounding protocol (SAL-2697) ───────────────
+#
+# Root cause R3 of the 2026-04-24 off-scope PR incident (#31/#32): the
+# alfred-coo-a system_prompt had zero grounding protocol, so the model
+# fabricated scope. This suite asserts the new prompt contains every
+# mandated phrase from plan H §2 G-1.
+# Reference: Z:/_planning/v1-ga/H_child_grounding.md §2 G-1.
+
+
+def _alfred_prompt() -> str:
+    return BUILTIN_PERSONAS["alfred-coo-a"].system_prompt
+
+
+def test_alfred_coo_a_prompt_declares_target_block_read():
+    """Step 0: the prompt must instruct the builder to read ## Target."""
+    assert "Read the ## Target" in _alfred_prompt()
+
+
+def test_alfred_coo_a_prompt_declares_plan_doc_fetch():
+    """Step 1: the prompt must instruct http_get against the plan-doc URL."""
+    assert "http_get the plan-doc URL" in _alfred_prompt()
+
+
+def test_alfred_coo_a_prompt_requires_understanding_section():
+    """Step 3: the prompt must require a ## Understanding section in the
+    mesh task result."""
+    assert "## Understanding" in _alfred_prompt()
+
+
+def test_alfred_coo_a_prompt_has_do_not_guess_directive():
+    """The anti-hallucination directive must appear verbatim (case-insensitive
+    match is acceptable per the AB-12 spec)."""
+    assert "do not guess" in _alfred_prompt().lower()
+
+
+def test_alfred_coo_a_prompt_addresses_no_code_trap():
+    """Step 5: the prompt must explicitly forbid the 'no-code' /
+    'docs-only' fabrication that caused PR #31."""
+    assert "no-code" in _alfred_prompt()
+
+
+def test_alfred_coo_a_prompt_enumerates_all_six_steps():
+    """The 6-step protocol must name STEP 0 through STEP 6 explicitly so a
+    model parsing the prompt cannot skip or collapse a step."""
+    prompt = _alfred_prompt()
+    for i in range(7):  # STEP 0..STEP 6 inclusive
+        assert f"STEP {i}" in prompt, f"missing STEP {i} marker"
+
+
+def test_alfred_coo_a_prompt_uses_linear_create_issue_for_escalation():
+    """R-d locked B (child-side escalation): when the ## Target is missing
+    or unresolved, the builder must escalate via linear_create_issue."""
+    assert "linear_create_issue" in _alfred_prompt()
+
+
+def test_alfred_coo_a_prompt_contains_all_mandated_phrases():
+    """Single-shot aggregate check: every mandated phrase from the AB-12
+    spec must be present in the resolved prompt. Guards against future
+    edits that silently remove one of them."""
+    prompt = _alfred_prompt()
+    lower = prompt.lower()
+    mandated_exact = [
+        "Read the ## Target",
+        "http_get the plan-doc URL",
+        "## Understanding",
+        "no-code",
+        "linear_create_issue",
+    ]
+    for phrase in mandated_exact:
+        assert phrase in prompt, f"mandated phrase missing: {phrase!r}"
+    assert "do not guess" in lower, "mandated phrase missing: 'Do NOT guess'"
+    for i in range(7):
+        assert f"STEP {i}" in prompt, f"missing STEP {i} marker"
