@@ -166,6 +166,25 @@ services:
     networks:
       - appliance
 
+  # New aletheia service
+  aletheia-svc:
+    image: ghcr.io/salucallc/aletheia-svc:latest
+    restart: unless-stopped
+    environment:
+      SOUL_API_URL: http://soul-svc:8080
+    depends_on:
+      soul-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks:
+      - appliance
+
+  # — end services
+
 volumes:
   caddy_data:
   caddy_config:
