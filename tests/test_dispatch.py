@@ -383,3 +383,245 @@ def test_peek_linear_ticket_prefers_title_over_description():
         "description": "see also SAL-0001",
     }
     assert _peek_linear_ticket(task) == "SAL-9999"
+
+
+# ── AB-17-m: size-aware iteration caps ──────────────────────────────────
+
+
+def test_iteration_cap_for_size_known_labels():
+    """size-S/M/L each map to their documented cap."""
+    from alfred_coo.dispatch import iteration_cap_for_size
+    assert iteration_cap_for_size("size-s") == 12
+    assert iteration_cap_for_size("size-m") == 16
+    assert iteration_cap_for_size("size-l") == 20
+    # Case-insensitive: the orchestrator emits `size-S` (upper) and Linear
+    # can emit either form depending on label source.
+    assert iteration_cap_for_size("SIZE-S") == 12
+    assert iteration_cap_for_size("Size-L") == 20
+
+
+def test_iteration_cap_for_size_unknown_defaults_to_12():
+    """Unknown / None / empty labels collapse to the size-S cap (12).
+
+    Conservative default: a mis-labelled ticket shouldn't leak the size-L
+    budget by accident. 12 matches the AB-17-l behaviour pre-AB-17-m.
+    """
+    from alfred_coo.dispatch import iteration_cap_for_size
+    assert iteration_cap_for_size(None) == 12
+    assert iteration_cap_for_size("") == 12
+    assert iteration_cap_for_size("xyz") == 12
+    assert iteration_cap_for_size("size-xl") == 12  # not in the cap dict
+    assert iteration_cap_for_size("size-xs") == 12  # not in the cap dict
+
+
+def test_iteration_cap_for_size_ceiling_bounded(monkeypatch):
+    """Even with a patched cap dict exceeding MAX_TOOL_ITERATIONS, the
+    helper clamps at the module ceiling — defence in depth against a rogue
+    label map edit.
+    """
+    import alfred_coo.dispatch as d
+
+    # Temporarily tighten the ceiling to prove clamping works. We can't
+    # easily patch the inline dict, but we CAN lower MAX_TOOL_ITERATIONS
+    # and re-check that 20 (the size-L cap) gets squashed to the new ceiling.
+    monkeypatch.setattr(d, "MAX_TOOL_ITERATIONS", 10)
+    assert d.iteration_cap_for_size("size-l") == 10
+    assert d.iteration_cap_for_size("size-m") == 10
+    assert d.iteration_cap_for_size("size-s") == 10  # 12 > 10, clamped
+
+
+@pytest.mark.asyncio
+async def test_run_tool_loop_honours_max_iterations_override(
+    monkeypatch, dispatcher, ctx, caplog,
+):
+    """When the caller passes `max_iterations=4`, the loop bails at 4 and the
+    warning reports "(4)" not the module ceiling "(20)".
+
+    Exercised via a mock transport that keeps returning tool_calls forever
+    so the loop must hit the cap.
+    """
+    import logging as _logging
+    from alfred_coo.tools import ToolSpec
+
+    # Every response asks for another tool call → loop runs until cap.
+    tool_call_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_x",
+                    "function": {"name": "demo_tool", "arguments": "{}"},
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    transport = _RecordingTransport(responses=[tool_call_response] * 30)
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _demo_handler(**kwargs) -> dict:
+        return {"ok": True}
+
+    tool = ToolSpec(
+        name="demo_tool",
+        description="demo",
+        parameters={"type": "object", "properties": {}},
+        handler=_demo_handler,
+    )
+
+    with caplog.at_level(_logging.WARNING, logger="alfred_coo.dispatch"):
+        result = await dispatcher.call_with_tools(
+            "qwen3-coder:480b-cloud",
+            "sys",
+            "prompt",
+            tools=[tool],
+            context=ctx,
+            max_iterations=4,
+        )
+
+    # Exactly 4 model calls — the cap was honoured.
+    assert len(transport.requests) == 4
+    assert result.get("truncated") is True
+    assert result["iterations"] == 4
+    # Warning must reflect the effective cap (4), not MAX_TOOL_ITERATIONS (20).
+    warnings = [
+        r.message for r in caplog.records
+        if r.levelno == _logging.WARNING and "MAX_TOOL_ITERATIONS" in r.message
+    ]
+    assert warnings, "expected a MAX_TOOL_ITERATIONS warning"
+    assert "(4)" in warnings[-1], warnings[-1]
+
+
+@pytest.mark.asyncio
+async def test_run_tool_loop_clamps_override_at_ceiling(
+    monkeypatch, dispatcher, ctx, caplog,
+):
+    """A rogue caller passing max_iterations=999 must still be clamped at
+    MAX_TOOL_ITERATIONS. Proven by seeing the warning report the ceiling,
+    not the override.
+    """
+    import logging as _logging
+    from alfred_coo.tools import ToolSpec
+    from alfred_coo.dispatch import MAX_TOOL_ITERATIONS
+
+    tool_call_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_x",
+                    "function": {"name": "demo_tool", "arguments": "{}"},
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    transport = _RecordingTransport(responses=[tool_call_response] * 1000)
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _demo_handler(**kwargs) -> dict:
+        return {"ok": True}
+
+    tool = ToolSpec(
+        name="demo_tool",
+        description="demo",
+        parameters={"type": "object", "properties": {}},
+        handler=_demo_handler,
+    )
+
+    with caplog.at_level(_logging.WARNING, logger="alfred_coo.dispatch"):
+        result = await dispatcher.call_with_tools(
+            "qwen3-coder:480b-cloud",
+            "sys",
+            "prompt",
+            tools=[tool],
+            context=ctx,
+            max_iterations=999,
+        )
+
+    assert len(transport.requests) == MAX_TOOL_ITERATIONS
+    assert result["iterations"] == MAX_TOOL_ITERATIONS
+
+
+# ── main._peek_size_label + _builder_iteration_cap ──────────────────────
+
+
+def test_peek_size_label_from_size_line():
+    """Orchestrator writes `Size: M` into the child task body."""
+    from alfred_coo.main import _peek_size_label
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-9001 — scaffold thing",
+        "description": "Ticket: SAL-9001\nWave: 0\nSize: M\nEstimate: 5\n",
+    }
+    assert _peek_size_label(task) == "size-m"
+
+
+def test_peek_size_label_from_label_tag_in_title():
+    """Fallback: `size-L` tag embedded in title when body lacks Size: line."""
+    from alfred_coo.main import _peek_size_label
+    task = {
+        "title": "[persona:alfred-coo-a] [size-L] SAL-9002 — refactor thing",
+        "description": "no size line here",
+    }
+    assert _peek_size_label(task) == "size-l"
+
+
+def test_peek_size_label_missing_returns_none():
+    from alfred_coo.main import _peek_size_label
+    assert _peek_size_label({"title": "", "description": ""}) is None
+    assert _peek_size_label({"title": "no size info anywhere"}) is None
+
+
+def test_builder_iteration_cap_size_l():
+    """Builder persona + size-L task → 20-turn cap."""
+    from alfred_coo.main import _builder_iteration_cap
+    task = {"title": "x", "description": "Ticket: SAL-1\nSize: L\n"}
+    assert _builder_iteration_cap("alfred-coo-a", task) == 20
+
+
+def test_builder_iteration_cap_size_m():
+    from alfred_coo.main import _builder_iteration_cap
+    task = {"title": "x", "description": "Ticket: SAL-1\nSize: M\n"}
+    assert _builder_iteration_cap("alfred-coo-a", task) == 16
+
+
+def test_builder_iteration_cap_size_s():
+    from alfred_coo.main import _builder_iteration_cap
+    task = {"title": "x", "description": "Ticket: SAL-1\nSize: S\n"}
+    assert _builder_iteration_cap("alfred-coo-a", task) == 12
+
+
+def test_builder_iteration_cap_unknown_size_defaults_to_12():
+    from alfred_coo.main import _builder_iteration_cap
+    task = {"title": "no size", "description": "none here"}
+    # Builder, but no size → default cap (12). Not None — the helper still
+    # stamps the builder with a cap so the log line fires.
+    assert _builder_iteration_cap("alfred-coo-a", task) == 12
+
+
+def test_builder_iteration_cap_autonomous_build_a_also_gets_cap():
+    """autonomous-build-a is the orchestrator persona and ALSO counts as a
+    builder for AB-17-m purposes."""
+    from alfred_coo.main import _builder_iteration_cap
+    task = {"title": "x", "description": "Size: L\n"}
+    assert _builder_iteration_cap("autonomous-build-a", task) == 20
+
+
+def test_builder_iteration_cap_reviewer_returns_none():
+    """hawkman-qa-a is the reviewer — MUST get None so the default cap is
+    used. Blanket 20-turn budget on short review loops would just inflate
+    cost on noisy misfires.
+    """
+    from alfred_coo.main import _builder_iteration_cap
+    task = {"title": "review", "description": "Size: L\n"}  # size ignored
+    assert _builder_iteration_cap("hawkman-qa-a", task) is None
+
+
+def test_builder_iteration_cap_unknown_persona_returns_none():
+    """Any persona not on the builder allowlist falls back to default cap."""
+    from alfred_coo.main import _builder_iteration_cap
+    task = {"title": "x", "description": "Size: L\n"}
+    assert _builder_iteration_cap("some-future-persona", task) is None
+    assert _builder_iteration_cap("unknown", task) is None

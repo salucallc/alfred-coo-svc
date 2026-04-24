@@ -40,7 +40,29 @@ logger = logging.getLogger("alfred_coo.dispatch")
 # warnings at 16:46:18 and 16:49:29 UTC on gpt-oss:120b-cloud). AB-17-i already bounds
 # alfred-coo-a investigation to commit within 3 turns after 4 http_gets, so runaway cost
 # stays capped.
-MAX_TOOL_ITERATIONS = 12
+#
+# AB-17-m (2026-04-24): raised 12 -> 20 as the absolute CEILING after v8-full-v2
+# (mesh task 6fdf760f) still hit MAX_TOOL_ITERATIONS(12) three times in the first
+# 10 min on F07 / F08 / SS-09 scaffolding tickets (17:32 / 17:33 / 17:35 UTC).
+# Raw 20-turn budget is NOT handed out indiscriminately — the orchestrator now
+# passes a size-aware per-dispatch cap via `iteration_cap_for_size` below
+# (size-S=12, size-M=16, size-L=20) and `_tool_loop` clamps any override at
+# MAX_TOOL_ITERATIONS in case a caller mis-labels a ticket. Trivial tickets
+# keep the 12-turn behaviour; complex scaffolding gets headroom.
+MAX_TOOL_ITERATIONS = 20
+
+
+def iteration_cap_for_size(size_label: str | None) -> int:
+    """Return the tool-iteration cap for a ticket's size label.
+
+    AB-17-m (2026-04-24): size-gated caps so trivial tickets don't get
+    blanket 20-turn budget. Unknown/None label defaults to size-S cap.
+    Ceiling is MAX_TOOL_ITERATIONS regardless of return value (defence
+    in depth against a rogue label).
+    """
+    caps = {"size-s": 12, "size-m": 16, "size-l": 20}
+    cap = caps.get((size_label or "").lower(), 12)
+    return min(cap, MAX_TOOL_ITERATIONS)
 
 
 def select_model(task: dict, persona) -> str:
@@ -252,12 +274,19 @@ class Dispatcher:
         tools: list[ToolSpec],
         fallback_model: str | None = None,
         context: Optional[DispatchContext] = None,
+        max_iterations: int | None = None,
     ) -> dict:
         """Multi-turn OpenAI-compatible tool-use loop.
 
         The model can emit tool_calls; each call is executed and its JSON result
         fed back as a role=tool message; the loop runs until the model emits a
-        final message with no tool_calls, or MAX_TOOL_ITERATIONS is hit.
+        final message with no tool_calls, or the per-call cap is hit.
+
+        ``max_iterations`` is an optional per-call override (AB-17-m). When None
+        the loop uses ``MAX_TOOL_ITERATIONS`` (20). When provided it is clamped
+        at ``MAX_TOOL_ITERATIONS`` so a caller can't blow past the ceiling even
+        by mistake. The orchestrator uses this to hand out size-gated caps
+        (size-S=12, size-M=16, size-L=20) via ``iteration_cap_for_size``.
 
         Fallback: if the primary model errors at any point, retry the WHOLE loop
         against fallback_model with a fresh message history. This trades some
@@ -271,13 +300,19 @@ class Dispatcher:
             )
 
         try:
-            return await self._tool_loop(model, system, prompt, tools, context=context)
+            return await self._tool_loop(
+                model, system, prompt, tools,
+                context=context, max_iterations=max_iterations,
+            )
         except Exception as e:
             fb = fallback_model or "deepseek-v3.2:cloud"
             if fb == model:
                 raise
             logger.warning("tool-use primary %s failed (%s); retrying on %s", model, e, fb)
-            result = await self._tool_loop(fb, system, prompt, tools, context=context)
+            result = await self._tool_loop(
+                fb, system, prompt, tools,
+                context=context, max_iterations=max_iterations,
+            )
             result["model_used"] = f"{model} -> {fb}"
             return result
 
@@ -288,7 +323,19 @@ class Dispatcher:
         prompt: str,
         tools: list[ToolSpec],
         context: Optional[DispatchContext] = None,
+        max_iterations: int | None = None,
     ) -> dict:
+        # AB-17-m: clamp any override at the ceiling. None => default to ceiling.
+        if max_iterations is None:
+            effective_cap = MAX_TOOL_ITERATIONS
+        else:
+            effective_cap = min(max_iterations, MAX_TOOL_ITERATIONS)
+            # Guard against <=0 overrides collapsing the loop silently. Floor
+            # at 1 so at least one model call happens and the size-gating is
+            # observable in logs.
+            if effective_cap < 1:
+                effective_cap = 1
+
         messages: list[dict] = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -299,7 +346,7 @@ class Dispatcher:
         total_out = 0
         tool_call_log: list[dict] = []
 
-        for iteration in range(MAX_TOOL_ITERATIONS):
+        for iteration in range(effective_cap):
             data = await self._call_gateway(
                 model, messages, context=context, tools=tool_schemas,
             )
@@ -343,13 +390,17 @@ class Dispatcher:
                     "content": result_str,
                 })
 
-        logger.warning("tool-use hit MAX_TOOL_ITERATIONS (%d); returning partial", MAX_TOOL_ITERATIONS)
+        # AB-17-m: log the EFFECTIVE cap (size-aware) not the module ceiling so
+        # operators can tell "size-S hit 12" vs "size-L hit 20" at a glance.
+        logger.warning(
+            "tool-use hit MAX_TOOL_ITERATIONS (%d); returning partial", effective_cap
+        )
         return {
             "content": "[tool-use loop exceeded max iterations; partial progress in tool_calls]",
             "tokens_in": total_in,
             "tokens_out": total_out,
             "model_used": model,
             "tool_calls": tool_call_log,
-            "iterations": MAX_TOOL_ITERATIONS,
+            "iterations": effective_cap,
             "truncated": True,
         }

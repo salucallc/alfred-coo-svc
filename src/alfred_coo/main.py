@@ -25,7 +25,7 @@ from . import config, log, dispatch, health
 from .mesh import MeshClient, parse_persona_tag
 from .soul import SoulClient
 from .persona import Persona, get_persona
-from .dispatch import Dispatcher, DispatchContext
+from .dispatch import Dispatcher, DispatchContext, iteration_cap_for_size
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
 from .tools import resolve_tools, set_current_task_id, reset_current_task_id
@@ -37,6 +37,71 @@ logger = logging.getLogger(__name__)
 # followed by 1-6 digits. Used by `_peek_linear_ticket` to pull a correlation
 # id out of the mesh task title for the observability header contract.
 _LINEAR_TICKET_RE = re.compile(r"\b([A-Z]{2,5}-\d{1,6})\b")
+
+# AB-17-m: regex for the `Size: X` line the autonomous-build orchestrator
+# writes into the child task body via `_child_task_body` (see
+# `autonomous_build/orchestrator.py`). Matches `Size: S`, `Size: M`, `Size: L`
+# and the three-letter `Size: XS` / `Size: XL` variants, anchored to a line
+# start so it doesn't false-match arbitrary prose. Case-insensitive.
+_SIZE_LINE_RE = re.compile(
+    r"^\s*Size:\s*(XS|S|M|L|XL)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# AB-17-m: label-style size tag (`size-S`, `size-l`, etc.) as a fallback if the
+# `Size:` line is absent — the orchestrator labels Linear issues with these
+# and they sometimes surface in the mesh task title.
+_SIZE_LABEL_RE = re.compile(
+    r"\bsize-(xs|s|m|l|xl)\b",
+    re.IGNORECASE,
+)
+
+# AB-17-m: the personas that are BUILDERS, not reviewers. Builders get
+# size-gated iteration caps so complex scaffolding tickets (size-L) get room
+# to breathe while trivial tickets stay at the size-S default (12 turns).
+# Reviewers (hawkman-qa-a) use the default cap because review loops are
+# short (1-3 turns) and blanket-applying the 20-turn ceiling would only
+# inflate cost on noisy reviewer misfires.
+_BUILDER_PERSONAS = frozenset({"alfred-coo-a", "autonomous-build-a"})
+
+
+def _peek_size_label(task: dict) -> Optional[str]:
+    """Best-effort extraction of a ticket size label from the mesh task.
+
+    Returns one of ``size-s``/``size-m``/``size-l``/``size-xs``/``size-xl``
+    (lowercase, prefixed) when the autonomous-build orchestrator has stamped
+    the ticket with a `Size:` line in the body or a `size-*` label in the
+    title. Returns ``None`` otherwise — callers should treat that as
+    "unknown, use the default cap".
+
+    Never raises: a missing size must not block dispatch.
+    """
+    for field in ("description", "title"):
+        txt = task.get(field) or ""
+        if not txt:
+            continue
+        m = _SIZE_LINE_RE.search(txt)
+        if m:
+            return f"size-{m.group(1).lower()}"
+        m = _SIZE_LABEL_RE.search(txt)
+        if m:
+            return f"size-{m.group(1).lower()}"
+    return None
+
+
+def _builder_iteration_cap(persona_name: str, task: dict) -> Optional[int]:
+    """Return the size-gated tool-iteration cap for a BUILDER dispatch.
+
+    AB-17-m: only builders (alfred-coo-a / autonomous-build-a) receive a
+    size-aware cap. Reviewers (hawkman-qa-a) and any other persona get
+    ``None`` so ``dispatcher.call_with_tools`` falls back to the module-level
+    ``MAX_TOOL_ITERATIONS`` ceiling. Kept as a pure helper so tests can
+    exercise the mapping without spinning up a full dispatcher.
+    """
+    if persona_name not in _BUILDER_PERSONAS:
+        return None
+    size = _peek_size_label(task)
+    return iteration_cap_for_size(size)
 
 
 # Module-level registry of long-running orchestrator tasks, keyed by the mesh
@@ -422,13 +487,28 @@ async def main() -> None:
                     linear_ticket=_peek_linear_ticket(task),
                     mesh_task_id=str(task.get("id")) if task.get("id") else None,
                 )
+                # AB-17-m: size-gated iteration cap for builder personas.
+                # Reviewers get None here and fall back to MAX_TOOL_ITERATIONS
+                # inside the dispatcher (short review loops don't need 20
+                # turns). Computed once so the log + the call agree.
+                iteration_cap = _builder_iteration_cap(persona.name, task)
+                size_label = _peek_size_label(task)
                 logger.info("dispatching",
                             extra={"task_id": task.get("id"),
                                    "model": model,
                                    "persona": persona.name,
                                    "linear_ticket": dispatch_ctx.linear_ticket,
                                    "tools_enabled": len(tool_specs) > 0,
-                                   "tool_count": len(tool_specs)})
+                                   "tool_count": len(tool_specs),
+                                   "iteration_cap": iteration_cap,
+                                   "size_label": size_label})
+                if iteration_cap is not None:
+                    # AB-17-m: separate human-readable log so ops can grep for
+                    # per-ticket caps without digging through structured extras.
+                    logger.info(
+                        "dispatching with iteration_cap=%d size=%s",
+                        iteration_cap, size_label or "unknown",
+                    )
 
                 try:
                     if tool_specs:
@@ -441,6 +521,7 @@ async def main() -> None:
                                 tools=tool_specs,
                                 fallback_model=persona.fallback_model,
                                 context=dispatch_ctx,
+                                max_iterations=iteration_cap,
                             )
                         finally:
                             reset_current_task_id(ctx_token)
