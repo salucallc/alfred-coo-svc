@@ -1998,3 +1998,113 @@ def test_extract_verdict_from_tool_call_args():
         "summary": "",
     }
     assert AutonomousBuildOrchestrator._extract_verdict(result_json_args) == "APPROVE"
+
+
+# ── AB-17-n: wave-dispatch deadlock detector ───────────────────────────────
+
+
+async def test_dispatch_wave_deadlock_detected_and_broken(monkeypatch, caplog):
+    """AB-17-n regression: when wave-0 children fail without PRs and
+    downstream tickets are BLOCKED on those FAILED upstreams, the
+    `_dispatch_wave` loop used to spin forever because BLOCKED is not in
+    TERMINAL_STATES and `_deps_satisfied` permanently returned False.
+    The detector must coerce the BLOCKED tickets to FAILED, emit
+    `ticket_forced_failed_deadlock` events, and exit the loop.
+    Observed in v8-full (mesh task e7f85521) + v8-full-v2 (6fdf760f)
+    2026-04-24; debug sub af2c179d.
+    """
+    import logging
+
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+
+    # T1 already FAILED (wave-0 child died without PR). T2 and T3 have
+    # blocks_in=[T1.id] so they will flip PENDING -> BLOCKED on the very
+    # first `_select_ready` tick and remain stuck forever absent the
+    # detector.
+    t1 = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t2 = _t("u2", "SAL-2", "TIR-02", 0, "tiresias", blocks_in=["u1"])
+    t3 = _t("u3", "SAL-3", "TIR-03", 0, "tiresias", blocks_in=["u1"])
+    t1.status = TicketStatus.FAILED
+    _seed_graph(orch, [t1, t2, t3])
+
+    # Stub every side-effect the dispatch loop performs so the test
+    # isolates the deadlock detector. Any of these failing in production
+    # would be surfaced by its own test; here we just need no-ops.
+    async def _noop(*args, **kwargs):
+        return None
+    async def _noop_list(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    # Replace the module-level checkpoint helper so we don't touch soul.
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+
+    # Count ticks so we can assert bounded termination (no infinite loop).
+    ticks = {"n": 0}
+    real_sleep = asyncio.sleep
+    async def counting_sleep(delay):
+        ticks["n"] += 1
+        if ticks["n"] > 10:
+            raise RuntimeError(
+                "deadlock detector failed to break loop within 10 ticks"
+            )
+        await real_sleep(0)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        counting_sleep,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="alfred_coo.autonomous_build.orchestrator"):
+        await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    # T2 + T3 should both be coerced to FAILED by the detector.
+    assert t2.status == TicketStatus.FAILED, (
+        f"expected T2 FAILED, got {t2.status}"
+    )
+    assert t3.status == TicketStatus.FAILED, (
+        f"expected T3 FAILED, got {t3.status}"
+    )
+    # T1 stays FAILED (precondition).
+    assert t1.status == TicketStatus.FAILED
+
+    # record_event fired once per coerced ticket with the upstream failure
+    # list populated.
+    forced = [
+        e for e in orch.state.events
+        if e["kind"] == "ticket_forced_failed_deadlock"
+    ]
+    assert len(forced) == 2, (
+        f"expected 2 ticket_forced_failed_deadlock events, got {len(forced)}: "
+        f"{forced}"
+    )
+    identifiers = {e["identifier"] for e in forced}
+    assert identifiers == {"SAL-2", "SAL-3"}
+    # Each coerced ticket cites T1 as the upstream failure.
+    for e in forced:
+        assert e["upstream_failed"] == ["SAL-1"], (
+            f"expected upstream_failed=['SAL-1'], got {e['upstream_failed']}"
+        )
+
+    # ERROR log mentions "deadlock".
+    deadlock_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.ERROR and "deadlock" in r.getMessage()
+    ]
+    assert deadlock_msgs, (
+        f"expected an ERROR log containing 'deadlock'; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+
+    # Loop exited within a handful of ticks (the detector breaks
+    # immediately when it fires, so ticks["n"] should be small).
+    assert ticks["n"] <= 3, (
+        f"detector took {ticks['n']} ticks to break; expected <=3"
+    )

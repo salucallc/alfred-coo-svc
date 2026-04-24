@@ -1076,6 +1076,39 @@ class AutonomousBuildOrchestrator:
                 )
                 break
 
+            # AB-17-n: detect and break deadlock where non-terminal tickets
+            # (typically BLOCKED on FAILED upstreams) cannot progress because
+            # _deps_satisfied permanently returns False. Without this, the
+            # wave spins forever emitting only checkpoint heartbeats. Coerce
+            # stuck tickets to FAILED so the wave-gate classifier can apply
+            # soft-green or halt as appropriate. Observed in v8-full (mesh
+            # task e7f85521) + v8-full-v2 (6fdf760f) 2026-04-24; debug sub
+            # af2c179d.
+            non_terminal = [
+                t for t in wave_tickets if t.status not in TERMINAL_STATES
+            ]
+            if non_terminal and not in_flight and not ready:
+                blocked_ids = [t.identifier for t in non_terminal]
+                logger.error(
+                    "wave %d deadlock: %d tickets non-terminal with no "
+                    "in-flight or ready; coercing to FAILED: %s",
+                    wave_n, len(non_terminal), blocked_ids,
+                )
+                for t in non_terminal:
+                    upstream_failed = [
+                        self.graph.nodes[u].identifier
+                        for u in (t.blocks_in or [])
+                        if u in self.graph.nodes
+                        and self.graph.nodes[u].status == TicketStatus.FAILED
+                    ]
+                    t.status = TicketStatus.FAILED
+                    self.state.record_event(
+                        "ticket_forced_failed_deadlock",
+                        identifier=t.identifier,
+                        upstream_failed=upstream_failed,
+                    )
+                break
+
             await asyncio.sleep(self.poll_sleep_sec)
 
     def _select_ready(
@@ -2022,6 +2055,42 @@ class AutonomousBuildOrchestrator:
             # Drive the loop forward — in real operation this would be the
             # dispatch loop doing the work. In tests we advance statuses
             # directly between ticks.
+
+            # AB-17-n: parity with _dispatch_wave deadlock detector. If
+            # nothing is in-flight and BLOCKED tickets remain, we are
+            # stuck on deps whose FAILED upstreams will never transition.
+            # Coerce to FAILED so the classifier below can apply
+            # soft-green or halt. Scoped tightly to BLOCKED (not all
+            # non-terminal) because PENDING tickets may legitimately
+            # transition out-of-band — that's a different deadlock class
+            # caught by _dispatch_wave before we reach here.
+            blocked = [
+                t for t in wave_tickets if t.status == TicketStatus.BLOCKED
+            ]
+            in_flight_here = [
+                t for t in wave_tickets
+                if t.status in (
+                    TicketStatus.DISPATCHED,
+                    TicketStatus.IN_PROGRESS,
+                    TicketStatus.PR_OPEN,
+                    TicketStatus.REVIEWING,
+                    TicketStatus.MERGE_REQUESTED,
+                )
+            ]
+            if blocked and not in_flight_here:
+                blocked_ids = [t.identifier for t in blocked]
+                logger.error(
+                    "wave %d gate deadlock: %d BLOCKED tickets with no "
+                    "in-flight; coercing to FAILED: %s",
+                    wave_n, len(blocked), blocked_ids,
+                )
+                for t in blocked:
+                    t.status = TicketStatus.FAILED
+                    self.state.record_event(
+                        "ticket_forced_failed_gate_deadlock",
+                        identifier=t.identifier,
+                    )
+                break
 
         # Wave is terminal. Classify.
         # AB-17-d · Plan I §1.4 — tickets that were skipped due to

@@ -338,6 +338,51 @@ async def _spawn_long_running_handler(
                 _orchestrators_by_project.pop(pid, None)
 
         orch_task.add_done_callback(_clear_project_slot)
+
+    # AB-17-n: belt-and-suspenders — if orchestrator.run() raises a
+    # BaseException that escapes its own `except Exception` guard (e.g.
+    # SystemExit, or an exception inside the final `mesh.complete` call
+    # itself), the mesh task would never be /completed and the kickoff
+    # would look "silently dead" forever. Inspect the task's exception in
+    # a done-callback and fire a best-effort failed-complete so the mesh
+    # reconciles. Paired with the _dispatch_wave / _wait_for_wave_gate
+    # deadlock detectors above.
+    def _orch_done(
+        t: asyncio.Task,
+        tid: str = task_id,
+        sid: str = settings.soul_session_id,
+    ) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            exc = RuntimeError("orchestrator cancelled")
+        except Exception:
+            # .exception() can raise InvalidStateError if called too
+            # early; defensive guard — nothing actionable here.
+            return
+        if exc is None:
+            return
+        logger.error(
+            "orchestrator task %s died unexpectedly: %r", tid, exc
+        )
+        err_body = f"handler_died: {type(exc).__name__}: {exc}"
+        try:
+            asyncio.create_task(
+                mesh.complete(
+                    tid,
+                    session_id=sid,
+                    status="failed",
+                    result={"error": err_body},
+                )
+            )
+        except RuntimeError:
+            # No running loop (shouldn't happen in this callback, but be
+            # safe — done-callbacks fire on the loop that owned the task).
+            logger.exception(
+                "could not schedule failed-complete for task %s", tid
+            )
+
+    orch_task.add_done_callback(_orch_done)
     logger.info(
         "spawned long-running handler",
         extra={
