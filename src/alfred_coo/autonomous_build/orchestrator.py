@@ -365,17 +365,16 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
 
     "TIR-01": TargetHint(
         owner="salucallc",
-        repo="tiresias-sovereign",           # DOES NOT EXIST YET — pre-create via AB-20
+        repo="tiresias-sovereign",
         paths=(),
         new_paths=(
-            "README.md",
             "pyproject.toml",
             "src/tiresias_sovereign/__init__.py",
             ".github/workflows/ci.yml",
         ),
         base_branch="main",
         branch_hint="feature/tir-01-scaffold",
-        notes="BLOCKER: salucallc/tiresias-sovereign repo does not exist on GitHub. TIR-01 is the create-repo ticket. Child cannot propose_pr against a 404 repo. Two options: (a) pre-create empty repo before dispatching TIR-01 (operator one-liner: gh repo create salucallc/tiresias-sovereign --private --add-readme); or (b) add 'repo_create' primitive to AB-10/AB-11 tool surface. Recommend (a) for speed.",
+        notes="Scaffold the sovereign Tiresias proxy package. Repo pre-created by AB-20 with README. Your PR adds pyproject.toml + package skeleton + CI workflow; run Plan A §4 Wave 1 scaffold checklist.",
     ),
 
     "TIR-02": TargetHint(
