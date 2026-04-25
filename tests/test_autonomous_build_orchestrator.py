@@ -1063,10 +1063,10 @@ def test_target_hints_s04_uses_serve_py():
 
 
 def test_target_hints_entry_count_unchanged():
-    """AB-19 adds 6 wave-0 entries (SS-01/02/06/09 + OPS-22 + ALT-01) to
-    close the `no_hint: 6` gap observed in v8-full-v4 (mesh task 83dd216d,
-    2026-04-24). Pre-AB-19 baseline was 16; post is 22."""
-    assert len(_TARGET_HINTS) == 22
+    """Hint count baseline. Bumped 22 -> 46 by PR #73 (hint-coverage 2026-04-25)
+    which added 24 wave-1 entries: TIR-03..06, ALT-02/03/04/06, F04/F05/F12,
+    OPS-04/05/16/17/23, SS-03/04/10/11/12, C-26/27/28."""
+    assert len(_TARGET_HINTS) == 46
 
 
 # ── AB-17-a · new result types (HintStatus / PathResult / VerificationResult)
