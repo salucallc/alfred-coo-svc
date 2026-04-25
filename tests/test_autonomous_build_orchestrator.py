@@ -783,10 +783,15 @@ async def test_poll_children_marks_failed_when_no_pr_url(monkeypatch):
         mesh=mesh,
     )
 
-    # One wave-0 ticket, dispatched, awaiting completion.
+    # One wave-0 ticket, dispatched, awaiting completion. SAL-2870:
+    # opt out of retry-budget so this regression test can pin the
+    # terminal-FAILED transition directly. Default budget would route
+    # the ticket through BACKED_OFF (correct new behaviour, but a
+    # different surface).
     t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
     t.status = TicketStatus.DISPATCHED
     t.child_task_id = "child-1"
+    t.retry_budget = 0  # SAL-2870: pin legacy terminal-FAILED behavior
     _seed_graph(orch, [t])
 
     # Track Linear state transitions the orchestrator requests.
@@ -855,6 +860,7 @@ async def test_poll_children_force_fails_phantom_after_threshold(monkeypatch):
     t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
     t.status = TicketStatus.DISPATCHED
     t.child_task_id = "child-phantom-1"
+    t.retry_budget = 0  # SAL-2870: pin legacy terminal-FAILED behavior
     _seed_graph(orch, [t])
 
     linear_calls = []
@@ -953,6 +959,7 @@ async def test_poll_children_handles_mesh_failed_status(monkeypatch):
     t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
     t.status = TicketStatus.DISPATCHED
     t.child_task_id = "child-failed-1"
+    t.retry_budget = 0  # SAL-2870: pin legacy terminal-FAILED behavior
     _seed_graph(orch, [t])
 
     linear_calls = []
@@ -2640,6 +2647,10 @@ async def test_dispatch_wave_deadlock_detected_and_broken(monkeypatch, caplog):
 
     orch = _mk_orchestrator()
     orch.poll_sleep_sec = 0
+    # SAL-2870: collapse grace + retry so this AB-17-n test isolates
+    # the pure deadlock-coerce semantics without waiting for the new
+    # 15-min grace window or routing through BACKED_OFF.
+    orch.deadlock_grace_sec = 0
 
     # T1 already FAILED (wave-0 child died without PR). T2 and T3 have
     # blocks_in=[T1.id] so they will flip PENDING -> BLOCKED on the very
@@ -2649,6 +2660,12 @@ async def test_dispatch_wave_deadlock_detected_and_broken(monkeypatch, caplog):
     t2 = _t("u2", "SAL-2", "TIR-02", 0, "tiresias", blocks_in=["u1"])
     t3 = _t("u3", "SAL-3", "TIR-03", 0, "tiresias", blocks_in=["u1"])
     t1.status = TicketStatus.FAILED
+    # SAL-2870: T1 is the failing upstream the test fixture pretends has
+    # already exhausted retries. Pin retry_budget=0 on T2/T3 so the post-
+    # pass doesn't bounce them through BACKED_OFF instead of FAILED.
+    t1.retry_budget = 0
+    t2.retry_budget = 0
+    t3.retry_budget = 0
     _seed_graph(orch, [t1, t2, t3])
 
     # Stub every side-effect the dispatch loop performs so the test
@@ -3442,4 +3459,538 @@ async def test_complete_kickoff_canceled_posts_failed_with_cancel_flag(monkeypat
     assert rec["result"]["cancel_reason"] == "test_reason"
     assert "external_cancel" in rec["result"]["error"]
     assert "final_state_snapshot" in rec["result"]
+
+
+# ── SAL-2870: dependency-aware retry + deadlock grace + topo dispatch ──────
+#
+# v7o crashed at 18:09:19 UTC 2026-04-25 with `wave 1 deadlock: 17 tickets
+# non-terminal with no in-flight or ready; coercing to FAILED`. The 17
+# downstream tickets were BLOCKED on FAILED upstreams (SS-10 et al.).
+# AB-17-n's same-tick coerce-to-FAILED cascaded the entire wave-1 tail to
+# FAILED before any retry could land. SAL-2870 introduces:
+#   1. Per-ticket retry budget — FAILED -> BACKED_OFF -> PENDING re-dispatch
+#   2. BACKED_OFF timer -> PENDING flip-back after retry_backoff_sec
+#   3. Re-evaluate downstream readiness on every tick (not just on
+#      MERGED_GREEN transition)
+#   4. Deadlock detector grace period (15 min default) before coerce
+#   5. Topological dispatch order within wave (deps first)
+
+
+async def test_sal_2870_retry_failed_to_backed_off(monkeypatch):
+    """Component #1: a ticket FAILED with retry budget remaining is
+    routed through BACKED_OFF instead of terminal FAILED, with
+    retry_count incremented and child_task_id cleared so the next
+    dispatch creates a fresh sub.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    # Tunables: budget=2, backoff=300s (default).
+    assert orch.retry_budget == 2
+    assert orch.retry_backoff_sec == 300
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-1"
+    _seed_graph(orch, [t])
+
+    async def _fake_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Child completes without a PR -> orchestrator wants to mark FAILED.
+    mesh.completed_tasks.append({
+        "id": "child-1",
+        "status": "completed",
+        "result": {"summary": "no PR opened"},
+    })
+
+    await orch._poll_children()
+
+    # Retry sweep should bounce the FAILED to BACKED_OFF.
+    assert t.status == TicketStatus.BACKED_OFF, (
+        f"expected BACKED_OFF after retry sweep, got {t.status}"
+    )
+    assert t.retry_count == 1
+    assert t.child_task_id is None  # cleared for fresh dispatch
+    assert t.backed_off_at is not None and t.backed_off_at > 0
+
+    # state.events should record both the failure and the back-off.
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "ticket_failed" in kinds
+    assert "ticket_backed_off" in kinds
+    bo = next(e for e in orch.state.events if e["kind"] == "ticket_backed_off")
+    assert bo["identifier"] == "SAL-1"
+    assert bo["retry_count"] == 1
+    assert bo["retry_budget"] == 2
+
+
+async def test_sal_2870_retry_exhausted_lands_terminal_failed(monkeypatch):
+    """Component #1: when retry_count == retry_budget, FAILED is
+    terminal — no further BACKED_OFF bounce.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-2"
+    t.retry_budget = 2
+    t.retry_count = 2  # already exhausted
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    mesh.completed_tasks.append({
+        "id": "child-2",
+        "status": "completed",
+        "result": {"summary": "no PR"},
+    })
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"expected terminal FAILED on exhausted budget, got {t.status}"
+    )
+    assert t.retry_count == 2
+    bo = [e for e in orch.state.events if e["kind"] == "ticket_backed_off"]
+    assert not bo, "no back-off when budget exhausted"
+
+
+async def test_sal_2870_retry_budget_zero_disables_retry(monkeypatch):
+    """retry_budget=0 (legacy semantics) keeps FAILED terminal."""
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-3"
+    t.retry_budget = 0
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    mesh.completed_tasks.append({
+        "id": "child-3",
+        "status": "completed",
+        "result": {"summary": "no PR"},
+    })
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED
+
+
+async def test_sal_2870_backed_off_wakes_after_window():
+    """Component #2: a ticket BACKED_OFF at t=0 is still BACKED_OFF at
+    t=4min, but at t=5min01s it wakes back to PENDING and is re-dispatched
+    next tick.
+    """
+    import time
+    orch = _mk_orchestrator()
+    orch.retry_backoff_sec = 5 * 60  # 5 min default
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t.status = TicketStatus.BACKED_OFF
+    t.retry_count = 1
+    t.retry_budget = 2
+    t.backed_off_at = time.time() - (4 * 60)  # 4 min ago
+    _seed_graph(orch, [t])
+
+    woken = orch._wake_backed_off_tickets()
+    assert woken == [], "ticket below backoff window should not wake"
+    assert t.status == TicketStatus.BACKED_OFF
+
+    # Advance: now elapsed = 5min 1s.
+    t.backed_off_at = time.time() - (5 * 60 + 1)
+    woken = orch._wake_backed_off_tickets()
+    assert woken == [t]
+    assert t.status == TicketStatus.PENDING
+    assert t.backed_off_at is None
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "ticket_woke_from_backoff" in kinds
+
+
+async def test_sal_2870_deadlock_grace_no_coerce_below_threshold(monkeypatch):
+    """Component #4: 14 min of in_flight=0 + ready=0 must NOT coerce to
+    FAILED (sub-grace). Only at 15 min does the detector fire.
+    """
+    import logging
+    import time
+
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    orch.deadlock_grace_sec = 15 * 60
+    # Disable retry so the BLOCKED tickets don't get bounced through
+    # BACKED_OFF (which would defeat the deadlock-only assertion).
+    orch.retry_budget = 0
+
+    t1 = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t2 = _t("u2", "SAL-2", "TIR-02", 0, "tiresias", blocks_in=["u1"])
+    t1.status = TicketStatus.FAILED
+    t1.retry_budget = 0
+    t2.retry_budget = 0
+    _seed_graph(orch, [t1, t2])
+
+    async def _noop(*args, **kwargs):
+        return None
+    async def _noop_list(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+
+    # Hold time at "14 min after grace armed" — the detector should not
+    # fire. We let the loop run a few ticks, then bail externally.
+    real_time = time.time
+    armed_at = real_time()
+    def _fake_time():
+        # Always 14 min past arm — never crosses the 15-min threshold.
+        return armed_at + 14 * 60
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.time.time", _fake_time
+    )
+
+    ticks = {"n": 0}
+    real_sleep = asyncio.sleep
+    async def counting_sleep(delay):
+        ticks["n"] += 1
+        if ticks["n"] >= 5:
+            # Force exit: flip both tickets so the loop's all-terminal
+            # check trips. We're proving the detector did NOT coerce.
+            t2.status = TicketStatus.FAILED  # external resolution
+        await real_sleep(0)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        counting_sleep,
+    )
+
+    await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    forced = [
+        e for e in orch.state.events
+        if e["kind"] == "ticket_forced_failed_deadlock"
+    ]
+    assert forced == [], (
+        f"detector must NOT coerce within grace window; got {forced}"
+    )
+
+
+async def test_sal_2870_deadlock_grace_coerces_after_threshold(
+    monkeypatch, caplog
+):
+    """Component #4: at 15:01 (>= grace) the detector fires and coerces
+    BLOCKED tickets to FAILED.
+    """
+    import logging
+    import time
+
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    orch.deadlock_grace_sec = 15 * 60
+    orch.retry_budget = 0
+
+    t1 = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t2 = _t("u2", "SAL-2", "TIR-02", 0, "tiresias", blocks_in=["u1"])
+    t1.status = TicketStatus.FAILED
+    t1.retry_budget = 0
+    t2.retry_budget = 0
+    _seed_graph(orch, [t1, t2])
+
+    async def _noop(*args, **kwargs):
+        return None
+    async def _noop_list(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+
+    # Pre-arm: set _no_progress_since to "16 minutes ago" so the very
+    # first tick of _dispatch_wave's grace check sees stuck_for >= grace.
+    # This bypasses the chicken-and-egg of mocking time.time across the
+    # snapshot + watchdog + detector all in one tick.
+    orch._no_progress_since = time.time() - (16 * 60)
+
+    ticks = {"n": 0}
+    real_sleep = asyncio.sleep
+    async def counting_sleep(delay):
+        ticks["n"] += 1
+        if ticks["n"] > 10:
+            raise RuntimeError("grace detector failed within 10 ticks")
+        await real_sleep(0)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        counting_sleep,
+    )
+
+    with caplog.at_level(
+        logging.ERROR, logger="alfred_coo.autonomous_build.orchestrator"
+    ):
+        await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    assert t2.status == TicketStatus.FAILED, (
+        f"expected coerce-to-FAILED past grace, got {t2.status}"
+    )
+    forced = [
+        e for e in orch.state.events
+        if e["kind"] == "ticket_forced_failed_deadlock"
+    ]
+    assert len(forced) == 1
+    assert forced[0]["identifier"] == "SAL-2"
+    # stuck_for_sec field (new in SAL-2870) reports elapsed time.
+    assert forced[0]["stuck_for_sec"] >= 15 * 60
+
+
+def test_sal_2870_topo_sort_orders_deps_before_dependents():
+    """Component #5: graph A->B->C, ready=[B, C, A] (out of order),
+    after _topo_sort = [A, B, C].
+    """
+    orch = _mk_orchestrator()
+    a = _t("ua", "SAL-A", "TIR-A", 0, "tiresias")
+    b = _t("ub", "SAL-B", "TIR-B", 0, "tiresias", blocks_in=["ua"])
+    c = _t("uc", "SAL-C", "TIR-C", 0, "tiresias", blocks_in=["ub"])
+    _seed_graph(orch, [a, b, c])
+
+    out = orch._topo_sort([b, c, a])
+    assert [t.identifier for t in out] == ["SAL-A", "SAL-B", "SAL-C"], (
+        f"expected [A, B, C], got {[t.identifier for t in out]}"
+    )
+
+
+def test_sal_2870_topo_sort_preserves_independent_ordering():
+    """No edges among the ready set -> stable order falls back to
+    (CP, identifier).
+    """
+    orch = _mk_orchestrator()
+    a = _t("ua", "SAL-A", "TIR-A", 0, "tiresias")
+    b = _t("ub", "SAL-B", "TIR-B", 0, "tiresias", is_critical_path=True)
+    c = _t("uc", "SAL-C", "TIR-C", 0, "tiresias")
+    _seed_graph(orch, [a, b, c])
+
+    # CP first, then identifier: [B (CP), A, C].
+    out = orch._topo_sort([c, a, b])
+    assert [t.identifier for t in out] == ["SAL-B", "SAL-A", "SAL-C"]
+
+
+def test_sal_2870_topo_sort_handles_cycles_gracefully():
+    """A cycle (A->B->A) returns all tickets (in identifier order for the
+    unreachable remainder) and emits a WARNING — never drops items.
+    """
+    import logging
+    orch = _mk_orchestrator()
+    a = _t("ua", "SAL-A", "TIR-A", 0, "tiresias", blocks_in=["ub"])
+    b = _t("ub", "SAL-B", "TIR-B", 0, "tiresias", blocks_in=["ua"])
+    _seed_graph(orch, [a, b])
+
+    out = orch._topo_sort([a, b])
+    assert {t.identifier for t in out} == {"SAL-A", "SAL-B"}
+
+
+def test_sal_2870_select_ready_uses_topo_within_cp_tier():
+    """Component #5 integration: _select_ready returns tickets in topo
+    order within each critical-path tier.
+    """
+    orch = _mk_orchestrator()
+    # Both CP, A blocks B. Even though B's identifier sorts ahead of A,
+    # topo must put A first.
+    a = _t("ua", "SAL-Z-A", "TIR-A", 0, "tiresias", is_critical_path=True)
+    b = _t("ub", "SAL-A-B", "TIR-B", 0, "tiresias",
+           is_critical_path=True, blocks_in=["ua"])
+    a.blocks_out = ["ub"]
+    _seed_graph(orch, [a, b])
+
+    ready = orch._select_ready([a, b], in_flight=[])
+    # A (no deps) must come before B even though "SAL-A-B" < "SAL-Z-A".
+    # B is BLOCKED on A so doesn't appear in ready set yet.
+    assert ready == [a]
+
+    # Make A green; now B becomes ready.
+    a.status = TicketStatus.MERGED_GREEN
+    ready = orch._select_ready([a, b], in_flight=[])
+    assert ready == [b]
+
+
+async def test_sal_2870_cascading_unblock_on_retry(monkeypatch):
+    """Cascading unblock: A FAILED -> BACKED_OFF; A retries -> MERGED_GREEN;
+    B (depends on A) unblocks even though it was BLOCKED multiple ticks
+    ago. The _refresh_blocked_status pre-pass in _poll_children handles
+    this without needing an upstream transition event.
+    """
+    import time
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    a = _t("ua", "SAL-A", "TIR-A", 0, "tiresias")
+    b = _t("ub", "SAL-B", "TIR-B", 0, "tiresias", blocks_in=["ua"])
+    a.blocks_out = ["ub"]
+    # Setup: A is in BACKED_OFF (just failed once), B is BLOCKED waiting
+    # for A.
+    a.status = TicketStatus.BACKED_OFF
+    a.retry_count = 1
+    a.retry_budget = 2
+    a.backed_off_at = time.time() - 1000  # already past any sane backoff
+    b.status = TicketStatus.BLOCKED
+    _seed_graph(orch, [a, b])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    # Tick 1: A wakes from backoff (BACKED_OFF -> PENDING). B stays BLOCKED.
+    await orch._poll_children()
+    assert a.status == TicketStatus.PENDING
+    assert b.status == TicketStatus.BLOCKED
+
+    # External: A is dispatched and merges green.
+    a.status = TicketStatus.MERGED_GREEN
+
+    # Tick 2: orchestrator re-evaluates. B should unblock.
+    await orch._poll_children()
+    assert b.status == TicketStatus.PENDING, (
+        f"B should unblock once A is MERGED_GREEN; got {b.status}"
+    )
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "ticket_unblocked" in kinds
+
+
+async def test_sal_2870_v7o_synthetic_cascade_recovers(monkeypatch):
+    """Synthetic v7o-style cascade: TIR-02 fails on first attempt ->
+    BACKED_OFF -> retries -> MERGED_GREEN -> TIR-03..06 unblock.
+    Previously this whole cascade FAILED at the same-tick deadlock; now
+    it succeeds.
+    """
+    import time
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    orch.retry_backoff_sec = 0  # zero-window for fast test
+    orch.deadlock_grace_sec = 999999  # disable grace coerce
+
+    # 5 tickets in a chain: TIR-02 -> TIR-03 -> ... -> TIR-06.
+    chain = []
+    prev_id = None
+    for i in range(2, 7):
+        kwargs = {}
+        if prev_id:
+            kwargs["blocks_in"] = [prev_id]
+        t = _t(f"u{i}", f"SAL-{i}", f"TIR-0{i}", 0, "tiresias", **kwargs)
+        chain.append(t)
+        prev_id = t.id
+    # Wire blocks_out for parity.
+    for i in range(len(chain) - 1):
+        chain[i].blocks_out = [chain[i + 1].id]
+
+    tir_02 = chain[0]
+    tir_03 = chain[1]
+    tir_04 = chain[2]
+    tir_05 = chain[3]
+    tir_06 = chain[4]
+
+    # TIR-02 starts DISPATCHED; downstream all BLOCKED.
+    tir_02.status = TicketStatus.DISPATCHED
+    tir_02.child_task_id = "child-tir02-1"
+    for t in (tir_03, tir_04, tir_05, tir_06):
+        t.status = TicketStatus.BLOCKED
+    _seed_graph(orch, chain)
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    # Tick 1: TIR-02's first attempt fails (no PR).
+    mesh.completed_tasks.append({
+        "id": "child-tir02-1",
+        "status": "completed",
+        "result": {"summary": "no PR opened"},
+    })
+    await orch._poll_children()
+
+    # Retry sweep should put TIR-02 in BACKED_OFF.
+    assert tir_02.status == TicketStatus.BACKED_OFF
+    assert tir_02.retry_count == 1
+    # Downstream still BLOCKED.
+    assert tir_03.status == TicketStatus.BLOCKED
+
+    # Tick 2: backoff window is 0s -> TIR-02 wakes back to PENDING.
+    mesh.completed_tasks.clear()
+    await orch._poll_children()
+    assert tir_02.status == TicketStatus.PENDING
+
+    # Simulate retry: dispatch + merge green.
+    tir_02.status = TicketStatus.MERGED_GREEN
+
+    # Tick 3: downstream unblock cascade.
+    await orch._poll_children()
+    assert tir_03.status == TicketStatus.PENDING, (
+        f"TIR-03 should unblock once TIR-02 is green; got {tir_03.status}"
+    )
+    # TIR-04..06 are still BLOCKED on TIR-03 etc — they don't all
+    # unblock at once because the chain is sequential. But the
+    # important assertion is that the recovery path is reachable.
+    assert tir_04.status == TicketStatus.BLOCKED
+    assert tir_05.status == TicketStatus.BLOCKED
+    assert tir_06.status == TicketStatus.BLOCKED
+
+
+async def test_sal_2870_payload_overrides_retry_tunables():
+    """Component #1+2+4: kickoff payload's retry_budget,
+    retry_backoff_sec, deadlock_grace_sec all flow through to the
+    instance attributes. Bad values fall back to defaults with a
+    warning (no crash).
+    """
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p",
+        "retry_budget": 5,
+        "retry_backoff_sec": 600,
+        "deadlock_grace_sec": 1800,
+    })
+    # _parse_payload runs lazily — call it directly.
+    orch._parse_payload()
+    assert orch.retry_budget == 5
+    assert orch.retry_backoff_sec == 600
+    assert orch.deadlock_grace_sec == 1800
+
+    # Bad values: silent fallback to defaults, no exception.
+    orch2 = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p",
+        "retry_budget": "not-a-number",
+        "retry_backoff_sec": None,  # ignored
+        "deadlock_grace_sec": [],  # rejected
+    })
+    orch2._parse_payload()
+    assert orch2.retry_budget == 2  # default
+    assert orch2.deadlock_grace_sec == 15 * 60  # default
+
+
+async def test_sal_2870_state_round_trip_carries_retry_fields():
+    """Snapshot/restore pins the retry_count + backed_off_at +
+    no_progress_since fields so a daemon bounce doesn't reset retry
+    state.
+    """
+    from alfred_coo.autonomous_build.state import OrchestratorState
+    s = OrchestratorState(
+        kickoff_task_id="k",
+        retry_counts={"u1": 1, "u2": 2},
+        backed_off_at={"u1": 1234.5},
+        no_progress_since=999.0,
+    )
+    blob = s.to_json()
+    s2 = OrchestratorState.from_json(blob)
+    assert s2.retry_counts == {"u1": 1, "u2": 2}
+    assert s2.backed_off_at == {"u1": 1234.5}
+    assert s2.no_progress_since == 999.0
 

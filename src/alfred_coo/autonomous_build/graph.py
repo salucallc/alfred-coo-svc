@@ -27,7 +27,15 @@ logger = logging.getLogger("alfred_coo.autonomous_build.graph")
 class TicketStatus(str, Enum):
     """Lifecycle state of one ticket in the orchestrator. Strings match the
     values in plan F §2 verbatim so soul-memory dumps are stable across
-    refactors."""
+    refactors.
+
+    SAL-2870 (2026-04-25): added ``BACKED_OFF``. A ticket transitions here
+    instead of FAILED when ``retry_count < retry_budget``. After the
+    configurable backoff window (`retry_backoff_sec`, default 5 min) it
+    flips back to PENDING so the dispatch loop re-selects it. Sits between
+    BLOCKED and FAILED semantically: not terminal, not in-flight, just
+    cooling.
+    """
 
     PENDING = "pending"
     DISPATCHED = "dispatched"
@@ -38,9 +46,12 @@ class TicketStatus(str, Enum):
     MERGED_GREEN = "merged_green"
     FAILED = "failed"
     BLOCKED = "blocked"
+    BACKED_OFF = "backed_off"
 
 
 # Terminal states — once a ticket lands here the wave loop stops polling it.
+# BACKED_OFF is intentionally NOT terminal: the deadlock detector and wave
+# gate must keep waiting through the backoff window for re-dispatch.
 TERMINAL_STATES: frozenset[TicketStatus] = frozenset(
     {TicketStatus.MERGED_GREEN, TicketStatus.FAILED}
 )
@@ -107,6 +118,20 @@ class Ticket:
     # after REQUEST_CHANGES so the retry budget only applies per review
     # attempt.
     silent_review_retries: int = 0
+    # SAL-2870: per-ticket retry budget. A FAILED transition consumes one
+    # ``retry_count`` slot and bounces the ticket through BACKED_OFF →
+    # PENDING for re-dispatch instead of landing in terminal FAILED. The
+    # default budget (2) is overrideable per-kickoff via the top-level
+    # ``retry_budget`` payload field. ``retry_budget`` of 0 disables retry
+    # entirely (legacy behaviour). Counter never decrements; once exhausted
+    # the next FAILED is terminal.
+    retry_budget: int = 2
+    retry_count: int = 0
+    # Wall-clock when the ticket entered BACKED_OFF. Read by
+    # ``_poll_children`` on every tick to decide if the backoff window has
+    # elapsed and the ticket should flip back to PENDING. ``None`` outside
+    # the BACKED_OFF state.
+    backed_off_at: Optional[float] = None
     # Raw Linear state name for debugging / resume logic.
     linear_state: str = ""
 
