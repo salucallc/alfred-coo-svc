@@ -198,11 +198,13 @@ def test_alfred_coo_a_prompt_addresses_no_code_trap():
     assert "no-code" in _alfred_prompt()
 
 
-def test_alfred_coo_a_prompt_enumerates_all_six_steps():
-    """The 6-step protocol must name STEP 0 through STEP 6 explicitly so a
-    model parsing the prompt cannot skip or collapse a step."""
+def test_alfred_coo_a_prompt_enumerates_all_steps():
+    """The protocol must name STEP 0 through STEP 7 explicitly so a model
+    parsing the prompt cannot skip or collapse a step. AB-17-s extended
+    the original 6-step protocol with STEP 4 (APE/V artifact pair) and
+    renumbered the prior STEP 4..6 to STEP 5..7."""
     prompt = _alfred_prompt()
-    for i in range(7):  # STEP 0..STEP 6 inclusive
+    for i in range(8):  # STEP 0..STEP 7 inclusive
         assert f"STEP {i}" in prompt, f"missing STEP {i} marker"
 
 
@@ -228,7 +230,9 @@ def test_alfred_coo_a_prompt_contains_all_mandated_phrases():
     for phrase in mandated_exact:
         assert phrase in prompt, f"mandated phrase missing: {phrase!r}"
     assert "do not guess" in lower, "mandated phrase missing: 'Do NOT guess'"
-    for i in range(7):
+    # AB-17-s: STEP 4 added (APE/V artifact pair); old STEP 4..6 renumbered
+    # to STEP 5..7. range(8) keeps the floor at STEP 0..STEP 7 inclusive.
+    for i in range(8):
         assert f"STEP {i}" in prompt, f"missing STEP {i} marker"
 
 
@@ -442,4 +446,140 @@ def test_hawkman_prompt_contains_all_ab17e_markers():
     for marker in mandated:
         assert marker in prompt, (
             f"hawkman-qa-a missing AB-17-e marker {marker!r}"
+        )
+
+
+# ── AB-17-s · builder writes plans/v1-ga/<TICKET>.md + cites APE/V ─────────
+#
+# Hawkman's GATE 1 grep-matches the PR body for a verbatim APE/V citation
+# pulled from a per-ticket plan doc (plans/v1-ga/<TICKET>.md). Pre-AB-17-s
+# the alfred-coo-a builder produced neither artifact, so every autonomous PR
+# REQUEST_CHANGES on Gate 1. Validated 2026-04-24: SAL-2663 PR #22 and
+# SAL-2636 PR #68 both rejected on the same Gate1 + Gate3 reasoning. AB-17-s
+# extends the builder prompt with a new STEP 4 mandating both artifacts; the
+# tests below lock the contract so a future edit cannot silently drop it.
+
+
+def test_alfred_coo_a_prompt_mentions_plans_v1_ga_path():
+    """STEP 4(a): the prompt must reference the literal `plans/v1-ga/`
+    directory so the builder writes the per-ticket plan doc to the path
+    hawkman's GATE 1 grep-matches against."""
+    assert "plans/v1-ga/" in _alfred_prompt(), (
+        "alfred-coo-a missing `plans/v1-ga/` path; hawkman GATE 1 will "
+        "REQUEST_CHANGES with reason 'missing APE/V citation' every time"
+    )
+
+
+def test_alfred_coo_a_prompt_mentions_apev_citation_section_heading():
+    """STEP 4(b): the prompt must cite the exact PR-body heading
+    `## APE/V Citation` (two pound signs, one space, exact case) so the
+    PR body matches what hawkman's GATE 1 grep is looking for."""
+    assert "## APE/V Citation" in _alfred_prompt(), (
+        "alfred-coo-a missing `## APE/V Citation` section heading; hawkman "
+        "GATE 1 cannot find the citation block"
+    )
+
+
+def test_alfred_coo_a_prompt_has_ab17s_artifact_step():
+    """STEP 4 (AB-17-s) introduces the APE/V artifact pair — the prompt
+    must literally label this as STEP 4 with `Build the APE/V artifact
+    pair` so a model parsing top-down lands on it before the propose_pr
+    call."""
+    prompt = _alfred_prompt()
+    assert "STEP 4" in prompt
+    assert "Build the APE/V artifact pair" in prompt, (
+        "STEP 4 phrasing missing; AB-17-s artifact-mandate regress"
+    )
+
+
+def test_alfred_coo_a_prompt_template_has_four_required_sections():
+    """STEP 4(a): the inline template for plans/v1-ga/<TICKET>.md must
+    enumerate the four content sections so the builder produces a
+    consistent per-ticket plan doc shape."""
+    prompt = _alfred_prompt()
+    for section in (
+        "## Target paths",
+        "## Acceptance criteria",
+        "## Verification approach",
+        "## Risks",
+    ):
+        assert section in prompt, (
+            f"alfred-coo-a STEP 4 template missing {section!r} section; "
+            "AB-17-s plan-doc template regress"
+        )
+
+
+def test_alfred_coo_a_step5_references_plan_doc_in_files_dict():
+    """STEP 5: the propose_pr call must include the plans/v1-ga/<TICKET>.md
+    plan doc in its files dict — the builder cannot split the artifact and
+    the PR body across two tool calls."""
+    prompt = _alfred_prompt()
+    # The plan-doc path must appear in the STEP 5 narrative explaining
+    # that propose_pr's files dict gets the new plan-doc entry on top of
+    # ## Target paths.
+    assert "plans/v1-ga/<TICKET>.md" in prompt, (
+        "STEP 5 missing reference to plans/v1-ga/<TICKET>.md as a "
+        "propose_pr files dict entry"
+    )
+
+
+def test_alfred_coo_a_prompt_cites_validation_evidence():
+    """The prompt must point at SAL-2663 PR #22 and SAL-2636 PR #68 as
+    the validating evidence for why this discipline is mandatory.
+    Without the evidence, future maintainers may strip the gate."""
+    prompt = _alfred_prompt()
+    assert "SAL-2663" in prompt and "SAL-2636" in prompt, (
+        "STEP 4 must cite the rejected-PR evidence so the rationale "
+        "is preserved alongside the contract"
+    )
+
+
+def test_alfred_coo_a_and_hawkman_apev_contract_aligned():
+    """Cross-check: hawkman's GATE 1 reason-string is `missing APE/V
+    citation`; alfred-coo-a must explicitly call out that this is the
+    failure mode it is preventing. Both prompts must agree on the
+    artifact location (plans/v1-ga/ + ## APE/V Citation in PR body)
+    or the builder + reviewer drift apart again."""
+    alfred = _alfred_prompt()
+    hawkman = _hawkman_prompt()
+    # Failure-mode string is shared
+    assert "missing APE/V citation" in alfred, (
+        "alfred-coo-a must reference hawkman's exact GATE 1 reason "
+        "string so the model knows what it is preventing"
+    )
+    assert "missing APE/V citation" in hawkman
+    # Plan-doc directory is shared
+    assert "plans/v1-ga/" in alfred
+    assert "plans/v1-ga/" in hawkman
+    # Verbatim-citation requirement is shared
+    assert (
+        "cite the acceptance lines verbatim" in hawkman
+        or "verbatim citation" in hawkman
+    )
+    assert "verbatim" in alfred, (
+        "alfred-coo-a must instruct verbatim quoting of acceptance "
+        "lines so hawkman's GATE 1 grep matches"
+    )
+
+
+def test_alfred_coo_a_prompt_contains_all_ab17s_markers():
+    """AB-17-s aggregate guard. Single-shot regression check covering
+    every load-bearing marker introduced by this ticket. Mirrors the
+    AB-17-e/f aggregate-check style."""
+    prompt = _alfred_prompt()
+    mandated = [
+        "plans/v1-ga/",
+        "## APE/V Citation",
+        "Build the APE/V artifact pair",
+        "## Target paths",
+        "## Acceptance criteria",
+        "## Verification approach",
+        "## Risks",
+        "missing APE/V citation",
+        "SAL-2663",
+        "SAL-2636",
+    ]
+    for marker in mandated:
+        assert marker in prompt, (
+            f"alfred-coo-a missing AB-17-s marker {marker!r}"
         )
