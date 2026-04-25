@@ -85,6 +85,36 @@ class MeshClient:
         }
         return await self._make_request("POST", url, headers=headers, json=data)
 
+    async def get_task(self, task_id: str) -> dict | None:
+        """AB-17-q: best-effort fetch of a single mesh task by id.
+
+        soul-svc v2.0.0 does not expose ``GET /v1/mesh/tasks/{id}``, so we
+        scan the small set of recent ``failed``/``completed``/``claimed``
+        listings and filter client-side. Returns the matching task record
+        or ``None`` if not found.
+
+        Used by the autonomous_build orchestrator to detect an external
+        cancel signal: an operator who PATCHes the kickoff task to
+        ``status="failed"`` (or sets ``result.cancel=true`` on a
+        ``failed`` complete) will cause this helper to return that record
+        on the next tick. The orchestrator then enters drain mode without
+        a daemon restart.
+        """
+        # Scan the lifecycle states a cancel signal could surface in.
+        # Order matters: check `failed` first (most common cancel path),
+        # then `completed` (idempotency — cancel of an already-completing
+        # task), then `claimed` (forward-compat if soul-svc later adds a
+        # `canceled` status without re-listing under `failed`).
+        for status in ("failed", "completed", "claimed"):
+            try:
+                tasks = await self.list_tasks(status=status, limit=100)
+            except Exception:
+                continue
+            for t in tasks or []:
+                if isinstance(t, dict) and t.get("id") == task_id:
+                    return t
+        return None
+
     async def claim(self, task_id: str, session_id: str, node_id: str) -> dict:
         url = f"/v1/mesh/tasks/{task_id}/claim"
         headers = self._get_auth_header()

@@ -1183,6 +1183,26 @@ class AutonomousBuildOrchestrator:
         self._repo_missing_tickets: set[str] = set()
         self._emitted_blocks: set[str] = set()
 
+        # AB-17-q · external cancel signal (SAL-2756, 2026-04-24).
+        # An operator who PATCHes the kickoff task's lifecycle state to
+        # ``failed`` (with ``result.cancel == True``, or just ``status ==
+        # "failed"``) signals this orchestrator to drain gracefully. Set
+        # by ``_check_cancel_signal`` once per dispatch tick. When True:
+        #   - ``_drain_mode`` is also flipped on so ``_dispatch_wave``
+        #     stops selecting new ready tickets.
+        #   - the wave loop in ``_run_inner`` exits cleanly after the
+        #     current wave's in-flight children finish (or are skipped
+        #     by the gate-deadlock detector if they crashed).
+        #   - ``_complete_kickoff_canceled`` runs instead of
+        #     ``_run_on_all_green_actions`` + ``_complete_kickoff``, so
+        #     the kickoff record stays consistent with the operator's
+        #     intent rather than racing them to a ``completed`` write.
+        # Replaces the restart-as-cancel pattern (full daemon bounce
+        # observed costing ~60s and killing in-flight builds, 2026-04-24
+        # task db4a7b9f).
+        self._cancel_requested: bool = False
+        self._cancel_reason: str = ""
+
     # ── public entry point ─────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -1253,9 +1273,29 @@ class AutonomousBuildOrchestrator:
                 )
                 self._verified_hints = {}
             await self._dispatch_wave(wave)
+            # AB-17-q · external cancel signal (SAL-2756). If
+            # `_dispatch_wave` returned because the operator canceled the
+            # run (drain finished), skip the wave gate (it would raise on
+            # non-terminal tickets that never got dispatched) and exit
+            # the wave loop. Graceful-cancel terminal handler runs below.
+            if self._cancel_requested:
+                logger.info(
+                    "wave %d: cancel observed during dispatch; skipping "
+                    "wave gate and exiting wave loop", wave,
+                )
+                self.state.record_event("wave_exit_canceled", wave=wave)
+                break
             await self._wait_for_wave_gate(wave)
             self.state.record_event("wave_exit", wave=wave)
             await checkpoint(self.state, self.soul, self.task_id)
+
+        # 5. AB-17-q: branch on cancel before running on_all_green or the
+        # standard complete-kickoff path. on_all_green spawns more child
+        # tasks (the post-merge actions) which would defeat the cancel
+        # intent; route to the cancel-terminal helper instead.
+        if self._cancel_requested:
+            await self._complete_kickoff_canceled()
+            return
 
         # 5. on_all_green.
         await self._run_on_all_green_actions()
@@ -1500,6 +1540,14 @@ class AutonomousBuildOrchestrator:
         await self._mark_repo_missing_tickets(wave_tickets)
 
         while True:
+            # AB-17-q · external cancel signal (SAL-2756). Polled at the
+            # top of every tick so the operator's PATCH is observed within
+            # one `poll_sleep_sec` cycle (45s by default). Sets
+            # `_drain_mode` so the dispatch loop below skips new children
+            # automatically; the early-exit check at the bottom of the
+            # tick lets us break the moment in-flight drains.
+            await self._check_cancel_signal()
+
             # ── select ready ────────────────────────────────────────────
             in_flight = self._in_flight_for_wave(wave_n)
             ready = self._select_ready(wave_tickets, in_flight)
@@ -1577,6 +1625,30 @@ class AutonomousBuildOrchestrator:
                     wave_n,
                 )
                 break
+
+            # AB-17-q · graceful-cancel exit. Once cancel is requested AND
+            # no children remain in-flight for this wave, the drain is
+            # complete: break out of the dispatch loop without raising.
+            # The wave gate is skipped by `_run_inner` so non-terminal
+            # tickets that never got dispatched don't trip the gate's
+            # critical-path / soft-green math. `in_flight` was computed
+            # at the top of this tick — re-checking against the current
+            # ticket statuses (which `_poll_children` may have just
+            # advanced) is what we want.
+            if self._cancel_requested:
+                still_in_flight = self._in_flight_for_wave(wave_n)
+                if not still_in_flight:
+                    logger.warning(
+                        "[cancel] wave %d drained (no in-flight); "
+                        "exiting dispatch loop on cancel signal",
+                        wave_n,
+                    )
+                    self.state.record_event(
+                        "wave_dispatch_canceled",
+                        wave=wave_n,
+                        reason=self._cancel_reason,
+                    )
+                    break
 
             # AB-17-n: detect and break deadlock where non-terminal tickets
             # (typically BLOCKED on FAILED upstreams) cannot progress because
@@ -3286,6 +3358,125 @@ class AutonomousBuildOrchestrator:
         except Exception:
             logger.exception(
                 "failed to mark kickoff task %s complete", self.task_id
+            )
+
+    # ── AB-17-q · external cancel signal (SAL-2756) ─────────────────────────
+
+    async def _check_cancel_signal(self) -> bool:
+        """Poll the kickoff task's lifecycle state for an external cancel
+        signal. Returns ``True`` iff a cancel was just observed (so the
+        caller can log / record an event once); idempotent — subsequent
+        calls return ``False`` once ``_cancel_requested`` is already set.
+
+        Three signal shapes accepted (any one fires the cancel):
+
+        1. ``status == "canceled"`` — forward-compat for a future soul-svc
+           lifecycle state. The current v2.0.0 enum is ``completed|failed``
+           only, but `_check_cancel_signal` matches case-insensitively so
+           the contract holds the moment soul-svc adds it.
+        2. ``status == "failed"`` AND ``result.cancel == True`` — the
+           SAL-2756 design-sketch path. The operator marks the kickoff
+           failed and stamps ``cancel: true`` in the result blob to
+           distinguish a deliberate cancel from a crash-completion.
+        3. ``status == "failed"`` with no ``cancel`` flag — treated as a
+           cancel iff the orchestrator is still ticking (we wouldn't be
+           in this method otherwise). Operator workflow: ``mesh.complete
+           --status failed --reason external_cancel`` is the documented
+           way to stop a runaway wave; we honour the signal regardless of
+           whether the result blob carries the explicit flag.
+
+        Best-effort: any HTTP / JSON failure returns ``False`` and lets
+        the next tick retry. Cancel never raises into the dispatch loop.
+        """
+        if self._cancel_requested:
+            return False
+        try:
+            rec = await self.mesh.get_task(self.task_id)
+        except Exception:
+            logger.exception(
+                "cancel-signal poll failed for kickoff %s; will retry next tick",
+                self.task_id,
+            )
+            return False
+        if not isinstance(rec, dict):
+            return False
+
+        status = (rec.get("status") or "").lower()
+        result = rec.get("result") or {}
+        cancel_flag = bool(result.get("cancel")) if isinstance(result, dict) else False
+
+        if status == "canceled" or cancel_flag or status == "failed":
+            reason = ""
+            if isinstance(result, dict):
+                reason = str(
+                    result.get("reason")
+                    or result.get("error")
+                    or ""
+                )[:500]
+            if not reason:
+                reason = f"external_cancel:status={status or 'unknown'}"
+            self._cancel_requested = True
+            self._cancel_reason = reason
+            self._drain_mode = True
+            logger.warning(
+                "[cancel] external cancel signal observed for kickoff %s "
+                "(status=%s cancel_flag=%s reason=%s); entering drain mode",
+                self.task_id, status, cancel_flag, reason,
+            )
+            self.state.record_event(
+                "cancel_requested",
+                task_id=self.task_id,
+                status=status,
+                cancel_flag=cancel_flag,
+                reason=reason,
+            )
+            return True
+        return False
+
+    async def _complete_kickoff_canceled(self) -> None:
+        """AB-17-q: terminal handler for the graceful-cancel path.
+
+        Snapshots state, records a ``kickoff_canceled`` event, and posts a
+        final ``status="failed"`` complete with ``result.cancel = True``
+        so the kickoff record clearly reflects an operator-driven stop
+        rather than a crash. The operator-side PATCH that triggered the
+        cancel will already have flipped the DB record — this call is
+        idempotent (soul-svc returns 409 / 200 on re-complete) and serves
+        primarily to attach the orchestrator-side state snapshot for
+        post-mortem.
+        """
+        self._snapshot_graph_into_state()
+        self.state.record_event(
+            "kickoff_canceled",
+            task_id=self.task_id,
+            reason=self._cancel_reason,
+            current_wave=self.state.current_wave,
+        )
+        try:
+            await self.mesh.complete(
+                self.task_id,
+                session_id=self.settings.soul_session_id,
+                status="failed",
+                result={
+                    "error": f"external_cancel: {self._cancel_reason}",
+                    "cancel": True,
+                    "cancel_reason": self._cancel_reason,
+                    "final_state_snapshot": {
+                        "current_wave": self.state.current_wave,
+                        "cumulative_spend_usd": self.state.cumulative_spend_usd,
+                        "ticket_status": self.state.ticket_status,
+                        "events_tail": self.state.events[-10:],
+                    },
+                },
+            )
+        except Exception:
+            # The operator's PATCH may have already moved the record to a
+            # terminal state — soul-svc rejects re-completion with 409.
+            # Log and move on; the cancel intent is already in the DB.
+            logger.warning(
+                "post-cancel complete failed for kickoff %s "
+                "(likely already terminal); continuing",
+                self.task_id,
             )
 
     async def _fail_kickoff(self, *, reason: str) -> None:

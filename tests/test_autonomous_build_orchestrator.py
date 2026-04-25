@@ -19,6 +19,7 @@ import json
 import pytest
 
 from alfred_coo.autonomous_build.graph import (
+    TERMINAL_STATES,
     Ticket,
     TicketGraph,
     TicketStatus,
@@ -2777,3 +2778,271 @@ async def test_dispatch_child_uses_fresh_hint_in_body(monkeypatch):
     assert "# verified absent @" not in body, (
         f"stale 'verified absent' marker leaked through; body:\n{body}"
     )
+
+
+# ── AB-17-q · external cancel signal (SAL-2756) ────────────────────────────
+
+
+class _FakeMeshWithCancelSignal(_FakeMesh):
+    """_FakeMesh extension that returns a `failed` record for the kickoff
+    task after N polls of `get_task`. Used to simulate an operator
+    PATCHing the kickoff to canceled mid-run.
+    """
+
+    def __init__(self, kickoff_id: str, cancel_after_polls: int,
+                 cancel_result: dict | None = None):
+        super().__init__()
+        self.kickoff_id = kickoff_id
+        self.cancel_after_polls = cancel_after_polls
+        self.cancel_result = cancel_result or {"cancel": True, "reason": "manual_test"}
+        self._get_task_calls = 0
+
+    async def get_task(self, task_id: str):
+        self._get_task_calls += 1
+        if task_id == self.kickoff_id and self._get_task_calls > self.cancel_after_polls:
+            return {
+                "id": self.kickoff_id,
+                "status": "failed",
+                "result": self.cancel_result,
+            }
+        return None
+
+
+async def test_orchestrator_external_cancel_drains_and_exits(monkeypatch, caplog):
+    """AB-17-q (SAL-2756) regression: when the kickoff task is PATCHed
+    to status=failed with result.cancel=true mid-wave, the orchestrator
+    observes the signal at the next dispatch tick, sets `_drain_mode`
+    so no new children dispatch, lets in-flight children complete, and
+    exits the wave loop without raising.
+
+    Setup: 4 wave-0 tickets, max_parallel_subs=2.
+      - tick 1: dispatches 2 children (T1, T2), poll completes T1
+      - tick 2: cancel observed, drain — T2 still in-flight
+      - tick 3: poll completes T2; in-flight empty; cancel exit fires
+
+    Asserts:
+      - T3, T4 NEVER dispatched (proves drain-mode skipped new children)
+      - T1, T2 reach MERGED_GREEN (proves in-flight allowed to finish)
+      - state events include `cancel_requested` + `wave_dispatch_canceled`
+      - mesh.complete called once with status="failed" + cancel=True
+    """
+    import logging
+
+    kickoff_id = "kick-cancel-test"
+    mesh = _FakeMeshWithCancelSignal(
+        kickoff_id=kickoff_id,
+        cancel_after_polls=1,  # cancel observed on the 2nd poll
+    )
+    orch = AutonomousBuildOrchestrator(
+        task={"id": kickoff_id, "title": "[persona:autonomous-build-a] kickoff",
+              "description": ""},
+        persona=_mk_persona(),
+        mesh=mesh,
+        soul=_FakeSoul(),
+        dispatcher=object(),
+        settings=_FakeSettings(),
+    )
+    orch.poll_sleep_sec = 0
+    orch.max_parallel_subs = 2  # constrains tick-1 to 2 dispatches
+
+    t1 = _t("u1", "SAL-1", "TIR-01", 0, "tiresias")
+    t2 = _t("u2", "SAL-2", "TIR-02", 0, "tiresias")
+    t3 = _t("u3", "SAL-3", "TIR-03", 0, "tiresias")
+    t4 = _t("u4", "SAL-4", "TIR-04", 0, "tiresias")
+    _seed_graph(orch, [t1, t2, t3, t4])
+
+    # Stub side-effects we don't care about.
+    async def _noop(*a, **kw):
+        return None
+    async def _noop_list(*a, **kw):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+
+    # Track which tickets have been dispatched as children so we can
+    # advance their state on subsequent ticks. The fake `_dispatch_child`
+    # records the child_task_id and flips status to DISPATCHED.
+    dispatched_order: list[Ticket] = []
+    async def _fake_dispatch_child(ticket):
+        dispatched_order.append(ticket)
+        ticket.child_task_id = f"child-{ticket.identifier}"
+        ticket.status = TicketStatus.DISPATCHED
+        # Record on mesh.created so the test can assert dispatch counts.
+        mesh.created.append({
+            "title": ticket.identifier,
+            "description": "",
+            "from_session_id": None,
+        })
+    monkeypatch.setattr(orch, "_dispatch_child", _fake_dispatch_child)
+
+    # `_poll_children` advances dispatched tickets one step per tick:
+    # tick 1 (post-dispatch): T1 -> MERGED_GREEN
+    # tick 2 (post-cancel):   T2 -> MERGED_GREEN
+    poll_call = {"n": 0}
+    async def _fake_poll_children():
+        poll_call["n"] += 1
+        # Pick the FIRST non-terminal dispatched ticket and complete it.
+        for t in dispatched_order:
+            if t.status not in TERMINAL_STATES:
+                t.status = TicketStatus.MERGED_GREEN
+                return [t]
+        return []
+    monkeypatch.setattr(orch, "_poll_children", _fake_poll_children)
+
+    # Bound the loop in case of a regression.
+    ticks = {"n": 0}
+    real_sleep = asyncio.sleep
+    async def counting_sleep(delay):
+        ticks["n"] += 1
+        if ticks["n"] > 20:
+            raise RuntimeError(
+                "cancel exit failed to break dispatch loop within 20 ticks"
+            )
+        await real_sleep(0)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        counting_sleep,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="alfred_coo.autonomous_build.orchestrator"):
+        await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    # ── core assertions ────────────────────────────────────────────────────
+
+    # Cancel was observed and drain mode flipped on.
+    assert orch._cancel_requested is True
+    assert orch._drain_mode is True
+    assert "manual_test" in orch._cancel_reason
+
+    # T1 + T2 dispatched on tick 1 (max_parallel_subs=2). T3 + T4 NEVER
+    # dispatched because cancel fired on tick 2 before they could be
+    # selected.
+    dispatched_idents = [t.identifier for t in dispatched_order]
+    assert dispatched_idents == ["SAL-1", "SAL-2"], (
+        f"expected only T1 + T2 dispatched, got {dispatched_idents}"
+    )
+    # T1 + T2 completed normally (in-flight allowed to drain).
+    assert t1.status == TicketStatus.MERGED_GREEN
+    assert t2.status == TicketStatus.MERGED_GREEN
+    # T3 + T4 stayed pending (never dispatched).
+    assert t3.status == TicketStatus.PENDING, (
+        f"T3 should never have left PENDING; got {t3.status}"
+    )
+    assert t4.status == TicketStatus.PENDING, (
+        f"T4 should never have left PENDING; got {t4.status}"
+    )
+
+    # State events fired.
+    event_kinds = [e["kind"] for e in orch.state.events]
+    assert "cancel_requested" in event_kinds
+    assert "wave_dispatch_canceled" in event_kinds
+    cancel_ev = next(e for e in orch.state.events if e["kind"] == "cancel_requested")
+    assert cancel_ev["status"] == "failed"
+    assert cancel_ev["cancel_flag"] is True
+
+    # Cancel log line emitted.
+    cancel_logs = [
+        r.getMessage() for r in caplog.records
+        if "[cancel]" in r.getMessage()
+    ]
+    assert any("external cancel signal observed" in m for m in cancel_logs), (
+        f"expected '[cancel] external cancel signal observed' log; got: {cancel_logs}"
+    )
+    assert any("drained (no in-flight)" in m for m in cancel_logs), (
+        f"expected '[cancel] wave N drained' log; got: {cancel_logs}"
+    )
+
+
+async def test_check_cancel_signal_idempotent_and_handles_missing_record():
+    """`_check_cancel_signal` returns False if the kickoff record isn't
+    found (mesh returned None) and True only on the first cancel event.
+    Subsequent calls after `_cancel_requested` is set short-circuit to
+    False so the dispatch loop doesn't double-record events.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    # No record → False, no state mutation.
+    assert await orch._check_cancel_signal() is False
+    assert orch._cancel_requested is False
+
+    # Add a get_task that returns a cancel record. First call: True.
+    async def _get_task(task_id):
+        return {
+            "id": task_id,
+            "status": "failed",
+            "result": {"cancel": True, "reason": "test_cancel"},
+        }
+    mesh.get_task = _get_task
+
+    assert await orch._check_cancel_signal() is True
+    assert orch._cancel_requested is True
+    assert orch._drain_mode is True
+    assert orch._cancel_reason == "test_cancel"
+
+    # Second call: idempotent, returns False without re-recording.
+    initial_event_count = len(
+        [e for e in orch.state.events if e["kind"] == "cancel_requested"]
+    )
+    assert await orch._check_cancel_signal() is False
+    final_event_count = len(
+        [e for e in orch.state.events if e["kind"] == "cancel_requested"]
+    )
+    assert initial_event_count == final_event_count == 1
+
+
+async def test_check_cancel_signal_recognizes_canceled_status():
+    """Forward-compat: `status == "canceled"` fires the cancel even
+    without the result.cancel flag. soul-svc v2.0.0 only allows
+    completed|failed today, but the orchestrator pre-honours a future
+    `canceled` lifecycle state.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    async def _get_task(task_id):
+        return {
+            "id": task_id,
+            "status": "canceled",
+            "result": {},
+        }
+    mesh.get_task = _get_task
+
+    assert await orch._check_cancel_signal() is True
+    assert orch._cancel_requested is True
+    assert "canceled" in orch._cancel_reason
+
+
+async def test_complete_kickoff_canceled_posts_failed_with_cancel_flag(monkeypatch):
+    """`_complete_kickoff_canceled` writes mesh.complete with
+    status="failed" and result.cancel=True so the kickoff record
+    clearly reflects an operator-driven stop.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    orch._cancel_requested = True
+    orch._cancel_reason = "test_reason"
+    orch.state.cumulative_spend_usd = 1.23
+
+    async def _noop(*a, **kw):
+        return None
+    monkeypatch.setattr(orch, "_snapshot_graph_into_state", lambda: None)
+
+    await orch._complete_kickoff_canceled()
+
+    assert len(mesh.completions) == 1
+    rec = mesh.completions[0]
+    assert rec["task_id"] == orch.task_id
+    assert rec["status"] == "failed"
+    assert rec["result"]["cancel"] is True
+    assert rec["result"]["cancel_reason"] == "test_reason"
+    assert "external_cancel" in rec["result"]["error"]
+    assert "final_state_snapshot" in rec["result"]
+
