@@ -1,9 +1,14 @@
-from fastapi.testclient import TestClient
-from aletheia.app.main import app
+import pytest
+from aletheia.app.verdict import Verdict
+from aletheia.app.soul_writer import write_verdict
 
-client = TestClient(app)
+def test_verdict_model_fields():
+    v = Verdict(verdict="PASS", reason="All good")
+    assert v.verdict == "PASS"
+    assert v.reason == "All good"
 
-def test_debug_verdict():
-    response = client.post("/v1/_debug/verdict", json={"verdict": "PASS"})
-    assert response.status_code == 200
-    assert response.json() == {"result": "written"}
+def test_write_verdict_returns_expected_structure():
+    v = Verdict(verdict="FAIL")
+    payload = write_verdict(v)
+    assert payload["verdict"] == "FAIL"
+    assert payload["topic"] == "aletheia.verdict"

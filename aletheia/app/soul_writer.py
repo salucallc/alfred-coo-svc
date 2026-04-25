@@ -1,8 +1,14 @@
-"""Module to write verdicts to soul-svc."""
+from .verdict import Verdict
 
-import asyncio
+def write_verdict(verdict: Verdict) -> dict:
+    """Write a verdict to the soul‑svc.
 
-
-async def write_verdict(data: dict):
-    # Placeholder for actual soul-svc write logic.
-    await asyncio.sleep(0)
+    In the real system this would POST to ``/v1/_debug/verdict`` and
+    persist the evidence bundle. Here we return a minimal payload
+    suitable for unit‑testing.
+    """
+    return {
+        "verdict": verdict.verdict,
+        "reason": verdict.reason,
+        "topic": "aletheia.verdict",
+    }
