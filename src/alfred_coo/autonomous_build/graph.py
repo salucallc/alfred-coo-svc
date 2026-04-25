@@ -47,13 +47,27 @@ class TicketStatus(str, Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
     BACKED_OFF = "backed_off"
+    # SAL-2886 (v7p escalate-path bug, 2026-04-25 evening): the alfred-coo-a
+    # persona contract has TWO valid emit-modes (persona.py:58-67):
+    #   1. propose_pr -> PR URL (happy path) -> PR_OPEN -> REVIEWING -> MERGED_GREEN
+    #   2. linear_create_issue -> grounding-gap issue (escalate path) -> ESCALATED
+    # Prior to this state, the escalate path was misclassified as FAILED in
+    # _poll_children (no PR URL -> "silent persona bug"), causing v7p wave-0
+    # cascade: 4 already-merged tickets escalated, were marked FAILED, burned
+    # retry budget. ESCALATED is terminal-non-failure - wave-gate excludes
+    # from numerator + denominator (parity with PATH_CONFLICT excusal).
+    ESCALATED = "escalated"
 
 
 # Terminal states — once a ticket lands here the wave loop stops polling it.
 # BACKED_OFF is intentionally NOT terminal: the deadlock detector and wave
 # gate must keep waiting through the backoff window for re-dispatch.
 TERMINAL_STATES: frozenset[TicketStatus] = frozenset(
-    {TicketStatus.MERGED_GREEN, TicketStatus.FAILED}
+    {
+        TicketStatus.MERGED_GREEN,
+        TicketStatus.FAILED,
+        TicketStatus.ESCALATED,  # SAL-2886
+    }
 )
 
 
