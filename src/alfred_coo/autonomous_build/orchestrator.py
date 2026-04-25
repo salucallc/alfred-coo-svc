@@ -533,6 +533,368 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         branch_hint="feature/tir-08-mcp-llm-cascade",
         notes="BLOCKED on TIR-01; mcp-llm cascade router (principle-aware routing)",
     ),
+
+    # ── Wave 1 additions (Path A hint expansion 2026-04-25) ──────────────
+    # 24 entries derived from Z:/_planning/v1-ga/{A,B,C,D,E,K}_*.md.
+    # Paths verified via `gh api repos/salucallc/<repo>/contents/<path>?ref=main`.
+    # Resolves the wave-1 no_hint crash (Linear: SAL-2585..SAL-2676).
+
+    # ── Epic A · Tiresias-sovereign Wave 2 — sequential core proxy ──────
+    "TIR-03": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(),
+        new_paths=(
+            "src/tiresias_sovereign/middleware/__init__.py",
+            "src/tiresias_sovereign/middleware/soulkey_auth.py",
+            "tests/test_auth_middleware.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-03-soulkey-auth",
+        notes="plan A §4 Wave 2 + SAL-2585; identity P1-P3 middleware (missing/malformed→401, unregistered→403, valid→200); table-driven tests; depends on TIR-02 principle registry",
+    ),
+
+    "TIR-04": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(),
+        new_paths=(
+            "src/tiresias_sovereign/proxy/__init__.py",
+            "src/tiresias_sovereign/proxy/handler.py",
+            "src/tiresias_sovereign/proxy/allowlist.py",
+            "tests/test_proxy_allowlist.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-04-proxy-allowlist",
+        notes="plan A §4 Wave 2 + SAL-2586; boundary P4-P6 — proxy handler + destination allowlist; non-allowlisted dest → 403 P4; depends on TIR-03",
+    ),
+
+    "TIR-05": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(),
+        new_paths=(
+            "src/tiresias_sovereign/audit/__init__.py",
+            "src/tiresias_sovereign/audit/hash_chain.py",
+            "tests/test_audit_chain.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-05-audit-hash-chain",
+        notes="plan A §4 Wave 2 + SAL-2587; accountability P7-P9 — audit hash-chain writer; 100 sequential requests integrity-walk; writes against TIR-07 audit schema; depends on TIR-04",
+    ),
+
+    "TIR-06": TargetHint(
+        owner="salucallc",
+        repo="tiresias-sovereign",
+        paths=(),
+        new_paths=(
+            "src/tiresias_sovereign/headers/__init__.py",
+            "src/tiresias_sovereign/headers/transparency.py",
+            "tests/test_transparency_headers.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-06-transparency-headers",
+        notes="plan A §4 Wave 2 + SAL-2588; transparency P10-P12 — emits X-Tiresias-Principles-Passed/Policy-Bundle/Audit-ID + X-Tiresias-Deny-Reason; depends on TIR-04 + TIR-05",
+    ),
+
+    # ── Epic B · Aletheia daemon (alfred-coo-svc/aletheia/ subtree) ──────
+    "ALT-02": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("aletheia/app/main.py",),
+        new_paths=(
+            "aletheia/app/verdict.py",
+            "aletheia/app/soul_writer.py",
+            "aletheia/tests/test_verdict_writer.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-02-verdict-model",
+        notes="plan B §2 audit/ + SAL-2599; verdict data model + soul-svc writer for topic=aletheia.verdict; main.py wires POST /v1/_debug/verdict + soul_writer; JSON-schema validated in CI",
+    ),
+
+    "ALT-03": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "aletheia/app/prompt/__init__.py",
+            "aletheia/app/prompt/parser.py",
+            "aletheia/prompts/verify_v1.md",
+            "aletheia/tests/test_parser.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-03-verify-prompt-parser",
+        notes="plan B §5 ALT-03 + SAL-2600; verify_v1.md prompt template (§5 verbatim) + sentinel parser for `DONE verify={PASS|FAIL|UNCERTAIN}`; 20 canned outputs; prompt sha256 pinned in env",
+    ),
+
+    "ALT-04": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "aletheia/app/router/__init__.py",
+            "aletheia/app/router/policy.py",
+            "aletheia/tests/test_router.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-04-model-router",
+        notes="plan B §5 ALT-04 + SAL-2601; two-tier routing (qwen3-coder:480b high/med-stakes, hf:openai/gpt-oss-120b low); refuses when generator_model == candidate_verifier_model; 12 (action_class, risk_tier) test cases",
+    ),
+
+    "ALT-06": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "aletheia/app/watchers/__init__.py",
+            "aletheia/app/watchers/github_poller.py",
+            "aletheia/tests/test_github_poller.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-06-github-poller",
+        notes="plan B §5 ALT-06 (Track B) + SAL-2603; polls list_pull_requests every 30s on watched repos (default saluca-llc/* per plan B §4 O4); enqueues pr_review job within 45s; consumes GITHUB_PAT_POLLER env var",
+    ),
+
+    # ── Epic C/F · Fleet Wave 1 (F04 sidecar + F05 heartbeat + F12 policy) ─
+    "F04": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "src/alfred_coo/fleet_gateway/__init__.py",
+            "src/alfred_coo/fleet_gateway/server.py",
+            "src/alfred_coo/fleet_gateway/Dockerfile",
+            "tests/test_fleet_gateway_ws.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f04-fleet-gateway-ws",
+        notes="plan C §2.3 + SAL-2612; new fleet-gateway sidecar (port 8090) owns WS fan-out; wscat establishes; invalid key→401 close; 100 concurrent clients sustained 5min; compose wire-in defers to F20. Host repo: alfred-coo-svc (sibling to src/alfred_coo) — flag for review",
+    ),
+
+    "F05": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("routers/fleet.py",),
+        new_paths=(
+            "tests/test_fleet_heartbeat.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f05-heartbeat-hub",
+        notes="plan C §3.2 + SAL-2613; modifies routers/fleet.py (created by F02) adding heartbeat handler; ack p95<500ms localhost; 3 missed → mode_state=degraded; depends on F04 WS upgrade and F02 router",
+    ),
+
+    "F12": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("routers/fleet.py",),
+        new_paths=(
+            "fleet/__init__.py",
+            "fleet/policy_signer.py",
+            "tests/test_fleet_policy_signer.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f12-fleet-policy-signer",
+        notes="plan C §3.4 + SAL-2620; /v1/fleet/policy endpoint + ed25519 signer module under top-level fleet/ pkg (soul-svc is flat); tampered bundle → openssl verify fails; depends on F01 + F02",
+    ),
+
+    # ── Epic D · Ops layer additions (Wave 2/4/5 OPS tickets) ────────────
+    "OPS-04": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/docker-compose.yml",
+            "deploy/appliance/.env.template",
+        ),
+        new_paths=(
+            "deploy/appliance/infisical/init.sql",
+            "deploy/appliance/infisical/README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-04-infisical-service",
+        notes="plan D §3.5 + SAL-2637; infisical/infisical:v0.124.0-postgres on mc-ops + INFISICAL_* env defaults; init.sql provisions infisical schema in mc-postgres; APE/V: curl infisical:8080/api/status returns ok",
+    ),
+
+    "OPS-05": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/docker-compose.yml",
+            "deploy/appliance/.env.template",
+        ),
+        new_paths=(
+            "deploy/appliance/infisical/derive_root_key.sh",
+            "deploy/appliance/infisical/README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-05-kek-infisical-key",
+        notes="plan D §3.5 + SAL-2638; KEK-derived infisical root key via mc-init container; secrets readable across 2x restart; KEK rotation re-derives. README.md shared with OPS-04 — race-handle by merging into existing file",
+    ),
+
+    "OPS-16": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/otel/otel-collector-config.yaml",
+            "deploy/appliance/otel/README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-16-otel-collector",
+        notes="plan D §3.2 + SAL-2649; otel/opentelemetry-collector-contrib:0.115.0 on mc-ops; receivers OTLP grpc:4317 + http:4318; exporters fan to prometheus + loki",
+    ),
+
+    "OPS-17": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/prometheus/prometheus.yml",
+            "deploy/appliance/prometheus/scrape_configs.yml",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-17-prometheus",
+        notes="plan D §3.2 + SAL-2650; prom/prometheus:v2.55.1 on mc-ops; 30d retention; scrape_configs targets soul-svc/tiresias/coo/portal /metrics; APE/V: /api/v1/targets shows ≥5 up=1",
+    ),
+
+    "OPS-23": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/__init__.py",),
+        new_paths=(
+            "configs/model_pricing.yaml",
+            "src/alfred_coo/pricing.py",
+            "tests/test_pricing_loader.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-23-model-pricing",
+        notes="plan D §3.1 + SAL-2656; YAML pricing table (Ollama Max=flat $100/mo amortized, free=$0, paid per-token); pricing.load() returns dict; configs/ dir does not exist on main — first ticket to create it",
+    ),
+
+    # ── Epic E · soul-svc gap-closure remainder (SS-03/04/10/11/12) ──────
+    "SS-03": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("routers/cot_capture.py",),
+        new_paths=(
+            "tests/test_cot_unified.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss03-cot-unify",
+        notes="plan E §5.1 S-03 + SAL-2664; rewrite cot_capture.py so /v1/cot/capture writes to _memories with modality=cot, removes file-shim; row in _memories queryable + /var/lib/soul-svc/cot/ never created; D1 decision = merge",
+    ),
+
+    "SS-04": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("serve.py",),
+        new_paths=(
+            "routers/metrics.py",
+            "tests/test_metrics_endpoint.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss04-metrics",
+        notes="plan E §5.1 S-04 + SAL-2665; /metrics endpoint with soul_http_requests_total + soul_http_request_duration_seconds histogram + soul_db_query_duration_seconds{table} + soul_memory_writes_total{knowledge_tier}; register router in serve.py; NO tenant_id label (R3 risk register); mirrors existing S-04 hint because parser emits SS-04 from SAL-SS-04",
+    ),
+
+    "SS-10": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "routers/session_lifecycle.py",
+            "routers/session.py",
+            "routers/challenge.py",
+            "routers/admin.py",
+            "routers/deps.py",
+        ),
+        new_paths=(
+            "tests/test_session_asyncpg.py",
+            "tests/test_admin_asyncpg.py",
+            "tests/test_challenge_asyncpg.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss10-asyncpg-routers-sweep",
+        notes="plan E §5.2 S-10 + SAL-2671; swap Supabase SDK→db/repo helpers in 5 appliance-critical routers (created by SS-09); existing test_auth_hybrid + test_session_continuity stay green; bearer-auth latency ≤10% regression; grep -c 'client.table' on these 5 == 0; depends on SS-09",
+    ),
+
+    "SS-11": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(),
+        new_paths=(
+            "scripts/apply_migrations.py",
+            "tests/test_apply_migrations_idempotent.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss11-apply-migrations-asyncpg",
+        notes="plan E §5.2 S-11 + SAL-2672; supersedes SS-06 implementation; reads DATABASE_URL only (NO SUPABASE_SERVICE_KEY); asyncpg.connect (single conn, serial); _soul_migration_log idempotency + SHA-drift refusal; --dry-run default; bootstrap log table on fresh DB; depends on SS-09",
+    ),
+
+    "SS-12": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(),
+        new_paths=(
+            "tests/e2e/__init__.py",
+            "tests/e2e/smoke_backends.sh",
+            ".github/workflows/soul-svc-backend-portability.yml",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss12-multi-backend-smoke",
+        notes="plan E §5.2 S-12 + SAL-2673; CI matrix smoke against local Postgres + Supabase (direct PG conn, NOT rpc) + Neon (ephemeral branch); 5 assertions per backend; secrets from GCP Secret Manager (supabase-direct-postgres-url, neon-api-key); depends on SS-09 + SS-10 + SS-11",
+    ),
+
+    # ── Epic C amendment · Multi-tenant Fleet (C-26..C-28) ───────────────
+    # Parser regex emits `C-26` for SAL-C-26 titles via single-letter `C`
+    # alternative (graph.py:67). C-26 extends soul_lite (F08); C-27/C-28
+    # extend mcctl from F03/F19 inline (mcctl files NOT in paths — flagged).
+    "C-26": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "soul_lite/__init__.py",
+            "soul_lite/service.py",
+        ),
+        new_paths=(
+            "soul_lite/repository.py",
+            "soul_lite/migrations/0001_init.sql",
+            "soul_lite/migrations/0002_tenant_id.sql",
+            "scripts/lint_no_raw_sql.py",
+            "tests/soul_lite/__init__.py",
+            "tests/soul_lite/test_tenant_scope.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/c26-soul-lite-multitenant",
+        notes="plan C §5 C-26 + SAL-2674; tenant_id NOT NULL + per-table index; TenantScopedRepository helper; AST lint via scripts/lint_no_raw_sql.py; pytest tenant-scope isolation; prod boot refuses if any row tenant_id='__legacy__'; depends on SS-11. Locks soul_lite to migrations/ subdir convention (F08 left open)",
+    ),
+
+    "C-27": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "src/alfred_coo/fleet_auth/__init__.py",
+            "src/alfred_coo/fleet_auth/tenant_binding.py",
+            "tests/fleet/__init__.py",
+            "tests/fleet/test_tenant_auth.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/c27-fleet-tenant-auth",
+        notes="plan C §5 C-27 + SAL-2675; api_key bound to tenant_id (sk_endpoint_<tenantslug>_<endpoint_id>_<sha256>); fleet_endpoint_tenants tracking table (migration via SS-11); register payload gains tenant block; mcctl token --tenant flag wiring extends F03's src/mcctl/commands/token.py inline (NOT in paths — flag for review). Depends on C-26, TIR-03",
+    ),
+
+    "C-28": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "src/alfred_coo/fleet_policy/__init__.py",
+            "src/alfred_coo/fleet_policy/tenant_bundles.py",
+            "tests/fleet/test_tenant_policy.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/c28-fleet-tenant-policy",
+        notes="plan C §5 C-28 + SAL-2676; /v1/fleet/policy keyed by tenant {bundles:{tenant_a:{signed},tenant_b:{...}}}; F12 signer signs each tenant's bundle separately; mcctl push-policy --tenant only bumps that tenant's policy_version; mesh_scope.allowed_topics_prefix per-tenant. mcctl push-policy command itself is from F19 (later wave) — C-28 only adds tenant_bundles module + test, mcctl extension lands inline. Depends on C-27 + F12",
+    ),
 }
 
 
