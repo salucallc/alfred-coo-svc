@@ -65,7 +65,20 @@ DEFAULT_POLL_SLEEP_SEC = 45
 # Soft-green threshold on non-critical-path failures: if ≥90% of the wave
 # is merged_green and no critical-path failures, the wave is allowed to
 # close with a Slack warning. Critical-path failures always hard-halt.
+#
+# AB-17-w (2026-04-25): the threshold is now overridable per-kickoff via
+# the ``wave_green_ratio_threshold`` payload field. The constant below is
+# the default applied when the payload omits the field.
 SOFT_GREEN_THRESHOLD = 0.9
+DEFAULT_WAVE_GREEN_RATIO_THRESHOLD = SOFT_GREEN_THRESHOLD
+
+# AB-17-w · Linear label name (not UUID) used by ``_wait_for_wave_gate``
+# to exempt human-assigned tickets from the green-ratio denominator.
+# The Linear API surfaces label *names* on issues (see graph.py line 279
+# and tools.py line 1577), so name-matching is the cheap path.
+# Authoritative UUID for this label (created 2026-04-25 by AB-17-v):
+#   d3b067fd-0217-4901-b191-50ce2fd971f2
+HUMAN_ASSIGNED_LABEL = "human-assigned"
 
 # Default: a critical-path ticket stuck in-flight for >30 min triggers
 # a Slack stall ping. Overridable by the payload for tests / tuning.
@@ -732,6 +745,8 @@ class AutonomousBuildOrchestrator:
         self.poll_sleep_sec: int = DEFAULT_POLL_SLEEP_SEC
         self.wave_order: List[int] = [0, 1, 2, 3]
         self.linear_project_id: str = ""
+        # AB-17-w: overridable per-kickoff via `wave_green_ratio_threshold`.
+        self.wave_green_ratio_threshold: float = DEFAULT_WAVE_GREEN_RATIO_THRESHOLD
 
         # Stash the last time we posted a cadence tick so _status_tick can
         # rate-limit itself without a separate timer.
@@ -953,6 +968,23 @@ class AutonomousBuildOrchestrator:
                 self.stall_threshold_sec = int(stall_override)
             except (TypeError, ValueError):
                 self.stall_threshold_sec = DEFAULT_STALL_THRESHOLD_SEC
+
+        # AB-17-w: per-kickoff override of the wave-gate green-ratio
+        # threshold. Default is SOFT_GREEN_THRESHOLD (0.9). The payload
+        # field is `wave_green_ratio_threshold` (top-level float).
+        gate_override = payload.get("wave_green_ratio_threshold")
+        if gate_override is not None:
+            try:
+                self.wave_green_ratio_threshold = float(gate_override)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ignoring non-numeric wave_green_ratio_threshold=%r; "
+                    "keeping default %.2f",
+                    gate_override, DEFAULT_WAVE_GREEN_RATIO_THRESHOLD,
+                )
+                self.wave_green_ratio_threshold = (
+                    DEFAULT_WAVE_GREEN_RATIO_THRESHOLD
+                )
 
         # Wave order.
         wave_order = payload.get("wave_order")
@@ -2323,7 +2355,18 @@ class AutonomousBuildOrchestrator:
     async def _wait_for_wave_gate(self, wave_n: int) -> None:
         """Block until every ticket in `wave_n` is terminal. Raise if a
         critical-path ticket failed; allow soft-green on non-critical
-        failures if ≥`SOFT_GREEN_THRESHOLD` of the wave merged green."""
+        failures if ≥`self.wave_green_ratio_threshold` of the *scored*
+        wave merged green.
+
+        AB-17-w (2026-04-25): the threshold is configurable per-kickoff
+        (payload field ``wave_green_ratio_threshold``, default
+        ``SOFT_GREEN_THRESHOLD``). Tickets bearing the ``human-assigned``
+        label, plus tickets whose pre-dispatch hint verification returned
+        ``PATH_CONFLICT`` or ``NO_HINT``, are excused from both numerator
+        and denominator. If every ticket in the wave is excused
+        (denominator == 0), the wave passes without a green-ratio check.
+        See ``_is_wave_gate_excused`` for the exact predicate.
+        """
         wave_tickets = self.graph.tickets_in_wave(wave_n)
         if not wave_tickets:
             return
@@ -2381,10 +2424,52 @@ class AutonomousBuildOrchestrator:
             t for t in wave_tickets
             if t.id not in self._repo_missing_tickets
         ]
-        failed = [t for t in effective if t.status == TicketStatus.FAILED]
+        # AB-17-w · Plan AB-17-w — additional excusal axes on top of the
+        # AB-17-d REPO_MISSING exclusion already applied above. These
+        # tickets are excluded from the green-ratio denominator because
+        # they were never an executable code path:
+        #   1. ``human-assigned`` label — Cristian (or another human) is
+        #      handling this out-of-band; the orchestrator never owned it.
+        #   2. PATH_CONFLICT verification — the static target hint pointed
+        #      at a path that already exists in a way the spec didn't
+        #      anticipate; no actionable PR can be opened until a human
+        #      resolves the conflict.
+        #   3. NO_HINT (code not in ``_TARGET_HINTS``) — pre-existing
+        #      grounding gap; the orchestrator has no idea where this
+        #      ticket's PR should land. Equivalent to "never had a
+        #      TargetHint at all".
+        # Excused tickets are kept in `wave_tickets` for terminal-state
+        # tracking but removed from both numerator + denominator.
+        excused = [
+            t for t in effective
+            if self._is_wave_gate_excused(t)
+        ]
+        excused_ids = {t.id for t in excused}
+        scored = [t for t in effective if t.id not in excused_ids]
+
+        failed = [t for t in scored if t.status == TicketStatus.FAILED]
         cp_failed = [t for t in failed if t.is_critical_path]
-        green = [t for t in effective if t.status == TicketStatus.MERGED_GREEN]
-        green_ratio = len(green) / max(1, len(effective))
+        green = [t for t in scored if t.status == TicketStatus.MERGED_GREEN]
+        threshold = float(self.wave_green_ratio_threshold)
+        denominator = len(scored)
+        green_ratio = (len(green) / denominator) if denominator > 0 else 1.0
+
+        # AB-17-w: structured wave-end log line. Always emitted, regardless
+        # of decision, so an operator tailing logs sees the full math
+        # (numerator, denominator, excused count, threshold, ratio,
+        # decision) on one line.
+        decision = (
+            "halted_critical_path" if cp_failed
+            else "skipped_all_excused" if denominator <= 0
+            else "passed" if green_ratio >= threshold
+            else "failed_below_threshold"
+        )
+        logger.info(
+            "[wave-gate] wave=%d green=%d failed=%d excused=%d "
+            "denominator=%d threshold=%.2f ratio=%.2f decision=%s",
+            wave_n, len(green), len(failed), len(excused),
+            denominator, threshold, green_ratio, decision,
+        )
 
         if cp_failed:
             msg = (
@@ -2396,36 +2481,102 @@ class AutonomousBuildOrchestrator:
                                     failed=[t.identifier for t in cp_failed])
             raise RuntimeError(msg)
 
-        if failed and green_ratio >= SOFT_GREEN_THRESHOLD:
+        # AB-17-w: if every ticket was excused (e.g. an entire wave is
+        # human-assigned scope), there is nothing for the orchestrator to
+        # gate on. Treat as a pass — the wave succeeded by definition.
+        if denominator <= 0:
+            logger.info(
+                "wave %d all-excused (n=%d); skipping green-ratio check",
+                wave_n, len(excused),
+            )
+            self.state.record_event(
+                "wave_all_excused",
+                wave=wave_n,
+                excused=[t.identifier for t in excused],
+                excused_count=len(excused),
+            )
+            return
+
+        if failed and green_ratio >= threshold:
             logger.warning(
-                "wave %d soft-green: %d/%d merged, non-critical failures: %s",
-                wave_n, len(green), len(effective),
+                "wave %d soft-green: %d/%d merged (%d excused), "
+                "non-critical failures: %s",
+                wave_n, len(green), denominator, len(excused),
                 [t.identifier for t in failed],
             )
             self.state.record_event(
                 "wave_soft_green",
                 wave=wave_n,
                 failed=[t.identifier for t in failed],
+                excused=[t.identifier for t in excused],
+                excused_count=len(excused),
                 green_ratio=green_ratio,
+                threshold=threshold,
             )
             return
 
         if failed:
             msg = (
                 f"wave {wave_n} failed: green_ratio={green_ratio:.2f} < "
-                f"{SOFT_GREEN_THRESHOLD} and {len(failed)} non-critical failure(s)"
+                f"{threshold:.2f} and {len(failed)} non-critical failure(s)"
             )
             logger.error(msg)
             self.state.record_event(
                 "wave_halt_below_soft_green",
                 wave=wave_n,
                 failed=[t.identifier for t in failed],
+                excused=[t.identifier for t in excused],
+                excused_count=len(excused),
                 green_ratio=green_ratio,
+                threshold=threshold,
             )
             raise RuntimeError(msg)
 
         logger.info("wave %d all-green", wave_n)
-        self.state.record_event("wave_all_green", wave=wave_n)
+        self.state.record_event(
+            "wave_all_green",
+            wave=wave_n,
+            excused_count=len(excused),
+        )
+
+    def _is_wave_gate_excused(self, ticket: "Ticket") -> bool:
+        """AB-17-w: True iff `ticket` should be excluded from the wave-gate
+        green-ratio denominator. See ``_wait_for_wave_gate`` for the three
+        excusal axes (human-assigned label, PATH_CONFLICT verification,
+        NO_HINT / unmapped code).
+
+        Centralised so the same predicate is used in any future caller
+        (e.g. status-tick rendering) and so tests can exercise the
+        decision in isolation.
+        """
+        # Axis 1: human-assigned label (case-insensitive name match).
+        labels = getattr(ticket, "labels", None) or []
+        if any(
+            isinstance(lbl, str) and lbl.lower() == HUMAN_ASSIGNED_LABEL
+            for lbl in labels
+        ):
+            return True
+
+        # Axes 2 + 3: per-code hint verification at wave start. The
+        # `_verified_hints` cache is keyed by the uppercase ticket code.
+        # Verification only runs in real `run()` flow, so the cache is
+        # empty when an operator (or test) drives `_wait_for_wave_gate`
+        # directly. We deliberately do NOT fall back to a direct
+        # `_TARGET_HINTS` lookup when the cache is empty — that would
+        # excuse every ticket whose code isn't pre-mapped, including
+        # tickets the orchestrator legitimately tried to build. The cache
+        # is the only signal that says "verification ran AND told us this
+        # ticket was never actionable".
+        code_key = (ticket.code or "").upper()
+        if code_key:
+            vr = self._verified_hints.get(code_key)
+            if vr is not None and vr.status in (
+                HintStatus.PATH_CONFLICT,
+                HintStatus.NO_HINT,
+            ):
+                return True
+
+        return False
 
     # ── on-all-green actions ────────────────────────────────────────────────
 

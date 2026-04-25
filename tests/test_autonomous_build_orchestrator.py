@@ -305,6 +305,216 @@ async def test_noncritical_failure_logs_but_continues(monkeypatch):
     assert any(e["kind"] == "wave_soft_green" for e in events)
 
 
+# ── AB-17-w: wave-gate green_ratio configurable + excused-from-denominator ─
+
+
+async def _patch_nosleep(monkeypatch):
+    async def _nosleep(delay):
+        return None
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep", _nosleep
+    )
+
+
+async def test_wave_gate_passes_when_threshold_met(monkeypatch):
+    """AB-17-w · 9 green / 1 failed / 0 excused, default threshold 0.9 →
+    soft-green pass (existing behaviour, no regression)."""
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    tickets = [
+        _t(f"u{i}", f"SAL-{i}", f"TIR-{i:02d}", 1, "tiresias")
+        for i in range(10)
+    ]
+    for t in tickets[:9]:
+        t.status = TicketStatus.MERGED_GREEN
+    tickets[9].status = TicketStatus.FAILED
+    _seed_graph(orch, tickets)
+    await _patch_nosleep(monkeypatch)
+
+    await orch._wait_for_wave_gate(1)
+    events = orch.state.events
+    assert any(e["kind"] == "wave_soft_green" for e in events)
+
+
+async def test_wave_gate_fails_when_threshold_unmet(monkeypatch):
+    """AB-17-w · 7 green / 3 failed / 0 excused → 0.7 < 0.9 → raises."""
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    tickets = [
+        _t(f"u{i}", f"SAL-{i}", f"TIR-{i:02d}", 1, "tiresias")
+        for i in range(10)
+    ]
+    for t in tickets[:7]:
+        t.status = TicketStatus.MERGED_GREEN
+    for t in tickets[7:]:
+        t.status = TicketStatus.FAILED
+    _seed_graph(orch, tickets)
+    await _patch_nosleep(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="green_ratio=0.70"):
+        await orch._wait_for_wave_gate(1)
+    events = orch.state.events
+    assert any(e["kind"] == "wave_halt_below_soft_green" for e in events)
+
+
+async def test_wave_gate_exempts_human_assigned(monkeypatch):
+    """AB-17-w · 7 green / 3 failed (all human-assigned) → denominator 7 →
+    7/7=1.0 → passes without raise. The 3 failures are excused from BOTH
+    numerator and denominator, so the gate sees an all-green wave."""
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    tickets = [
+        _t(f"u{i}", f"SAL-{i}", f"TIR-{i:02d}", 1, "tiresias")
+        for i in range(10)
+    ]
+    for t in tickets[:7]:
+        t.status = TicketStatus.MERGED_GREEN
+    for t in tickets[7:]:
+        t.status = TicketStatus.FAILED
+        t.labels = ["human-assigned"]  # excuse from denominator
+    _seed_graph(orch, tickets)
+    await _patch_nosleep(monkeypatch)
+
+    # No raise.
+    await orch._wait_for_wave_gate(1)
+    # Should land on the all-green path (denominator = 7, ratio = 1.0),
+    # not soft-green (since `failed` after excusal is empty).
+    events = orch.state.events
+    kinds = [e["kind"] for e in events]
+    assert "wave_all_green" in kinds
+    assert "wave_halt_below_soft_green" not in kinds
+    # Excused count should be reported on the all-green event for ops
+    # visibility (3 human-assigned tickets sat out this wave).
+    all_green_evt = next(e for e in events if e["kind"] == "wave_all_green")
+    assert all_green_evt.get("excused_count") == 3
+
+
+async def test_wave_gate_skips_when_all_excused(monkeypatch):
+    """AB-17-w · 0 green / 5 path_conflict (all excused) → denominator 0 →
+    skip green-ratio check entirely → passes."""
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    tickets = [
+        _t(f"u{i}", f"SAL-{i}", f"TIR-{i:02d}", 1, "tiresias")
+        for i in range(5)
+    ]
+    # All five reached terminal as FAILED but verification flagged each
+    # as PATH_CONFLICT — the orchestrator never had an actionable target.
+    for t in tickets:
+        t.status = TicketStatus.FAILED
+        # Seed verified_hints so _is_wave_gate_excused excuses them via
+        # axis 2 (PATH_CONFLICT verification result).
+        orch._verified_hints[t.code] = VerificationResult(
+            code=t.code,
+            hint=None,
+            status=HintStatus.PATH_CONFLICT,
+            repo_exists=True,
+            path_results=(),
+            error="path conflict",
+        )
+    _seed_graph(orch, tickets)
+    await _patch_nosleep(monkeypatch)
+
+    # No raise — wave is by-definition successful when every ticket is
+    # excused.
+    await orch._wait_for_wave_gate(1)
+    events = orch.state.events
+    kinds = [e["kind"] for e in events]
+    assert "wave_all_excused" in kinds
+    assert "wave_halt_below_soft_green" not in kinds
+    evt = next(e for e in events if e["kind"] == "wave_all_excused")
+    assert evt.get("excused_count") == 5
+
+
+async def test_wave_gate_threshold_override(monkeypatch):
+    """AB-17-w · payload threshold=0.6, 7 green / 3 failed / 0 excused →
+    0.7 ≥ 0.6 → soft-green pass (would raise on default 0.9)."""
+    payload = {
+        "linear_project_id": "proj-abc",
+        "wave_green_ratio_threshold": 0.6,
+    }
+    orch = _mk_orchestrator(kickoff_desc=payload)
+    orch._parse_payload()  # apply override onto self
+    orch.poll_sleep_sec = 0
+    tickets = [
+        _t(f"u{i}", f"SAL-{i}", f"TIR-{i:02d}", 1, "tiresias")
+        for i in range(10)
+    ]
+    for t in tickets[:7]:
+        t.status = TicketStatus.MERGED_GREEN
+    for t in tickets[7:]:
+        t.status = TicketStatus.FAILED
+    _seed_graph(orch, tickets)
+    await _patch_nosleep(monkeypatch)
+
+    # Threshold 0.6 ≤ 0.7, so soft-green passes (no raise).
+    await orch._wait_for_wave_gate(1)
+    events = orch.state.events
+    soft = next(
+        (e for e in events if e["kind"] == "wave_soft_green"), None
+    )
+    assert soft is not None
+    assert soft.get("threshold") == pytest.approx(0.6)
+
+
+async def test_wave_gate_combination(monkeypatch):
+    """AB-17-w · 7 green / 3 failed where 1 failure is human-assigned →
+    denominator = 9 (10 - 1 excused), green = 7, ratio = 7/9 ≈ 0.78 → below
+    default 0.9 → raises. Verifies excusal applies BEFORE the ratio test
+    (not after) — i.e. removing the excused ticket from the denominator,
+    not from the failed list alone."""
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    tickets = [
+        _t(f"u{i}", f"SAL-{i}", f"TIR-{i:02d}", 1, "tiresias")
+        for i in range(10)
+    ]
+    for t in tickets[:7]:
+        t.status = TicketStatus.MERGED_GREEN
+    for t in tickets[7:]:
+        t.status = TicketStatus.FAILED
+    # Excuse exactly one of the three failures.
+    tickets[9].labels = ["human-assigned"]
+    _seed_graph(orch, tickets)
+    await _patch_nosleep(monkeypatch)
+
+    with pytest.raises(RuntimeError, match=r"green_ratio=0\.78"):
+        await orch._wait_for_wave_gate(1)
+    events = orch.state.events
+    halt = next(
+        e for e in events if e["kind"] == "wave_halt_below_soft_green"
+    )
+    assert halt.get("excused_count") == 1
+    assert halt.get("green_ratio") == pytest.approx(7 / 9, abs=1e-3)
+
+
+def test_parse_payload_threshold_default_and_override():
+    """AB-17-w · _parse_payload should default to SOFT_GREEN_THRESHOLD
+    (0.9) when the field is absent and apply the float override when
+    present. Non-numeric values are ignored with a warning, falling back
+    to the default."""
+    # Default.
+    orch = _mk_orchestrator(kickoff_desc={"linear_project_id": "p1"})
+    orch._parse_payload()
+    assert orch.wave_green_ratio_threshold == pytest.approx(0.9)
+
+    # Explicit override.
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "wave_green_ratio_threshold": 0.75,
+    })
+    orch._parse_payload()
+    assert orch.wave_green_ratio_threshold == pytest.approx(0.75)
+
+    # Non-numeric is ignored; default kept.
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "wave_green_ratio_threshold": "not-a-float",
+    })
+    orch._parse_payload()
+    assert orch.wave_green_ratio_threshold == pytest.approx(0.9)
+
+
 # ── PR extraction ───────────────────────────────────────────────────────────
 
 
