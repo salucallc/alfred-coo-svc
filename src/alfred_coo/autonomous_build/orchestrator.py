@@ -1302,7 +1302,43 @@ class AutonomousBuildOrchestrator:
 
         Uses `self.mesh.create_task(...)` — added to MeshClient alongside
         this orchestrator (plan F §4.2 notes mesh_task_create as re-used).
+
+        SAL-2787: re-verify the target hint immediately before dispatch to
+        defeat the wave-cache staleness race. ``_verify_wave_hints`` runs
+        ONCE at wave start and caches in ``self._verified_hints``; sibling
+        builders may merge ``new_paths`` mid-wave, so by the time a later
+        child dispatches the cached entry can be stale (v7e wave 0,
+        2026-04-24: 6 dispatches → 0 PRs because every child correctly
+        grounded out on a stale OK that re-verification flipped to
+        PATH_CONFLICT). Reuses ``self._verify_semaphore`` via
+        ``_verify_hint``; ~200ms HTTP cost per dispatch.
+
+        Wave-start ``_verify_wave_hints`` is preserved (cadence display +
+        initial graph signal); this just refreshes the per-ticket entry
+        in-place so ``_child_task_body`` reads fresh state. Failures here
+        fall back to the cached entry (verification crashes mid-wave must
+        not freeze dispatch — UNVERIFIED still dispatches by design).
         """
+        code_key = (ticket.code or "").upper()
+        if code_key:
+            hint = _TARGET_HINTS.get(code_key)
+            if hint is not None:
+                try:
+                    fresh_vr = await self._verify_hint(code_key, hint)
+                    # Key parity with `_verify_wave_hints` (uppercased) AND
+                    # with `_child_task_body`'s raw-`ticket.code` lookup —
+                    # ticket codes are uppercase by convention, but write
+                    # both keys defensively so a future lower-case code
+                    # cannot silently miss the cache lookup.
+                    self._verified_hints[code_key] = fresh_vr
+                    if ticket.code != code_key:
+                        self._verified_hints[ticket.code] = fresh_vr
+                except Exception:
+                    logger.exception(
+                        "SAL-2787: per-dispatch re-verify crashed for %s; "
+                        "falling back to wave-cached hint",
+                        code_key,
+                    )
         title = self._child_task_title(ticket)
         body = self._child_task_body(ticket)
         logger.info(

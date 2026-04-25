@@ -389,6 +389,19 @@ async def test_run_integration_dry_run_harness(monkeypatch):
         return None
     monkeypatch.setattr(orch, "_update_linear_state", _noop)
 
+    # Stub both wave-start verification and SAL-2787 per-dispatch
+    # verification so the harness doesn't make live GitHub calls.
+    async def _stub_verify_hint(code, hint):
+        return VerificationResult(
+            code=code,
+            hint=hint,
+            status=HintStatus.UNVERIFIED,
+            repo_exists=False,
+            path_results=(),
+            error="stubbed in test",
+        )
+    monkeypatch.setattr(orch, "_verify_hint", _stub_verify_hint)
+
     # Simulate an instant APPROVE + merge when the orchestrator dispatches
     # a review task. In production this would take a real review loop; the
     # dry-run harness short-circuits straight to MERGED_GREEN so the wave
@@ -2372,3 +2385,185 @@ async def test_dispatch_wave_watchdog_silent_when_no_in_flight(monkeypatch, capl
     # And no state event.
     events = [e for e in orch.state.events if e["kind"] == "wave_no_progress"]
     assert not events, f"unexpected wave_no_progress events: {events}"
+
+
+# ── SAL-2787 · per-dispatch hint re-verify (cache-staleness race fix) ──────
+
+
+async def test_dispatch_child_refreshes_verified_hints_cache(monkeypatch):
+    """SAL-2787: ``_dispatch_child`` must call ``_verify_hint`` and
+    overwrite ``self._verified_hints[code]`` BEFORE building the task body,
+    so a stale wave-start cache entry (e.g. ``OK`` while a sibling builder
+    has since merged the ``new_paths`` file) cannot escape into the child.
+
+    Audit ref: ``Z:/_planning/v1-ga/hints_audit_2026-04-24.md``; v7e wave 0
+    (2026-04-24) produced 6 dispatches → 0 PRs because every child correctly
+    grounded out on a STEP-2 re-verify that flipped the cached OK to
+    PATH_CONFLICT.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    # Pre-populate _verified_hints with a stale OK for OPS-02 — simulating
+    # wave-start verification that happened BEFORE a sibling merged
+    # IMAGE_PINS.md.
+    hint = _TARGET_HINTS["OPS-02"]
+    stale_vr = VerificationResult(
+        code="OPS-02",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=tuple(
+            PathResult(path=p, expected="exist", observed="exist", ok=True)
+            for p in hint.paths
+        ) + tuple(
+            PathResult(path=p, expected="absent", observed="absent", ok=True)
+            for p in hint.new_paths
+        ),
+    )
+    orch._verified_hints["OPS-02"] = stale_vr
+
+    # Patch _verify_hint to return the *fresh* state (path_conflict — the
+    # IMAGE_PINS.md file is now present on main).
+    fresh_vr = VerificationResult(
+        code="OPS-02",
+        hint=hint,
+        status=HintStatus.PATH_CONFLICT,
+        repo_exists=True,
+        path_results=tuple(
+            PathResult(path=p, expected="exist", observed="exist", ok=True)
+            for p in hint.paths
+        ) + tuple(
+            PathResult(path=p, expected="absent", observed="exist", ok=False)
+            for p in hint.new_paths
+        ),
+        error="one or more new_paths already exist",
+    )
+    verify_calls: list[tuple[str, str]] = []
+
+    async def _fake_verify_hint(code, h):
+        verify_calls.append((code, h.repo))
+        return fresh_vr
+    monkeypatch.setattr(orch, "_verify_hint", _fake_verify_hint)
+
+    # Stub Linear (not under test).
+    async def _noop(*a, **kw):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop)
+
+    ticket = _t("u-ops-02", "SAL-2700", "OPS-02", 0, "ops", size="S")
+    await orch._dispatch_child(ticket)
+
+    # Re-verify was called exactly once for this ticket's code.
+    assert verify_calls == [("OPS-02", hint.repo)], (
+        f"expected one _verify_hint call for OPS-02, got: {verify_calls}"
+    )
+    # Cache now reflects the fresh path_conflict, NOT the stale OK.
+    assert orch._verified_hints["OPS-02"] is fresh_vr
+    assert orch._verified_hints["OPS-02"].status is HintStatus.PATH_CONFLICT
+
+
+async def test_dispatch_child_verify_handles_unhinted_ticket(monkeypatch):
+    """SAL-2787: a ticket whose code is NOT in ``_TARGET_HINTS`` must NOT
+    trigger ``_verify_hint`` (no hint → nothing to verify) and must not
+    raise. The unresolved-render path in ``_child_task_body`` handles it.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    verify_calls: list[str] = []
+
+    async def _exploding_verify_hint(code, h):
+        verify_calls.append(code)
+        raise AssertionError(
+            "_verify_hint must NOT be called for unhinted tickets"
+        )
+    monkeypatch.setattr(orch, "_verify_hint", _exploding_verify_hint)
+
+    async def _noop(*a, **kw):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop)
+
+    # Code not in _TARGET_HINTS.
+    assert "NOT-A-REAL-CODE-99" not in _TARGET_HINTS
+    ticket = _t("u-x", "SAL-9999", "NOT-A-REAL-CODE-99", 0, "ops", size="S")
+
+    # Must not raise.
+    await orch._dispatch_child(ticket)
+
+    assert verify_calls == [], (
+        f"unhinted ticket triggered verify: {verify_calls}"
+    )
+    # Empty-code ticket too: no verify, no error.
+    ticket2 = _t("u-y", "SAL-9998", "", 0, "ops", size="S")
+    await orch._dispatch_child(ticket2)
+    assert verify_calls == []
+
+
+async def test_dispatch_child_uses_fresh_hint_in_body(monkeypatch):
+    """SAL-2787: end-to-end — when ``_verify_hint`` returns ``PATH_CONFLICT``
+    mid-test, the rendered ``## Target`` block in the dispatched body must
+    carry the conflict marker (``# CONFLICT: file already exists ...``)
+    rather than the stale ``# verified absent ...`` from the wave-start
+    cache. Asserts the fresh state actually reaches the child.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    # Stale OK in cache.
+    hint = _TARGET_HINTS["OPS-02"]
+    orch._verified_hints["OPS-02"] = VerificationResult(
+        code="OPS-02",
+        hint=hint,
+        status=HintStatus.OK,
+        repo_exists=True,
+        path_results=tuple(
+            PathResult(path=p, expected="exist", observed="exist", ok=True)
+            for p in hint.paths
+        ) + tuple(
+            PathResult(path=p, expected="absent", observed="absent", ok=True)
+            for p in hint.new_paths
+        ),
+    )
+
+    # Patch _verify_hint to flip to PATH_CONFLICT.
+    async def _fake_verify_hint(code, h):
+        return VerificationResult(
+            code=code,
+            hint=h,
+            status=HintStatus.PATH_CONFLICT,
+            repo_exists=True,
+            path_results=tuple(
+                PathResult(path=p, expected="exist", observed="exist", ok=True)
+                for p in h.paths
+            ) + tuple(
+                PathResult(path=p, expected="absent", observed="exist", ok=False)
+                for p in h.new_paths
+            ),
+            error="one or more new_paths already exist",
+        )
+    monkeypatch.setattr(orch, "_verify_hint", _fake_verify_hint)
+
+    async def _noop(*a, **kw):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop)
+
+    ticket = _t("u-ops-02", "SAL-2700", "OPS-02", 0, "ops", size="S")
+    await orch._dispatch_child(ticket)
+
+    # The mesh recorded the dispatched body — assert the conflict marker
+    # made it in (i.e. the fresh re-verify drove the render, not the
+    # stale OK).
+    assert mesh.created, "expected a mesh task to be created"
+    body = mesh.created[-1]["description"]
+    assert "## Target" in body
+    # _render_target_block emits a "(conflict — file ... already exists"
+    # marker on each `new_paths` entry whose observed flipped to "exist".
+    assert "(conflict —" in body, (
+        f"expected conflict marker in fresh-rendered Target block; got:\n{body}"
+    )
+    # And conversely, the rendered block must NOT carry the stale
+    # "verified absent" marker that the cached OK would have produced.
+    assert "# verified absent @" not in body, (
+        f"stale 'verified absent' marker leaked through; body:\n{body}"
+    )
