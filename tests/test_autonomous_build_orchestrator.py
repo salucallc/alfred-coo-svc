@@ -1032,6 +1032,188 @@ async def test_poll_children_keeps_claimed_child_in_progress(monkeypatch):
     )
 
 
+# ── AB-17-y · orphan-active reconciliation (post-v7l, SAL-2842) ─────────────
+#
+# Reproduces the silent-stuck scenario observed on v7l 2026-04-25:
+# SAL-2603 (UUID 28b30b6e...) hydrated from a prior daemon's persisted
+# state as ``in_progress`` but with NO entry in
+# ``state.dispatched_child_tasks``. The AB-17-x reconciler is gated on
+# ``t.child_task_id`` being truthy — orphan-active tickets bypass it
+# entirely. Watchdog reported ``in_flight=1 ready=0`` for 70+ min with
+# no possible escape path.
+#
+# These tests pin the orphan-active reconciler so a future refactor that
+# tightens the active-states list or moves the reconcile pre-pass can't
+# silently regress the v7l fix.
+
+
+async def test_poll_children_force_fails_orphan_active_after_threshold(
+    monkeypatch,
+):
+    """AB-17-y: a ticket in ACTIVE_TICKET_STATES with ``child_task_id is
+    None`` past STUCK_CHILD_FORCE_FAIL_SEC must be force-failed. Live
+    bug: SAL-2603 stuck IN_PROGRESS for 70+ min on v7l with no recovery
+    path. AB-17-x's reconcile loop skips this case because its filter
+    requires ``t.child_task_id`` to be truthy."""
+    import time as _time
+
+    from alfred_coo.autonomous_build.orchestrator import (
+        STUCK_CHILD_FORCE_FAIL_SEC,
+    )
+
+    mesh = _FakeMesh()  # no records anywhere
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u-orphan", "SAL-2603", "ALT-06", 0, "aletheia",
+           size="M", estimate=5)
+    t.status = TicketStatus.IN_PROGRESS
+    # The defining condition: active state, no child_task_id.
+    assert t.child_task_id is None, "fixture invariant"
+    _seed_graph(orch, [t])
+
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Stuck way past the threshold (70 min, mirrors the live v7l case).
+    orch._ticket_transition_ts[t.id] = _time.time() - (
+        STUCK_CHILD_FORCE_FAIL_SEC + 2400
+    )
+
+    updated = await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"expected FAILED for orphan-active ticket, got {t.status}; the "
+        f"orchestrator must reconcile active-state tickets with no "
+        f"child_task_id or the watchdog will spin in_flight=1 forever"
+    )
+    assert ("SAL-2603", "Backlog") in linear_calls, (
+        f"orphan-active force-fail must roll Linear -> Backlog: "
+        f"{linear_calls}"
+    )
+    assert any(
+        evt.get("kind") == "ticket_failed"
+        and "no_child_task_id" in str(evt.get("note", ""))
+        for evt in (orch.state.events or [])
+    ), (
+        f"expected a 'no_child_task_id' ticket_failed event in state, "
+        f"got: {orch.state.events}"
+    )
+    assert t in updated, (
+        f"orphan force-fail must surface in returned updated list (so "
+        f"watchdog progress timestamp bumps); got: {updated}"
+    )
+
+
+async def test_poll_children_does_not_force_fail_orphan_below_threshold(
+    monkeypatch,
+):
+    """AB-17-y: an orphan-active ticket whose transition_ts is RECENT
+    must NOT be force-failed. The dispatch loop may legitimately
+    transition a ticket to DISPATCHED before the next snapshot stamps
+    ``child_task_id`` into state; the no-child window is bounded by
+    one tick. Force-failing on the first tick post-restore would race
+    the dispatch loop and create false-failures."""
+    import time as _time
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u-fresh", "SAL-1", "TIR-01", 0, "tiresias", size="S",
+           estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    assert t.child_task_id is None, "fixture invariant"
+    _seed_graph(orch, [t])
+
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Just transitioned — well below threshold.
+    orch._ticket_transition_ts[t.id] = _time.time()
+
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.DISPATCHED, (
+        f"sub-threshold orphan must NOT be force-failed; got {t.status}"
+    )
+    assert linear_calls == [], (
+        f"no Linear updates for sub-threshold orphan: {linear_calls}"
+    )
+
+
+async def test_poll_children_orphan_reconcile_runs_when_no_in_flight(
+    monkeypatch,
+):
+    """AB-17-y: the orphan reconcile MUST run even when the AB-17-x
+    in-flight set is empty. Pre-fix, ``_poll_children`` returned early
+    on ``if not in_flight: return []``, so an orphan ticket (which by
+    definition has no child_task_id and is excluded from the in-flight
+    filter) was never inspected. The orphan branch runs first and its
+    output must be returned even on the empty-in-flight short-circuit.
+    """
+    import time as _time
+
+    from alfred_coo.autonomous_build.orchestrator import (
+        STUCK_CHILD_FORCE_FAIL_SEC,
+    )
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    # Only one ticket in the graph — orphan-active. No tickets with
+    # ``child_task_id`` set, so the AB-17-x in_flight list is empty.
+    t = _t("u-only-orphan", "SAL-2603", "ALT-06", 0, "aletheia",
+           size="M", estimate=5)
+    t.status = TicketStatus.IN_PROGRESS
+    _seed_graph(orch, [t])
+
+    async def _fake_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    orch._ticket_transition_ts[t.id] = _time.time() - (
+        STUCK_CHILD_FORCE_FAIL_SEC + 60
+    )
+
+    updated = await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"orphan reconcile must run BEFORE the in_flight short-circuit; "
+        f"got {t.status}"
+    )
+    assert t in updated, (
+        f"empty-in-flight short-circuit must still return orphan-failed "
+        f"tickets; got: {updated}"
+    )
+
+
 # ── AB-13: ## Target block + _TARGET_HINTS table (Plan H §2 G-2) ────────────
 
 

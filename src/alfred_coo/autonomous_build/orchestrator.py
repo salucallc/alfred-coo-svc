@@ -106,6 +106,29 @@ PROGRESS_STALL_WARN_SEC = 900  # 15 min
 # completed window is still observable.
 STUCK_CHILD_FORCE_FAIL_SEC = 30 * 60  # 30 min
 
+# AB-17-y · orphan-active reconciliation (post-v7l, 2026-04-25, SAL-2842).
+# A ticket can persist in an *active* state (DISPATCHED/IN_PROGRESS/PR_OPEN/
+# REVIEWING/MERGE_REQUESTED) with ``child_task_id == None``. AB-17-x's
+# reconcile loop is gated on ``t.child_task_id`` being truthy, so an
+# orphan-active ticket bypasses every recovery branch even though
+# ``_in_flight_for_wave`` (status-only) keeps counting it as in-flight
+# forever. Live-observed on v7l: SAL-2603 (UUID 28b30b6e...) hydrated
+# in_progress from a prior daemon's persisted state with NO entry in
+# ``state.dispatched_child_tasks`` across all 91 soul checkpoints — the
+# watchdog reported ``in_flight=1 ready=0`` for 70+ minutes with no
+# escape path. The orphan-active fail-cap reuses
+# ``STUCK_CHILD_FORCE_FAIL_SEC`` as its time window.
+#
+# Mirrors the status set in ``_in_flight_for_wave`` so the two views of
+# "in flight" stay in sync. If you add a new active state, update both.
+ACTIVE_TICKET_STATES: frozenset = frozenset({
+    TicketStatus.DISPATCHED,
+    TicketStatus.IN_PROGRESS,
+    TicketStatus.PR_OPEN,
+    TicketStatus.REVIEWING,
+    TicketStatus.MERGE_REQUESTED,
+})
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -1766,13 +1789,7 @@ class AutonomousBuildOrchestrator:
     def _in_flight_for_wave(self, wave_n: int) -> List[Ticket]:
         return [
             t for t in self.graph.tickets_in_wave(wave_n)
-            if t.status in (
-                TicketStatus.DISPATCHED,
-                TicketStatus.IN_PROGRESS,
-                TicketStatus.PR_OPEN,
-                TicketStatus.REVIEWING,
-                TicketStatus.MERGE_REQUESTED,
-            )
+            if t.status in ACTIVE_TICKET_STATES
         ]
 
     def _epic_in_flight(self, epic: str, in_flight: List[Ticket]) -> int:
@@ -1971,6 +1988,66 @@ class AutonomousBuildOrchestrator:
 
     # ── child polling + state transitions ───────────────────────────────────
 
+    async def _reconcile_orphan_active(self) -> List[Ticket]:
+        """AB-17-y · force-fail tickets stuck in active state with no
+        ``child_task_id``.
+
+        The AB-17-x phantom-child reconciler inside ``_poll_children``
+        is gated on ``t.child_task_id`` being truthy; an orphan-active
+        ticket (active status, no child id) bypasses every recovery
+        branch even though ``_in_flight_for_wave`` (status-only) keeps
+        counting it as in-flight. This pre-pass closes that gap.
+
+        Live observation (v7l, 2026-04-25): SAL-2603 (UUID 28b30b6e...)
+        hydrated as ``in_progress`` from a prior daemon's persisted
+        state with NO entry in ``state.dispatched_child_tasks`` across
+        all 91 soul checkpoints. Watchdog reported ``in_flight=1
+        ready=0`` for 70+ minutes.
+
+        Force-fails any active-state ticket whose
+        ``_ticket_transition_ts`` (last status-change clock) is older
+        than ``STUCK_CHILD_FORCE_FAIL_SEC``. Sub-threshold orphans are
+        intentionally tolerated so the dispatch loop has a chance to
+        re-attach a child via ``_dispatch_child`` on the next tick.
+
+        Returns the list of tickets force-failed this tick (empty if
+        none) so the caller can roll them into ``_poll_children``'s
+        ``updated`` set for watchdog progress accounting.
+        """
+        now = time.time()
+        forced: List[Ticket] = []
+        for ticket in self.graph.nodes.values():
+            if ticket.status not in ACTIVE_TICKET_STATES:
+                continue
+            if ticket.child_task_id:
+                # Has a child id — AB-17-x's loop will handle it. We
+                # only want to catch the orphan-active class here.
+                continue
+            entered_ts = self._ticket_transition_ts.get(ticket.id)
+            stuck_for = (now - entered_ts) if entered_ts else 0.0
+            if stuck_for <= STUCK_CHILD_FORCE_FAIL_SEC:
+                # Recently restored / freshly transitioned — give the
+                # dispatch loop a chance to re-attach a child task.
+                continue
+            logger.warning(
+                "AB-17-y: orphan-active %s (%s) — no child_task_id "
+                "for %.0fs; force-failing",
+                ticket.identifier, ticket.status.value, stuck_for,
+            )
+            ticket.status = TicketStatus.FAILED
+            self.state.record_event(
+                "ticket_failed",
+                identifier=ticket.identifier,
+                note=(
+                    f"no_child_task_id: ticket in active status with "
+                    f"no dispatched_child_tasks entry for "
+                    f"{int(stuck_for)}s"
+                ),
+            )
+            await self._update_linear_state(ticket, "Backlog")
+            forced.append(ticket)
+        return forced
+
     async def _poll_children(self) -> List[Ticket]:
         """Query recently completed mesh tasks and match them back to
         dispatched tickets. Returns the tickets whose statuses changed this
@@ -1998,14 +2075,36 @@ class AutonomousBuildOrchestrator:
         URL but its ticket never transitioned out of DISPATCHED, leaving
         ``in_flight=1 ready=0`` for hours despite zero claimed-state
         mesh tasks for the run.
+
+        AB-17-y (2026-04-25, post-v7l, SAL-2842): a sibling reconciler
+        runs BEFORE the AB-17-x in-flight filter to catch orphan-active
+        tickets — a ticket whose status is in ``ACTIVE_TICKET_STATES``
+        but ``child_task_id is None``. AB-17-x's filter
+        (``if t.child_task_id and t.status not in TERMINAL_STATES``)
+        skips these entirely, so the watchdog (status-only) sees them
+        as in_flight forever. Live-observed on v7l: SAL-2603 hydrated
+        in_progress from a prior daemon's checkpoint with no entry in
+        ``state.dispatched_child_tasks``; ``in_flight=1 ready=0`` for
+        70+ min before this fix existed. Force-fail kicks in once the
+        ticket has been in its current active status for longer than
+        ``STUCK_CHILD_FORCE_FAIL_SEC`` (same window as AB-17-x).
         """
+        # AB-17-y · orphan-active reconciliation (runs first so the
+        # AB-17-x filter below can ignore the no-child case cleanly).
+        # Force-fails any active-state ticket that's been stuck without a
+        # ``child_task_id`` past the threshold; sub-threshold tickets are
+        # left alone so the dispatch loop has a chance to lift them out
+        # of the orphan state on the next tick. See SAL-2842 for the
+        # live-observed v7l scenario this catches.
+        orphan_failed = await self._reconcile_orphan_active()
+
         in_flight = [
             t for t in self.graph.nodes.values()
             if t.child_task_id
             and t.status not in TERMINAL_STATES
         ]
         if not in_flight:
-            return []
+            return list(orphan_failed)
 
         # AB-17-x: fetch all three lifecycle states in one pass so we have
         # full visibility into where each child sits on the mesh. ``failed``
@@ -2175,6 +2274,12 @@ class AutonomousBuildOrchestrator:
                 )
                 await self._update_linear_state(ticket, "Backlog")
                 updated.append(ticket)
+
+        # AB-17-y: roll orphan-active force-fails into the same updated
+        # list so the watchdog sees them as forward progress and the
+        # caller (cadence diff, tests) gets a unified ticket list.
+        if orphan_failed:
+            updated.extend(orphan_failed)
 
         # AB-17-p: any state transition this tick (PR_OPEN, REVIEWING,
         # FAILED) counts as forward progress. Single stamp at the loop
