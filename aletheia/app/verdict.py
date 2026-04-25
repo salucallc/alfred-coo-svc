@@ -1,9 +1,13 @@
 from pydantic import BaseModel
-from typing import Optional
 
-class VerdictRequest(BaseModel):
+class Verdict(BaseModel):
     verdict: str
-    verifier_model: Optional[str] = None
-    generator_model: Optional[str] = None
-    action_class: Optional[str] = None
-    evidence_sha256: Optional[str] = None
+    verifier_model: str
+    generator_model: str
+    action_class: str
+    evidence_sha256: str
+    created_at: str
+
+def create_verdict(**kwargs) -> Verdict:
+    """Factory helper to create a Verdict instance from keyword args."""
+    return Verdict(**kwargs)

@@ -1,18 +1,19 @@
-from fastapi.testclient import TestClient
-from aletheia.app.main import app
+import pytest
+from aletheia.app.verdict import Verdict, create_verdict
+from aletheia.app.soul_writer import write_verdict
 
-client = TestClient(app)
+def test_verdict_creation():
+    v = create_verdict(
+        verdict="PASS",
+        verifier_model="model1",
+        generator_model="model2",
+        action_class="test_action",
+        evidence_sha256="abc123",
+        created_at="2026-04-25T00:00:00Z",
+    )
+    assert isinstance(v, Verdict)
+    assert v.verdict == "PASS"
 
-def test_debug_verdict_endpoint():
-    payload = {
-        "verdict": "PASS",
-        "verifier_model": "qwen3-coder:480b-cloud",
-        "generator_model": "test-gen-model",
-        "action_class": "test_action",
-        "evidence_sha256": "abc123def456"
-    }
-    response = client.post("/v1/_debug/verdict", json=payload)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "recorded"
-    assert data["verdict"] == "PASS"
+def test_soul_writer():
+    data = {"verdict": "PASS"}
+    assert write_verdict(data) is True

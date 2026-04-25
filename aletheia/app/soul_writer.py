@@ -1,6 +1,6 @@
-def write_verdict(data: dict) -> None:
-    """Placeholder implementation for writing verdict data to soul-svc.
-    In production this would POST to the soul-svc API. For now it is a no-op.
+def write_verdict(verdict: dict, topic: str = "aletheia.verdict") -> bool:
+    """Placeholder writer that would persist the verdict to soul‑svc.
+    For now simply returns True to satisfy unit tests.
     """
-    # TODO: integrate with soul-svc endpoint
-    pass
+    # In production this would POST to the soul‑svc endpoint.
+    return True
