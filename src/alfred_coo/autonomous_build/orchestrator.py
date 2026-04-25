@@ -4414,6 +4414,32 @@ class AutonomousBuildOrchestrator:
                 )[:500]
             if not reason:
                 reason = f"external_cancel:status={status or 'unknown'}"
+
+            # SAL-2890: defend against self-inflicted cancels.
+            #
+            # The daemon's main task-claim loop can spuriously re-claim its
+            # own already-running orchestrator parent task during long
+            # stalls (heartbeat-claim staleness in soul-svc). The duplicate-
+            # kickoff guard in main.py rejects the second claim by setting
+            # mesh status=failed with reason "duplicate_kickoff: existing
+            # orchestrator task=<own_id> running for project=<id>". If we
+            # honor that as a cancel, we kill our own recovery. The reason
+            # field is structurally diagnosable: prefix + own task id.
+            #
+            # Ignore the signal in that case, logging a WARNING so the race
+            # remains visible. External operator cancels (different reason
+            # OR same reason naming a different task id) are still honored.
+            if reason.startswith("duplicate_kickoff:") and self.task_id in reason:
+                logger.warning(
+                    "[cancel] ignoring self-inflicted duplicate-kickoff cancel "
+                    "signal for kickoff %s (reason=%s); main-loop spuriously "
+                    "re-claimed own running task. SAL-2890.",
+                    self.task_id, reason,
+                )
+                # Do NOT set _cancel_requested; do NOT enter drain mode.
+                # Caller treats False return as "no cancel observed."
+                return False
+
             self._cancel_requested = True
             self._cancel_reason = reason
             self._drain_mode = True
