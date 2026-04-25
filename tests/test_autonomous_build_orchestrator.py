@@ -3434,6 +3434,153 @@ async def test_check_cancel_signal_recognizes_canceled_status():
     assert "canceled" in orch._cancel_reason
 
 
+# ── SAL-2890: defend _check_cancel_signal against self-inflicted cancels ───
+#
+# v7p resume run at 21:41 UTC 2026-04-25: the daemon's main task-claim loop
+# spuriously re-claimed its OWN already-running orchestrator parent task. The
+# duplicate-kickoff guard in main.py rejected the second claim by setting
+# mesh status=failed with reason
+#   "duplicate_kickoff: existing orchestrator task=<own_id> running for project=<id>"
+# The still-running orchestrator's `_check_cancel_signal` polled the parent
+# task on its next tick, observed status=failed, and treated it as an
+# external cancel. Self-inflicted: PR #91 was actively recovering. Layer-A
+# fix at the cancel-signal poll site filters self-inflicted reasons.
+
+
+async def test_check_cancel_signal_rejects_self_inflicted_duplicate_kickoff(caplog):
+    """SAL-2890: when the failed-kickoff reason is a duplicate-kickoff guard
+    rejection naming the orchestrator's OWN task id, the cancel signal must
+    be ignored — that's the daemon's own main loop racing itself, not an
+    external operator stop. A WARNING is logged so the race stays visible.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    own_id = orch.task_id  # "kick-abc" via _mk_orchestrator
+    project_id = "8c1d8f69-aaaa-bbbb-cccc-deadbeefcafe"
+
+    async def _get_task(task_id):
+        return {
+            "id": task_id,
+            "status": "failed",
+            "result": {
+                "reason": (
+                    f"duplicate_kickoff: existing orchestrator task={own_id} "
+                    f"running for project={project_id}"
+                ),
+            },
+        }
+    mesh.get_task = _get_task
+
+    import logging as _logging
+    with caplog.at_level(
+        _logging.WARNING,
+        logger="alfred_coo.autonomous_build.orchestrator",
+    ):
+        observed = await orch._check_cancel_signal()
+
+    assert observed is False, "self-inflicted duplicate-kickoff must NOT fire cancel"
+    assert orch._cancel_requested is False
+    assert orch._drain_mode is False
+    assert orch._cancel_reason == ""
+
+    # No cancel_requested event recorded.
+    cancel_events = [e for e in orch.state.events if e["kind"] == "cancel_requested"]
+    assert cancel_events == []
+
+    # SAL-2890 WARNING emitted — leaves a breadcrumb for the race.
+    sal_logs = [
+        r.getMessage() for r in caplog.records
+        if r.levelname == "WARNING" and "SAL-2890" in r.getMessage()
+    ]
+    assert len(sal_logs) == 1, (
+        f"expected one SAL-2890 self-inflicted-cancel WARNING; got: {sal_logs}"
+    )
+    assert "self-inflicted" in sal_logs[0].lower() or "ignoring" in sal_logs[0].lower()
+
+
+async def test_check_cancel_signal_honors_duplicate_kickoff_for_different_task_id():
+    """The self-inflicted filter must only fire when the duplicate-kickoff
+    reason names the orchestrator's OWN task id. A duplicate-kickoff message
+    referencing a DIFFERENT task id (e.g. genuinely orphaned upstream task)
+    should still be honored as a cancel — guards against the filter being
+    too permissive.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    other_id = "deadbeef-1111-2222-3333-444444444444"
+    project_id = "8c1d8f69-aaaa-bbbb-cccc-deadbeefcafe"
+    assert other_id != orch.task_id
+
+    async def _get_task(task_id):
+        return {
+            "id": task_id,
+            "status": "failed",
+            "result": {
+                "reason": (
+                    f"duplicate_kickoff: existing orchestrator task={other_id} "
+                    f"running for project={project_id}"
+                ),
+            },
+        }
+    mesh.get_task = _get_task
+
+    observed = await orch._check_cancel_signal()
+    assert observed is True
+    assert orch._cancel_requested is True
+    assert orch._drain_mode is True
+    assert "duplicate_kickoff" in orch._cancel_reason
+
+
+async def test_check_cancel_signal_honors_external_cancel():
+    """Regression: an explicit external-cancel reason must still fire the
+    cancel — operators must be able to stop a runaway wave with
+    `mesh.complete --status failed --reason external_cancel`.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    async def _get_task(task_id):
+        return {
+            "id": task_id,
+            "status": "failed",
+            "result": {"reason": "external_cancel: operator stop"},
+        }
+    mesh.get_task = _get_task
+
+    observed = await orch._check_cancel_signal()
+    assert observed is True
+    assert orch._cancel_requested is True
+    assert orch._drain_mode is True
+    assert "external_cancel" in orch._cancel_reason
+
+
+async def test_check_cancel_signal_honors_naked_failed_status():
+    """Regression: AB-17-q's documented behaviour — `status="failed"` with
+    no `cancel` flag and no `reason` is still treated as a cancel. The
+    SAL-2890 self-inflicted filter must not regress this path.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    async def _get_task(task_id):
+        return {
+            "id": task_id,
+            "status": "failed",
+            "result": {},
+        }
+    mesh.get_task = _get_task
+
+    observed = await orch._check_cancel_signal()
+    assert observed is True
+    assert orch._cancel_requested is True
+    assert orch._drain_mode is True
+    # Synthesised reason from the no-explicit-reason branch.
+    assert "external_cancel" in orch._cancel_reason
+    assert "failed" in orch._cancel_reason
+
+
 async def test_complete_kickoff_canceled_posts_failed_with_cancel_flag(monkeypatch):
     """`_complete_kickoff_canceled` writes mesh.complete with
     status="failed" and result.cancel=True so the kickoff record
