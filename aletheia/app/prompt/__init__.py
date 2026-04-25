@@ -1,1 +1,1 @@
-# Package init for Aletheia prompt utilities
+from .parser import parse_verdict

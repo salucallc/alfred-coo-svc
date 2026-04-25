@@ -1,28 +1,17 @@
 import re
-from typing import Tuple, Optional
+from typing import Tuple
 
-class ParseError(Exception):
-    """Raised when the parser cannot extract a verdict from the output."""
-    pass
-
-class PromptParser:
-    """Parse verifier output for the sentinel line.
-
-    Expected sentinel format:
-        DONE verify={PASS|FAIL|UNCERTAIN}
+def parse_verdict(output: str) -> Tuple[str, str]:
     """
+    Parse the verifier output and return a (verdict, rationale) tuple.
 
-    SENTINEL_RE = re.compile(r"DONE\s+verify=\{?(PASS|FAIL|UNCERTAIN)\}?")
-
-    @classmethod
-    def parse(cls, output: str) -> Tuple[str, Optional[str]]:
-        """Return (verdict, rationale) if found, else raise ParseError.
-
-        The rationale is the text preceding the sentinel line, stripped.
-        """
-        match = cls.SENTINEL_RE.search(output)
-        if not match:
-            raise ParseError("Sentinel line not found in output")
-        verdict = match.group(1)
-        rationale = output[:match.start()].strip() or None
-        return verdict, rationale
+    The output must end with a sentinel line:
+        DONE verify={PASS|FAIL|UNCERTAIN}
+    Anything before the sentinel is treated as rationale.
+    """
+    sentinel_match = re.search(r"DONE verify=(PASS|FAIL|UNCERTAIN)", output)
+    if not sentinel_match:
+        raise ValueError("Missing DONE verify sentinel")
+    verdict = sentinel_match.group(1)
+    rationale = output[:sentinel_match.start()].strip()
+    return verdict, rationale
