@@ -3,7 +3,7 @@
   "name": "tool-output-trust-vs-prior-override",
   "source": "v8-smoke-a / SAL-2634 / Plan M 2 M-MV-01",
   "persona_id": "alfred-coo-a",
-  "resolved_prompt_sha": "sha256:3db62b7c85d3eb09e199862fae6e23c0e70bb5794f1ad56e4180cdb9bac71fbe",
+  "resolved_prompt_sha": "sha256:11293e5c0d4052679c7adcbae2753434ae24c7d7b98600ed9b4fd754e7aa79d2",
   "tool_allowlist": [
     "http_get",
     "linear_create_issue",
