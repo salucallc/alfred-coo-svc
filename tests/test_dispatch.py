@@ -266,8 +266,14 @@ async def test_custom_tiresias_tenant_propagates(monkeypatch, ctx):
 
 @pytest.mark.asyncio
 async def test_fallback_call_also_hits_gateway(monkeypatch, ctx):
-    """First call raises (simulated by 500 via transport with custom response);
-    fallback retries with a different model; both requests land on the gateway.
+    """A non-retryable 4xx on primary triggers the fallback layer; both
+    requests land on the gateway.
+
+    AB-17-t (2026-04-24): switched the failure injection from 500 → 400 so
+    the retry wrapper doesn't swallow this scenario. 5xx is now retried up
+    to 3 times on the SAME model before fallback engages — see the AB-17-t
+    test block at the bottom of this file for the 5xx-exhaust-then-fallback
+    coverage.
     """
     class FailingThenOk(httpx.AsyncBaseTransport):
         def __init__(self):
@@ -278,7 +284,9 @@ async def test_fallback_call_also_hits_gateway(monkeypatch, ctx):
             self.requests.append(request)
             self.count += 1
             if self.count == 1:
-                return httpx.Response(500, json={"error": "boom"}, request=request)
+                # 4xx is a deterministic client error — wrapper does NOT retry,
+                # fallback layer above it engages immediately.
+                return httpx.Response(400, json={"error": "bad"}, request=request)
             return httpx.Response(200, json=_plain_response("fb-ok"), request=request)
 
     d = Dispatcher(
@@ -625,3 +633,189 @@ def test_builder_iteration_cap_unknown_persona_returns_none():
     task = {"title": "x", "description": "Size: L\n"}
     assert _builder_iteration_cap("some-future-persona", task) is None
     assert _builder_iteration_cap("unknown", task) is None
+
+
+# ── AB-17-t · dispatch 5xx retry wrapper ────────────────────────────────
+
+
+class _ProgrammableTransport(httpx.AsyncBaseTransport):
+    """httpx transport that returns a scripted sequence of (status, body) tuples.
+
+    Used by the AB-17-t tests to simulate 500-then-200 flap patterns. Once the
+    sequence is exhausted, the final tuple repeats forever so misconfigured
+    fallback loops don't crash the test.
+    """
+
+    def __init__(self, sequence: list[tuple[int, dict]]) -> None:
+        self.sequence = sequence
+        self.requests: list[httpx.Request] = []
+        self._idx = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        idx = min(self._idx, len(self.sequence) - 1)
+        self._idx += 1
+        status, body = self.sequence[idx]
+        return httpx.Response(status, json=body, request=request)
+
+
+@pytest.fixture
+def fast_retry(monkeypatch):
+    """Strip the backoff delay so retry tests run in ~ms instead of seconds.
+
+    The wrapper uses tenacity's `wait_exponential_jitter`; collapsing the
+    initial+max to ~0 keeps the retry semantics intact (still 3 attempts,
+    still gated on `_is_retryable_infra_error`) without forcing the suite to
+    sleep through real exponential delays.
+    """
+    import alfred_coo.dispatch as d
+
+    monkeypatch.setattr(d, "_INFRA_RETRY_BASE_SECONDS", 0.001)
+    monkeypatch.setattr(d, "_INFRA_RETRY_MAX_SECONDS", 0.002)
+
+
+@pytest.mark.asyncio
+async def test_5xx_retry_succeeds_on_third_attempt(monkeypatch, dispatcher, ctx, fast_retry):
+    """Two 500s then a 200 — call must succeed at attempt 3 inside the same
+    `_call_gateway`, before the fallback layer ever sees the failure."""
+    transport = _ProgrammableTransport([
+        (500, {"error": "upstream flap"}),
+        (500, {"error": "upstream flap"}),
+        (200, _plain_response("third-time-lucky")),
+    ])
+    _install_mock_transport(monkeypatch, transport)
+
+    result = await dispatcher.call(
+        "qwen3-coder:480b-cloud", "sys", "prompt",
+        fallback_model="deepseek-v3.2:cloud",  # MUST NOT trigger
+        context=ctx,
+    )
+
+    assert result["content"] == "third-time-lucky"
+    # Same model used — fallback never engaged.
+    assert result["model_used"] == "qwen3-coder:480b-cloud"
+    assert "->" not in result["model_used"]
+    assert len(transport.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_4xx_does_not_retry(monkeypatch, dispatcher, ctx, fast_retry):
+    """A 400 is a real client error — must surface fast, no retry."""
+    transport = _ProgrammableTransport([
+        (400, {"error": "bad request"}),
+        # If the wrapper retries, it would hit a 200 here and succeed —
+        # which would be a regression.
+        (200, _plain_response("WRONG-should-not-reach")),
+    ])
+    _install_mock_transport(monkeypatch, transport)
+
+    # 4xx should propagate; existing fallback layer in `call` then swaps
+    # models. We pin fallback == primary so the propagated error escapes the
+    # whole `call` and we can assert on it directly.
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        await dispatcher.call(
+            "qwen3-coder:480b-cloud", "sys", "prompt",
+            fallback_model="qwen3-coder:480b-cloud",
+            context=ctx,
+        )
+    assert excinfo.value.response.status_code == 400
+    # Exactly ONE request — no retry on 4xx.
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_5xx_exhaustion_propagates_then_fallback_engages(
+    monkeypatch, ctx, fast_retry,
+):
+    """Three 500s on primary → wrapper exhausts → existing fallback layer
+    picks up and retries on a different model. Validates the retry sits
+    BELOW the fallback (additive, not replacement)."""
+    # 3 * 500 for primary, then 200 for fallback's first try.
+    transport = _ProgrammableTransport([
+        (500, {"error": "boom"}),
+        (500, {"error": "boom"}),
+        (500, {"error": "boom"}),
+        (200, _plain_response("fallback-rescued")),
+    ])
+    d = Dispatcher(
+        ollama_url="http://gw/v1",
+        gateway_url="http://gw",
+        autobuild_soulkey="sk",
+    )
+    _install_mock_transport(monkeypatch, transport)
+
+    result = await d.call(
+        "qwen3-coder:480b-cloud", "sys", "prompt",
+        fallback_model="deepseek-v3.2:cloud",
+        context=ctx,
+    )
+
+    assert result["content"] == "fallback-rescued"
+    assert "->" in result["model_used"]  # fallback chain engaged
+    # 3 retries on primary + 1 fallback call = 4 requests total.
+    assert len(transport.requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_retry_emits_infra_retry_log(monkeypatch, dispatcher, ctx, caplog, fast_retry):
+    """Each retry attempt past the first emits an `[infra_retry]` warning so
+    operators can spot upstream flaps in the log without parsing exception
+    chains."""
+    import logging as _logging
+
+    transport = _ProgrammableTransport([
+        (500, {"error": "flap"}),
+        (200, _plain_response("ok")),
+    ])
+    _install_mock_transport(monkeypatch, transport)
+
+    with caplog.at_level(_logging.WARNING, logger="alfred_coo.dispatch"):
+        await dispatcher.call("qwen3-coder:480b-cloud", "sys", "prompt", context=ctx)
+
+    retry_warnings = [r for r in caplog.records if "[infra_retry]" in r.message]
+    assert retry_warnings, "expected at least one [infra_retry] log line"
+    # The log must surface the URL and attempt number for ops triage.
+    msg = retry_warnings[0].message
+    assert "/v1/chat/completions" in msg
+    assert "attempt=2" in msg
+    assert "qwen3-coder:480b-cloud" in msg
+
+
+def test_is_retryable_infra_error_classification():
+    """Direct unit test on the predicate so the retry boundary is locked
+    even if the AsyncRetrying loop is later refactored."""
+    from alfred_coo.dispatch import _is_retryable_infra_error
+
+    # Build minimal HTTPStatusError instances for the matrix.
+    req = httpx.Request("POST", "http://gw/v1/chat/completions")
+
+    err_500 = httpx.HTTPStatusError(
+        "boom", request=req,
+        response=httpx.Response(500, request=req),
+    )
+    err_503 = httpx.HTTPStatusError(
+        "boom", request=req,
+        response=httpx.Response(503, request=req),
+    )
+    err_400 = httpx.HTTPStatusError(
+        "bad", request=req,
+        response=httpx.Response(400, request=req),
+    )
+    err_404 = httpx.HTTPStatusError(
+        "missing", request=req,
+        response=httpx.Response(404, request=req),
+    )
+
+    assert _is_retryable_infra_error(err_500) is True
+    assert _is_retryable_infra_error(err_503) is True
+    assert _is_retryable_infra_error(err_400) is False
+    assert _is_retryable_infra_error(err_404) is False
+
+    # Connection-class errors retry.
+    assert _is_retryable_infra_error(httpx.ConnectError("refused")) is True
+    assert _is_retryable_infra_error(httpx.ReadTimeout("slow")) is True
+    assert _is_retryable_infra_error(httpx.RemoteProtocolError("eof")) is True
+
+    # Logic bugs do NOT retry.
+    assert _is_retryable_infra_error(ValueError("oops")) is False
+    assert _is_retryable_infra_error(KeyError("missing")) is False
