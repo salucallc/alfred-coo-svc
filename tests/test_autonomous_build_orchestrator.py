@@ -817,6 +817,221 @@ async def test_poll_children_marks_failed_when_no_pr_url(monkeypatch):
     )
 
 
+# ── AB-17-x · phantom-child reconciliation (post-v7k 2026-04-25) ────────────
+#
+# Reproduces the silent-stuck scenario observed twice on 2026-04-25:
+# v7i (kickoff 06:11 UTC) and v7k (kickoff 07:14 UTC) both wedged on
+# SAL-2672 SS-11 with `[watchdog] in_flight=1 ready=0` for hours, even
+# though the mesh-state side showed zero claimed tasks for the run.
+# Root scenario: a ticket is DISPATCHED → child completes → some path
+# leaves the orchestrator's internal state pointing at a child_task_id
+# that is no longer in mesh ``claimed`` AND not visible in the
+# ``completed`` window the orchestrator polls. Without reconciliation,
+# the ticket stays in_flight forever.
+
+
+async def test_poll_children_force_fails_phantom_after_threshold(monkeypatch):
+    """AB-17-x: a ticket whose ``child_task_id`` is missing from mesh
+    claimed/completed/failed for >STUCK_CHILD_FORCE_FAIL_SEC must be
+    force-failed so the dispatch loop unsticks. This is the post-v7k
+    reconciliation patch (2026-04-25)."""
+    import time as _time
+
+    from alfred_coo.autonomous_build.orchestrator import (
+        STUCK_CHILD_FORCE_FAIL_SEC,
+    )
+
+    mesh = _FakeMesh()  # no completed, no failed, no claimed records
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-phantom-1"
+    _seed_graph(orch, [t])
+
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Seed the per-ticket transition timestamp to "long ago" so the stuck
+    # threshold trips on the first poll. _snapshot_graph_into_state would
+    # populate this in production; we set it directly to keep the test
+    # focused on the reconcile path, not the snapshot machinery.
+    orch._ticket_transition_ts[t.id] = _time.time() - (
+        STUCK_CHILD_FORCE_FAIL_SEC + 10
+    )
+
+    updated = await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"expected FAILED for phantom child, got {t.status}; the orchestrator "
+        f"must reconcile in_flight against mesh state to break silent-stuck"
+    )
+    assert ("SAL-1", "Backlog") in linear_calls, (
+        f"phantom-child fail must roll Linear back to Backlog: {linear_calls}"
+    )
+    assert any(
+        evt.get("kind") == "ticket_failed"
+        and "phantom_child" in str(evt.get("note", ""))
+        for evt in (orch.state.events or [])
+    ), (
+        f"expected a 'phantom_child' ticket_failed event in state, got: "
+        f"{orch.state.events}"
+    )
+    assert t in updated
+
+
+async def test_poll_children_does_not_force_fail_below_threshold(monkeypatch):
+    """AB-17-x: a phantom ticket that's only been DISPATCHED briefly
+    (sub-threshold) must NOT be force-failed — the brief window between
+    PATCH /complete and the next ?status=completed read can legitimately
+    show "missing from claimed AND completed" for sub-second durations."""
+    mesh = _FakeMesh()  # no records at all
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-fresh-1"
+    _seed_graph(orch, [t])
+
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Mark the ticket as "just transitioned" — well under the stuck cap.
+    import time as _time
+    orch._ticket_transition_ts[t.id] = _time.time()
+
+    await orch._poll_children()
+
+    # No state change yet — DISPATCHED bumps to IN_PROGRESS (the existing
+    # rec-is-None heuristic), but NOT to FAILED.
+    assert t.status == TicketStatus.IN_PROGRESS, (
+        f"sub-threshold phantom must NOT be force-failed; got {t.status}"
+    )
+    assert linear_calls == [], (
+        f"no Linear updates expected for sub-threshold poll: {linear_calls}"
+    )
+
+
+async def test_poll_children_handles_mesh_failed_status(monkeypatch):
+    """AB-17-x: a child task in mesh ``status=failed`` must surface in
+    ``_poll_children`` and mark its ticket FAILED (with reason from the
+    mesh record). Previously the orchestrator only fetched
+    ``status=completed`` so failed children were invisible — they'd stay
+    in_flight until the phantom-stuck timer caught them, costing 30 min
+    of wedged dispatch loop per occurrence."""
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-failed-1"
+    _seed_graph(orch, [t])
+
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    mesh.completed_tasks.append({
+        "id": "child-failed-1",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-1 TIR-01 ...",
+        "status": "failed",
+        "result": {"error": "dispatch failure: TimeoutError: model timeout"},
+    })
+
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"expected FAILED from mesh status=failed; got {t.status}"
+    )
+    # When the mesh record itself is failed, we route Linear → Canceled
+    # (existing behaviour for the task_status=='failed' branch).
+    assert ("SAL-1", "Canceled") in linear_calls, (
+        f"expected Linear -> Canceled for mesh-failed child: {linear_calls}"
+    )
+
+
+async def test_poll_children_keeps_claimed_child_in_progress(monkeypatch):
+    """AB-17-x: a child currently in mesh ``status=claimed`` is genuinely
+    in flight — bump DISPATCHED→IN_PROGRESS but do NOT force-fail even
+    if the per-ticket transition timestamp is ancient."""
+    import time as _time
+    from alfred_coo.autonomous_build.orchestrator import (
+        STUCK_CHILD_FORCE_FAIL_SEC,
+    )
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-claimed-1"
+    _seed_graph(orch, [t])
+
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Child IS still claimed (running on a long task). Even with an
+    # ancient transition_ts, we must not force-fail it.
+    mesh.completed_tasks.append({
+        "id": "child-claimed-1",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] long-running",
+        "status": "claimed",
+        "result": None,
+    })
+    orch._ticket_transition_ts[t.id] = _time.time() - (
+        STUCK_CHILD_FORCE_FAIL_SEC + 600
+    )
+
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.IN_PROGRESS, (
+        f"claimed child must NOT be force-failed; got {t.status}"
+    )
+    assert linear_calls == [], (
+        f"no Linear updates expected for in-progress claimed child: "
+        f"{linear_calls}"
+    )
+
+
 # ── AB-13: ## Target block + _TARGET_HINTS table (Plan H §2 G-2) ────────────
 
 

@@ -90,6 +90,22 @@ DEFAULT_STALL_THRESHOLD_SEC = 30 * 60
 # posts to Slack; this one is per-wave + WARN-level log + state event).
 PROGRESS_STALL_WARN_SEC = 900  # 15 min
 
+# AB-17-x · phantom-child reconciliation (post-v7k, 2026-04-25). If a
+# ticket has been DISPATCHED/IN_PROGRESS for longer than
+# ``STUCK_CHILD_FORCE_FAIL_SEC`` AND its ``child_task_id`` is no longer
+# present in mesh ``claimed`` (still running) state, the orchestrator
+# force-fails the ticket. This breaks the silent-stuck loop observed on
+# v7i (06:32 UTC) and v7k (07:14 UTC) where SAL-2672 SS-11's fix-round-1
+# child completed without a PR URL but its ticket never transitioned out
+# of DISPATCHED, leaving ``in_flight=1 ready=0`` for hours despite zero
+# claimed-state mesh tasks for the run.
+#
+# The reconcile path also widens ``_poll_children``'s mesh fetch to cover
+# ``failed`` and ``claimed`` lifecycle states (was: ``completed`` only),
+# so a child that died with ``status=failed`` or vanished from the
+# completed window is still observable.
+STUCK_CHILD_FORCE_FAIL_SEC = 30 * 60  # 30 min
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -1959,6 +1975,29 @@ class AutonomousBuildOrchestrator:
         """Query recently completed mesh tasks and match them back to
         dispatched tickets. Returns the tickets whose statuses changed this
         tick (useful for tests + future cadence diffing).
+
+        AB-17-x (2026-04-25, post-v7k): the poll now reconciles the
+        orchestrator's internal in-flight set against mesh-state ground
+        truth across THREE lifecycle states, not just ``completed``:
+
+        - ``completed`` — child finished; extract PR URL or mark FAILED
+          (existing behaviour).
+        - ``failed`` — child errored externally; mark ticket FAILED with
+          reason from the mesh record. Previously these were invisible
+          because ``_poll_children`` only fetched ``status=completed``;
+          a child that the executor marked FAILED on dispatch crash
+          (main.py:585) would be a phantom.
+        - ``claimed`` — child still running. Used to distinguish "really
+          in flight" from "phantom" (vanished from all three lists).
+
+        A ticket whose ``child_task_id`` is in NONE of those three lists
+        AND whose status has been DISPATCHED/IN_PROGRESS for longer than
+        ``STUCK_CHILD_FORCE_FAIL_SEC`` is force-failed. This breaks the
+        silent-stuck loop observed on v7i (06:32 UTC) and v7k (07:14 UTC)
+        where SAL-2672 SS-11's fix-round-1 child completed without a PR
+        URL but its ticket never transitioned out of DISPATCHED, leaving
+        ``in_flight=1 ready=0`` for hours despite zero claimed-state
+        mesh tasks for the run.
         """
         in_flight = [
             t for t in self.graph.nodes.values()
@@ -1968,12 +2007,38 @@ class AutonomousBuildOrchestrator:
         if not in_flight:
             return []
 
+        # AB-17-x: fetch all three lifecycle states in one pass so we have
+        # full visibility into where each child sits on the mesh. ``failed``
+        # was previously invisible; ``claimed`` lets us tell phantoms apart
+        # from genuinely-running children.
         try:
             completed = await self.mesh.list_tasks(status="completed", limit=100)
         except Exception:
             logger.exception("mesh.list_tasks(completed) failed")
             return []
+        try:
+            failed = await self.mesh.list_tasks(status="failed", limit=100)
+        except Exception:
+            logger.exception("mesh.list_tasks(failed) failed; treating as empty")
+            failed = []
+        try:
+            claimed = await self.mesh.list_tasks(status="claimed", limit=100)
+        except Exception:
+            logger.exception("mesh.list_tasks(claimed) failed; treating as empty")
+            claimed = []
+
         by_id = {c.get("id"): c for c in (completed or []) if isinstance(c, dict)}
+        # AB-17-x: terminal records (completed | failed) → drives state
+        # transitions in this tick. Claimed IDs only feed the
+        # phantom-detection branch below; we don't need their full payload.
+        terminal_by_id: Dict[str, Dict[str, Any]] = dict(by_id)
+        for f in (failed or []):
+            if isinstance(f, dict) and f.get("id"):
+                terminal_by_id[f["id"]] = f
+        claimed_ids = {
+            c.get("id") for c in (claimed or [])
+            if isinstance(c, dict) and c.get("id")
+        }
         # AB-05: expose the raw completed records for `_check_budget` to
         # walk without re-querying the mesh. We stash only the records that
         # correspond to tickets we actually dispatched (avoids double-
@@ -1991,6 +2056,7 @@ class AutonomousBuildOrchestrator:
         self._last_completed_by_id = dict(by_id)
 
         updated: List[Ticket] = []
+        now = time.time()
         for ticket in in_flight:
             # AB-08 bug fix (2026-04-24): if the ticket is already past
             # PR_OPEN — i.e. already handed off to _poll_reviews — do NOT
@@ -2003,11 +2069,56 @@ class AutonomousBuildOrchestrator:
                 TicketStatus.MERGE_REQUESTED,
             ):
                 continue
-            rec = by_id.get(ticket.child_task_id)
+            # AB-17-x: include the mesh ``failed`` listing in the lookup so
+            # an externally-failed child surfaces here. `terminal_by_id`
+            # merges completed + failed.
+            rec = terminal_by_id.get(ticket.child_task_id)
             if rec is None:
-                # Still in flight. Escalate status from DISPATCHED to
-                # IN_PROGRESS if we see that the child has been claimed
-                # (rough proxy — real impl would cross-check claimed_at).
+                # Not in completed or failed. Could be:
+                #   (a) still running (in mesh ``claimed``) — normal.
+                #   (b) just vanished — phantom. Force-fail after
+                #       ``STUCK_CHILD_FORCE_FAIL_SEC`` of no transition.
+                in_claimed = ticket.child_task_id in claimed_ids
+                if in_claimed:
+                    # Healthy in-flight; bump DISPATCHED → IN_PROGRESS.
+                    if ticket.status == TicketStatus.DISPATCHED:
+                        ticket.status = TicketStatus.IN_PROGRESS
+                    continue
+                # Phantom: not claimed, not completed, not failed. Apply
+                # the time-based escape hatch. Use _ticket_transition_ts
+                # populated by `_snapshot_graph_into_state` as the
+                # "entered current status" reference — this is the most
+                # reliable per-ticket clock the orchestrator already
+                # maintains for the stall watcher.
+                entered_ts = self._ticket_transition_ts.get(ticket.id)
+                stuck_for = (now - entered_ts) if entered_ts else 0.0
+                if stuck_for > STUCK_CHILD_FORCE_FAIL_SEC:
+                    logger.warning(
+                        "AB-17-x: phantom child %s for %s (%s) — not in "
+                        "claimed/completed/failed for %.0fs; force-failing",
+                        ticket.child_task_id, ticket.identifier,
+                        ticket.status.value, stuck_for,
+                    )
+                    ticket.status = TicketStatus.FAILED
+                    self.state.record_event(
+                        "ticket_failed",
+                        identifier=ticket.identifier,
+                        note=(
+                            f"phantom_child: child_task_id="
+                            f"{ticket.child_task_id} not in mesh "
+                            f"claimed/completed/failed for "
+                            f"{int(stuck_for)}s"
+                        ),
+                    )
+                    await self._update_linear_state(ticket, "Backlog")
+                    updated.append(ticket)
+                    continue
+                # Below the threshold: leave alone for now (a brief
+                # mesh inconsistency between PATCH /complete and the
+                # next ?status=completed query is normal — sub-second
+                # in practice but bounded by soul-svc's read-after-
+                # write semantics). Bump DISPATCHED→IN_PROGRESS so a
+                # status snapshot can be taken.
                 if ticket.status == TicketStatus.DISPATCHED:
                     ticket.status = TicketStatus.IN_PROGRESS
                 continue
