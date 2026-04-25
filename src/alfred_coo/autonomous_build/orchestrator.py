@@ -856,21 +856,21 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         ),
         new_paths=(
             "soul_lite/repository.py",
-            "soul_lite/migrations/0001_init.sql",
-            "soul_lite/migrations/0002_tenant_id.sql",
+            "soul_lite/bootstrap.py",
             "scripts/lint_no_raw_sql.py",
             "tests/soul_lite/__init__.py",
             "tests/soul_lite/test_tenant_scope.py",
+            "tests/soul_lite/test_bootstrap_from_persona.py",
         ),
         base_branch="main",
         branch_hint="feature/c26-soul-lite-multitenant",
-        notes="plan C §5 C-26 + SAL-2674; tenant_id NOT NULL + per-table index; TenantScopedRepository helper; AST lint via scripts/lint_no_raw_sql.py; pytest tenant-scope isolation; prod boot refuses if any row tenant_id='__legacy__'; depends on SS-11. Locks soul_lite to migrations/ subdir convention (F08 left open)",
+        notes="plan C §5 C-26 + SAL-2674; bootstrap.py mirrors soul-svc session_init pattern — schema materialized from genesis layer + recent memories + dream-cycle state on boot, NOT static migration files; tenant_id is part of the persona binding, materialized during bootstrap (not a separate ALTER step); TenantScopedRepository enforces tenant scope; AST lint via scripts/lint_no_raw_sql.py; prod boot refuses if any row tenant_id='__legacy__'; depends on SS-11 for asyncpg/aiosqlite abstraction. F08 deferred bootstrap scheme — C-26 locks 'derive-from-persona' over migrations/ to keep soul_lite consistent with soul-svc session_init mental model.",
     ),
 
     "C-27": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
+        paths=("src/mcctl/commands/token.py",),
         new_paths=(
             "src/alfred_coo/fleet_auth/__init__.py",
             "src/alfred_coo/fleet_auth/tenant_binding.py",
@@ -879,7 +879,7 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         ),
         base_branch="main",
         branch_hint="feature/c27-fleet-tenant-auth",
-        notes="plan C §5 C-27 + SAL-2675; api_key bound to tenant_id (sk_endpoint_<tenantslug>_<endpoint_id>_<sha256>); fleet_endpoint_tenants tracking table (migration via SS-11); register payload gains tenant block; mcctl token --tenant flag wiring extends F03's src/mcctl/commands/token.py inline (NOT in paths — flag for review). Depends on C-26, TIR-03",
+        notes="plan C §5 C-27 + SAL-2675; api_key bound to tenant_id (sk_endpoint_<tenantslug>_<endpoint_id>_<sha256>); fleet_endpoint_tenants tracking table (migration via SS-11); register payload gains tenant block; extends F03's src/mcctl/commands/token.py adding --tenant flag (in paths, file exists). Depends on C-26, TIR-03",
     ),
 
     "C-28": TargetHint(
