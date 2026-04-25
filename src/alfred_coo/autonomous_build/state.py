@@ -62,6 +62,17 @@ class OrchestratorState:
     ss08_acked: bool = False
     last_cadence_ts: float = 0.0
     last_checkpoint_ts: float = 0.0
+    # SAL-2870 retry-budget bookkeeping. Snapshot/restore parity for the
+    # per-ticket retry counter and BACKED_OFF wall-clock so a daemon
+    # restart inside the cooling window resumes the same backoff timer
+    # rather than starting fresh.
+    retry_counts: Dict[str, int] = field(default_factory=dict)
+    backed_off_at: Dict[str, float] = field(default_factory=dict)
+    # Deadlock-grace tracker — single float, not per-ticket. Persists so a
+    # daemon bounce mid-grace-window does not reset the timer (would let
+    # the orchestrator coerce immediately on restart). ``None`` means no
+    # active no-progress streak.
+    no_progress_since: Optional[float] = None
     # Free-form event log — capped to keep memory writes bounded.
     events: List[Dict[str, Any]] = field(default_factory=list)
 

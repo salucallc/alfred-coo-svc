@@ -129,6 +129,30 @@ ACTIVE_TICKET_STATES: frozenset = frozenset({
     TicketStatus.MERGE_REQUESTED,
 })
 
+# SAL-2870 (2026-04-25) — retry budget + BACKED_OFF state + deadlock grace.
+#
+# v7o crashed at 18:09:19 UTC with `wave 1 deadlock: 17 tickets non-terminal
+# with no in-flight or ready; coercing to FAILED`. The 17 downstream
+# tickets were BLOCKED on FAILED upstreams (SS-10 et al.). The previous
+# AB-17-n detector fired the SAME tick `in_flight=0 + ready=0` was
+# observed, so a transient FAILED upstream cascaded the whole tail.
+#
+# Three defaults tuned to the v7o post-mortem:
+#   - DEFAULT_RETRY_BUDGET=2 — every ticket gets up to 2 retry rounds.
+#     A primary FAILED → BACKED_OFF → retry. If that also FAILS →
+#     BACKED_OFF → second retry. Third FAILED is terminal.
+#   - DEFAULT_RETRY_BACKOFF_SEC=300 (5 min) — long enough for transient
+#     mesh / GitHub / soul-svc flaps to settle, short enough to keep a
+#     90-min wave moving. Override via ``retry_backoff_sec`` payload field.
+#   - DEFAULT_DEADLOCK_GRACE_SEC=900 (15 min) — empirical: the v7o cascade
+#     would have self-resolved within 6 min if retries had been allowed.
+#     15 min covers slow-flapping mesh tasks while still bounding the
+#     time wasted on a true structural deadlock. Override via
+#     ``deadlock_grace_sec`` payload field.
+DEFAULT_RETRY_BUDGET = 2
+DEFAULT_RETRY_BACKOFF_SEC = 5 * 60  # 5 min
+DEFAULT_DEADLOCK_GRACE_SEC = 15 * 60  # 15 min
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -1149,6 +1173,23 @@ class AutonomousBuildOrchestrator:
         # AB-17-w: overridable per-kickoff via `wave_green_ratio_threshold`.
         self.wave_green_ratio_threshold: float = DEFAULT_WAVE_GREEN_RATIO_THRESHOLD
 
+        # SAL-2870 retry + deadlock-grace tunables. All three are overrideable
+        # via top-level kickoff payload fields (``retry_budget``,
+        # ``retry_backoff_sec``, ``deadlock_grace_sec``). ``retry_budget`` is
+        # the *default* applied to every Ticket at graph-build time — per-
+        # ticket overrides via Ticket.retry_budget take precedence (e.g.
+        # restored state). Setting ``retry_budget=0`` disables the BACKED_OFF
+        # path and restores legacy "FAILED is terminal on first failure"
+        # semantics.
+        self.retry_budget: int = DEFAULT_RETRY_BUDGET
+        self.retry_backoff_sec: int = DEFAULT_RETRY_BACKOFF_SEC
+        self.deadlock_grace_sec: int = DEFAULT_DEADLOCK_GRACE_SEC
+        # Wall-clock when (in_flight=0 AND ready=0) was first observed. Reset
+        # to None whenever in_flight or ready becomes non-empty. Coerce-to-
+        # FAILED only fires when ``now - _no_progress_since >=
+        # deadlock_grace_sec``. Persisted into state for restart safety.
+        self._no_progress_since: Optional[float] = None
+
         # Stash the last time we posted a cadence tick so _status_tick can
         # rate-limit itself without a separate timer.
         self._last_cadence_ts: float = 0.0
@@ -1427,6 +1468,45 @@ class AutonomousBuildOrchestrator:
                     DEFAULT_WAVE_GREEN_RATIO_THRESHOLD
                 )
 
+        # SAL-2870: retry budget + backoff window + deadlock grace.
+        # All three are top-level optional ints/floats on the kickoff
+        # payload. Bad values fall back to module defaults with a WARN —
+        # we never crash the run on a typo.
+        retry_budget_override = payload.get("retry_budget")
+        if retry_budget_override is not None:
+            try:
+                self.retry_budget = max(0, int(retry_budget_override))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ignoring non-integer retry_budget=%r; keeping default %d",
+                    retry_budget_override, DEFAULT_RETRY_BUDGET,
+                )
+                self.retry_budget = DEFAULT_RETRY_BUDGET
+
+        backoff_override = payload.get("retry_backoff_sec")
+        if backoff_override is not None:
+            try:
+                self.retry_backoff_sec = max(0, int(backoff_override))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ignoring non-integer retry_backoff_sec=%r; keeping "
+                    "default %ds",
+                    backoff_override, DEFAULT_RETRY_BACKOFF_SEC,
+                )
+                self.retry_backoff_sec = DEFAULT_RETRY_BACKOFF_SEC
+
+        grace_override = payload.get("deadlock_grace_sec")
+        if grace_override is not None:
+            try:
+                self.deadlock_grace_sec = max(0, int(grace_override))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ignoring non-integer deadlock_grace_sec=%r; keeping "
+                    "default %ds",
+                    grace_override, DEFAULT_DEADLOCK_GRACE_SEC,
+                )
+                self.deadlock_grace_sec = DEFAULT_DEADLOCK_GRACE_SEC
+
         # Wave order.
         wave_order = payload.get("wave_order")
         if isinstance(wave_order, list) and wave_order:
@@ -1497,6 +1577,12 @@ class AutonomousBuildOrchestrator:
         """Merge prior-run statuses stored in `self.state.ticket_status` onto
         the fresh graph nodes so we don't re-dispatch tickets we already
         closed before the restart."""
+        # SAL-2870: seed every ticket with the kickoff-configured retry
+        # budget BEFORE per-ticket restore so a ticket without a stored
+        # ``retry_count`` simply inherits the new default. Per-ticket
+        # restores below override on top.
+        for node in self.graph.nodes.values():
+            node.retry_budget = self.retry_budget
         for uuid, status_str in (self.state.ticket_status or {}).items():
             node = self.graph.nodes.get(uuid)
             if node is None:
@@ -1525,6 +1611,20 @@ class AutonomousBuildOrchestrator:
             rtid = (self.state.review_task_ids or {}).get(uuid)
             if rtid:
                 node.review_task_id = rtid
+            # SAL-2870: restore retry_count + backed_off_at so a daemon
+            # bounce inside the cooling window resumes the same backoff
+            # timer rather than starting over.
+            rc = (self.state.retry_counts or {}).get(uuid)
+            if isinstance(rc, int) and rc > 0:
+                node.retry_count = rc
+            ba = (self.state.backed_off_at or {}).get(uuid)
+            if isinstance(ba, (int, float)) and ba > 0:
+                node.backed_off_at = float(ba)
+        # SAL-2870: restore the deadlock-grace timer. ``None`` is a valid
+        # value (no active no-progress streak) so we copy the field directly
+        # without a falsy guard.
+        if hasattr(self.state, "no_progress_since"):
+            self._no_progress_since = self.state.no_progress_since
 
     def _snapshot_graph_into_state(self) -> None:
         """Copy current ticket statuses + child ids onto `self.state` before
@@ -1553,6 +1653,22 @@ class AutonomousBuildOrchestrator:
             # still finds the task id on resume.
             if ticket.review_task_id:
                 self.state.review_task_ids[uuid] = ticket.review_task_id
+            # SAL-2870: mirror retry_count + backed_off_at so a restart
+            # mid-backoff resumes the same cooling timer. ``backed_off_at``
+            # is cleared (set to None) when a ticket leaves BACKED_OFF, so
+            # we mirror absence by popping the dict key — keeps the state
+            # snapshot diff-friendly.
+            if ticket.retry_count:
+                self.state.retry_counts[uuid] = ticket.retry_count
+            elif uuid in (self.state.retry_counts or {}):
+                self.state.retry_counts.pop(uuid, None)
+            if ticket.backed_off_at:
+                self.state.backed_off_at[uuid] = ticket.backed_off_at
+            elif uuid in (self.state.backed_off_at or {}):
+                self.state.backed_off_at.pop(uuid, None)
+        # SAL-2870: mirror the deadlock-grace timer onto state so a
+        # daemon bounce mid-grace-window resumes the same start point.
+        self.state.no_progress_since = self._no_progress_since
 
     # ── dispatch ────────────────────────────────────────────────────────────
 
@@ -1689,38 +1805,74 @@ class AutonomousBuildOrchestrator:
                     )
                     break
 
-            # AB-17-n: detect and break deadlock where non-terminal tickets
-            # (typically BLOCKED on FAILED upstreams) cannot progress because
-            # _deps_satisfied permanently returns False. Without this, the
-            # wave spins forever emitting only checkpoint heartbeats. Coerce
-            # stuck tickets to FAILED so the wave-gate classifier can apply
-            # soft-green or halt as appropriate. Observed in v8-full (mesh
-            # task e7f85521) + v8-full-v2 (6fdf760f) 2026-04-24; debug sub
-            # af2c179d.
+            # AB-17-n + SAL-2870: detect and break deadlock where non-terminal
+            # tickets (typically BLOCKED on FAILED upstreams) cannot progress
+            # because _deps_satisfied permanently returns False.
+            #
+            # SAL-2870 (2026-04-25, post-v7o crash 18:09:19 UTC) replaces the
+            # original same-tick coerce-to-FAILED with a grace window. v7o
+            # cascaded 17 wave-1 tickets to FAILED the moment SS-10 et al.
+            # FAILED, before the retry loop had a chance to re-dispatch
+            # those upstreams. Now:
+            #   1. The first observation of `in_flight=0 + ready=0` arms
+            #      ``self._no_progress_since = now``.
+            #   2. While armed, every subsequent tick that ALSO sees
+            #      ``in_flight=0 + ready=0`` checks elapsed time; if
+            #      ``deadlock_grace_sec`` has passed → coerce. Otherwise
+            #      keep ticking so the BACKED_OFF→READY flip in
+            #      ``_poll_children`` (SAL-2870 #2) can lift the wave.
+            #   3. As soon as in_flight or ready becomes non-empty (e.g. a
+            #      backed-off ticket woke up and got dispatched), the
+            #      timer is reset to None.
+            # BACKED_OFF tickets count as non-terminal but produce neither
+            # in_flight nor ready until the cooling window elapses, so the
+            # grace timer must keep them alive — that's by design.
             non_terminal = [
                 t for t in wave_tickets if t.status not in TERMINAL_STATES
             ]
-            if non_terminal and not in_flight and not ready:
-                blocked_ids = [t.identifier for t in non_terminal]
-                logger.error(
-                    "wave %d deadlock: %d tickets non-terminal with no "
-                    "in-flight or ready; coercing to FAILED: %s",
-                    wave_n, len(non_terminal), blocked_ids,
-                )
-                for t in non_terminal:
-                    upstream_failed = [
-                        self.graph.nodes[u].identifier
-                        for u in (t.blocks_in or [])
-                        if u in self.graph.nodes
-                        and self.graph.nodes[u].status == TicketStatus.FAILED
-                    ]
-                    t.status = TicketStatus.FAILED
-                    self.state.record_event(
-                        "ticket_forced_failed_deadlock",
-                        identifier=t.identifier,
-                        upstream_failed=upstream_failed,
+            if not in_flight and not ready:
+                if self._no_progress_since is None:
+                    self._no_progress_since = time.time()
+                    logger.info(
+                        "wave %d deadlock-grace armed: in_flight=0 ready=0; "
+                        "waiting %ds before coerce",
+                        wave_n, self.deadlock_grace_sec,
                     )
-                break
+                stuck_for = time.time() - self._no_progress_since
+                if non_terminal and stuck_for >= self.deadlock_grace_sec:
+                    blocked_ids = [t.identifier for t in non_terminal]
+                    logger.error(
+                        "wave %d deadlock: %d tickets non-terminal with no "
+                        "in-flight or ready for %.0fs (grace=%ds); coercing "
+                        "to FAILED: %s",
+                        wave_n, len(non_terminal), stuck_for,
+                        self.deadlock_grace_sec, blocked_ids,
+                    )
+                    for t in non_terminal:
+                        upstream_failed = [
+                            self.graph.nodes[u].identifier
+                            for u in (t.blocks_in or [])
+                            if u in self.graph.nodes
+                            and self.graph.nodes[u].status == TicketStatus.FAILED
+                        ]
+                        t.status = TicketStatus.FAILED
+                        self.state.record_event(
+                            "ticket_forced_failed_deadlock",
+                            identifier=t.identifier,
+                            upstream_failed=upstream_failed,
+                            stuck_for_sec=int(stuck_for),
+                        )
+                    self._no_progress_since = None
+                    break
+            else:
+                # Forward progress observed (something is in-flight or ready).
+                # Reset the grace timer so a later flat tick re-arms cleanly.
+                if self._no_progress_since is not None:
+                    logger.debug(
+                        "wave %d deadlock-grace cleared: in_flight=%d ready=%d",
+                        wave_n, len(in_flight), len(ready),
+                    )
+                self._no_progress_since = None
 
             # AB-17-p: no-forward-progress visibility. Emits a WARN + state
             # event when the wave has had in-flight work but no progress
@@ -1752,13 +1904,21 @@ class AutonomousBuildOrchestrator:
     ) -> List[Ticket]:
         """Return tickets in `pending` whose `blocks_in` are all merged_green.
 
-        Sort deterministically: critical-path first, then by identifier.
+        Sort: critical-path first, then topological order (deps first,
+        dependents later) within the same critical-path tier, then by
+        identifier as the final tiebreaker. SAL-2870 #5 added the topo
+        layer between the existing CP and identifier sorts so that when
+        two tickets are both ready and both/neither critical-path, the
+        one whose dependency chain is shallower is dispatched first.
+        Critical-path always wins because the operator may have flagged
+        a critical-path-leaf-but-deep-tree ticket as the priority pin
+        (e.g. SS-08 for a post-gap rerun).
         """
         in_flight_ids = {t.id for t in in_flight}
         ready: List[Ticket] = []
         for t in wave_tickets:
             # Only PENDING or BLOCKED tickets can (re-)enter the dispatch
-            # queue. Terminal + in-flight states are filtered out.
+            # queue. Terminal + in-flight + cooling states are filtered out.
             if t.status not in (TicketStatus.PENDING, TicketStatus.BLOCKED):
                 continue
             if t.id in in_flight_ids:
@@ -1772,8 +1932,100 @@ class AutonomousBuildOrchestrator:
             if t.status == TicketStatus.BLOCKED:
                 t.status = TicketStatus.PENDING
             ready.append(t)
+        # SAL-2870 #5: topo sort BEFORE the CP sort so the final ordering
+        # is (CP-tier, topo-rank, identifier). Python's sort is stable,
+        # so applying topo first then CP gives the right result.
+        ready = self._topo_sort(ready)
         ready.sort(key=lambda x: (not x.is_critical_path, x.identifier))
+        # Re-apply topo within each CP tier. We do this by re-grouping
+        # because the identifier-tiebreak above can disrupt topo order.
+        ready = self._stable_topo_within_cp(ready)
         return ready
+
+    def _topo_sort(self, tickets: List[Ticket]) -> List[Ticket]:
+        """SAL-2870 #5: Kahn-style topological sort over the subset of
+        ``tickets`` using the orchestrator graph's ``blocks_in`` /
+        ``blocks_out`` edges. Dependencies appear before dependents.
+
+        Edges referencing tickets outside ``tickets`` are ignored — the
+        sort runs over a candidate slice (typically the current ready
+        set), not the full graph. Cycles, if any, fall through with the
+        remaining items appended in identifier order so the function
+        always returns ``len(tickets)`` items.
+
+        O(V+E) on the candidate slice; cheap for any realistic wave.
+        """
+        if not tickets:
+            return tickets
+        candidate_ids = {t.id for t in tickets}
+        # Edges restricted to the candidate set so cross-wave / merged
+        # upstreams don't pollute the indegree count.
+        indeg: Dict[str, int] = {t.id: 0 for t in tickets}
+        adj: Dict[str, List[str]] = {t.id: [] for t in tickets}
+        for t in tickets:
+            for dep_id in (t.blocks_in or []):
+                if dep_id in candidate_ids:
+                    indeg[t.id] += 1
+                    adj[dep_id].append(t.id)
+        ticket_by_id = {t.id: t for t in tickets}
+        # Stable initial frontier: all zero-indegree nodes ordered by
+        # (not is_critical_path, identifier) so two roots without deps
+        # come out in the same order the legacy sort would have produced.
+        frontier = sorted(
+            [tid for tid in indeg if indeg[tid] == 0],
+            key=lambda tid: (
+                not ticket_by_id[tid].is_critical_path,
+                ticket_by_id[tid].identifier,
+            ),
+        )
+        ordered: List[Ticket] = []
+        seen: set[str] = set()
+        while frontier:
+            tid = frontier.pop(0)
+            if tid in seen:
+                continue
+            seen.add(tid)
+            ordered.append(ticket_by_id[tid])
+            # Generate next frontier in deterministic order so retries
+            # produce identical traces.
+            nxt = []
+            for child in adj.get(tid, []):
+                indeg[child] -= 1
+                if indeg[child] == 0 and child not in seen:
+                    nxt.append(child)
+            nxt.sort(key=lambda x: (
+                not ticket_by_id[x].is_critical_path,
+                ticket_by_id[x].identifier,
+            ))
+            frontier.extend(nxt)
+        # Cycles / unreachable nodes — append in identifier order so the
+        # caller still receives every ticket exactly once.
+        if len(ordered) < len(tickets):
+            remainder = sorted(
+                [t for t in tickets if t.id not in seen],
+                key=lambda t: t.identifier,
+            )
+            logger.warning(
+                "SAL-2870 _topo_sort: %d ticket(s) outside topo order "
+                "(possible cycle): %s",
+                len(remainder),
+                [t.identifier for t in remainder],
+            )
+            ordered.extend(remainder)
+        return ordered
+
+    def _stable_topo_within_cp(self, ordered: List[Ticket]) -> List[Ticket]:
+        """SAL-2870 #5 (helper): preserve topo order *within* each
+        critical-path tier after the (CP-first, identifier-tiebreak) sort.
+        ``ready.sort(...)`` above can pull a topo-later ticket ahead of
+        its dependency if the deeper ticket has a smaller identifier.
+        Re-toposort each CP tier independently to fix that.
+        """
+        if not ordered:
+            return ordered
+        cp = [t for t in ordered if t.is_critical_path]
+        non_cp = [t for t in ordered if not t.is_critical_path]
+        return self._topo_sort(cp) + self._topo_sort(non_cp)
 
     def _deps_satisfied(self, ticket: Ticket) -> bool:
         for dep_id in ticket.blocks_in:
@@ -2089,6 +2341,24 @@ class AutonomousBuildOrchestrator:
         ticket has been in its current active status for longer than
         ``STUCK_CHILD_FORCE_FAIL_SEC`` (same window as AB-17-x).
         """
+        # SAL-2870 #2 · BACKED_OFF → PENDING flip-back. Runs FIRST so
+        # tickets whose cooling window elapsed are visible to every
+        # downstream pass in the same tick (in-flight count, ready
+        # selection, dispatch). Tickets without a ``backed_off_at``
+        # timestamp (shouldn't happen but defensive) are left in
+        # BACKED_OFF and will be picked up next tick once their timer
+        # is set by ``_back_off_ticket``.
+        backed_off_woken = self._wake_backed_off_tickets()
+
+        # SAL-2870 #3 · re-evaluate readiness on every tick. The previous
+        # behaviour only unblocked downstream tickets when an upstream
+        # transitioned to MERGED_GREEN inside `_select_ready`. With
+        # BACKED_OFF in play, an upstream may oscillate FAILED → BACKED_OFF
+        # → PENDING → IN_PROGRESS → MERGED_GREEN multiple times before
+        # landing terminal, and a BLOCKED downstream needs to see the
+        # latest dep snapshot every tick. Cheap, idempotent.
+        self._refresh_blocked_status()
+
         # AB-17-y · orphan-active reconciliation (runs first so the
         # AB-17-x filter below can ignore the no-child case cleanly).
         # Force-fails any active-state ticket that's been stuck without a
@@ -2281,12 +2551,150 @@ class AutonomousBuildOrchestrator:
         if orphan_failed:
             updated.extend(orphan_failed)
 
+        # SAL-2870 #1 · retry-budget sweep. Every ticket that just
+        # transitioned to FAILED in this tick (caught via the `updated`
+        # list) is reconsidered: if it has retry budget left, flip back
+        # to BACKED_OFF and clear ``child_task_id`` so the next dispatch
+        # creates a fresh child. Sweep runs AFTER all the existing
+        # FAILED-transition branches so it's surgical: every prior
+        # codepath that wrote ``ticket.status = FAILED`` still works,
+        # we just re-route the verdict at the end. This minimizes
+        # conflict surface with the parallel SAL-2869 sub.
+        for ticket in list(updated):
+            if ticket.status != TicketStatus.FAILED:
+                continue
+            if ticket.retry_count >= ticket.retry_budget:
+                continue
+            self._back_off_ticket(ticket)
+
+        # SAL-2870: also bake in BACKED_OFF wake-ups + dep refreshes as
+        # forward-progress markers so the deadlock-grace timer resets
+        # whenever there's any motion at all in the graph.
+        if backed_off_woken:
+            updated.extend(backed_off_woken)
+
         # AB-17-p: any state transition this tick (PR_OPEN, REVIEWING,
         # FAILED) counts as forward progress. Single stamp at the loop
         # exit keeps this cheap and covers every branch above.
         if updated:
             self._last_progress_ts = time.time()
         return updated
+
+    def _wake_backed_off_tickets(self) -> List[Ticket]:
+        """SAL-2870 #2: scan every ticket in ``BACKED_OFF`` and flip back
+        to ``PENDING`` if ``time.time() - backed_off_at >= retry_backoff_sec``.
+        Returns the list of tickets woken this tick (used by the caller as
+        a forward-progress signal so the deadlock-grace timer resets).
+        Tickets with no ``backed_off_at`` (defensive: shouldn't happen) are
+        left alone — the next tick of ``_back_off_ticket`` will populate
+        the timestamp.
+        """
+        if self.retry_backoff_sec <= 0:
+            # Zero/negative backoff means no cooling window — flip back
+            # immediately. Useful for tests + dry-run.
+            woken: List[Ticket] = []
+            for ticket in self.graph.nodes.values():
+                if ticket.status == TicketStatus.BACKED_OFF:
+                    ticket.status = TicketStatus.PENDING
+                    ticket.backed_off_at = None
+                    woken.append(ticket)
+                    self.state.record_event(
+                        "ticket_woke_from_backoff",
+                        identifier=ticket.identifier,
+                        retry_count=ticket.retry_count,
+                    )
+            return woken
+        now = time.time()
+        woken = []
+        for ticket in self.graph.nodes.values():
+            if ticket.status != TicketStatus.BACKED_OFF:
+                continue
+            if ticket.backed_off_at is None:
+                continue
+            elapsed = now - ticket.backed_off_at
+            if elapsed >= self.retry_backoff_sec:
+                logger.info(
+                    "SAL-2870: %s woken from BACKED_OFF after %.0fs "
+                    "(retry %d/%d)",
+                    ticket.identifier, elapsed,
+                    ticket.retry_count, ticket.retry_budget,
+                )
+                ticket.status = TicketStatus.PENDING
+                ticket.backed_off_at = None
+                self.state.record_event(
+                    "ticket_woke_from_backoff",
+                    identifier=ticket.identifier,
+                    retry_count=ticket.retry_count,
+                    elapsed_sec=int(elapsed),
+                )
+                woken.append(ticket)
+        return woken
+
+    def _refresh_blocked_status(self) -> None:
+        """SAL-2870 #3: re-walk every BLOCKED ticket and downgrade to
+        PENDING when its deps are now satisfied. The existing
+        ``_select_ready`` already does this, but only for tickets being
+        considered for dispatch in *this* call. With retry semantics in
+        play (an upstream FAILED → BACKED_OFF → re-dispatched →
+        MERGED_GREEN), a BLOCKED downstream that wasn't in the candidate
+        list when its upstream was FAILED could miss the unblock.
+        Idempotent + cheap (single pass over the graph; no I/O).
+
+        Symmetric path: a PENDING ticket whose deps are not yet satisfied
+        is moved to BLOCKED, which keeps the cadence display honest.
+        Tickets in active or terminal states are not touched.
+        """
+        for ticket in self.graph.nodes.values():
+            if ticket.status == TicketStatus.BLOCKED:
+                if self._deps_satisfied(ticket):
+                    logger.debug(
+                        "SAL-2870: %s deps now satisfied; "
+                        "BLOCKED → PENDING (retry-aware unblock)",
+                        ticket.identifier,
+                    )
+                    ticket.status = TicketStatus.PENDING
+                    self.state.record_event(
+                        "ticket_unblocked",
+                        identifier=ticket.identifier,
+                    )
+            elif ticket.status == TicketStatus.PENDING:
+                # If a previously-PENDING ticket's upstream just FAILED →
+                # BACKED_OFF (waiting to retry), it should display as
+                # BLOCKED until the upstream lands MERGED_GREEN. Without
+                # this flip the cadence + deadlock detector see it as
+                # ready-but-uncalled which is misleading.
+                if not self._deps_satisfied(ticket):
+                    ticket.status = TicketStatus.BLOCKED
+
+    def _back_off_ticket(self, ticket: Ticket) -> None:
+        """SAL-2870 #1: route a FAILED ticket through BACKED_OFF when it
+        still has retry budget. Increments ``retry_count``, sets the
+        cooling timestamp, clears ``child_task_id`` so the next dispatch
+        spawns a fresh sub. Caller has already verified
+        ``retry_count < retry_budget``.
+        """
+        ticket.retry_count += 1
+        ticket.status = TicketStatus.BACKED_OFF
+        ticket.backed_off_at = time.time()
+        # Clear in-flight bookkeeping so the next dispatch creates a fresh
+        # child. Leave ``pr_url`` + ``review_cycles`` alone — those carry
+        # forward across retries (a fix-round dispatch may legitimately
+        # update the same PR rather than open a new one).
+        ticket.child_task_id = None
+        logger.warning(
+            "SAL-2870: %s FAILED but retry %d/%d available; "
+            "→ BACKED_OFF for %ds",
+            ticket.identifier,
+            ticket.retry_count, ticket.retry_budget,
+            self.retry_backoff_sec,
+        )
+        self.state.record_event(
+            "ticket_backed_off",
+            identifier=ticket.identifier,
+            retry_count=ticket.retry_count,
+            retry_budget=ticket.retry_budget,
+            backoff_sec=self.retry_backoff_sec,
+        )
 
     @staticmethod
     def _extract_pr_url(result: Dict[str, Any]) -> Optional[str]:
@@ -3026,41 +3434,54 @@ class AutonomousBuildOrchestrator:
             # dispatch loop doing the work. In tests we advance statuses
             # directly between ticks.
 
-            # AB-17-n: parity with _dispatch_wave deadlock detector. If
-            # nothing is in-flight and BLOCKED tickets remain, we are
-            # stuck on deps whose FAILED upstreams will never transition.
-            # Coerce to FAILED so the classifier below can apply
-            # soft-green or halt. Scoped tightly to BLOCKED (not all
+            # AB-17-n + SAL-2870: parity with _dispatch_wave deadlock
+            # detector. If nothing is in-flight and BLOCKED tickets remain,
+            # we are stuck on deps whose FAILED upstreams will never
+            # transition. Coerce to FAILED so the classifier below can
+            # apply soft-green or halt. Scoped tightly to BLOCKED (not all
             # non-terminal) because PENDING tickets may legitimately
             # transition out-of-band — that's a different deadlock class
-            # caught by _dispatch_wave before we reach here.
+            # caught by _dispatch_wave before we reach here. SAL-2870 adds
+            # the same grace-window semantics as _dispatch_wave so the
+            # gate doesn't pre-empt a pending retry. BACKED_OFF tickets
+            # are NOT in the BLOCKED set so they keep ticking through the
+            # cooling window naturally.
             blocked = [
                 t for t in wave_tickets if t.status == TicketStatus.BLOCKED
             ]
             in_flight_here = [
                 t for t in wave_tickets
-                if t.status in (
-                    TicketStatus.DISPATCHED,
-                    TicketStatus.IN_PROGRESS,
-                    TicketStatus.PR_OPEN,
-                    TicketStatus.REVIEWING,
-                    TicketStatus.MERGE_REQUESTED,
-                )
+                if t.status in ACTIVE_TICKET_STATES
             ]
-            if blocked and not in_flight_here:
-                blocked_ids = [t.identifier for t in blocked]
-                logger.error(
-                    "wave %d gate deadlock: %d BLOCKED tickets with no "
-                    "in-flight; coercing to FAILED: %s",
-                    wave_n, len(blocked), blocked_ids,
-                )
-                for t in blocked:
-                    t.status = TicketStatus.FAILED
-                    self.state.record_event(
-                        "ticket_forced_failed_gate_deadlock",
-                        identifier=t.identifier,
+            cooling = [
+                t for t in wave_tickets
+                if t.status == TicketStatus.BACKED_OFF
+            ]
+            if blocked and not in_flight_here and not cooling:
+                if self._no_progress_since is None:
+                    self._no_progress_since = time.time()
+                stuck_for = time.time() - self._no_progress_since
+                if stuck_for >= self.deadlock_grace_sec:
+                    blocked_ids = [t.identifier for t in blocked]
+                    logger.error(
+                        "wave %d gate deadlock: %d BLOCKED tickets with no "
+                        "in-flight or cooling for %.0fs (grace=%ds); "
+                        "coercing to FAILED: %s",
+                        wave_n, len(blocked), stuck_for,
+                        self.deadlock_grace_sec, blocked_ids,
                     )
-                break
+                    for t in blocked:
+                        t.status = TicketStatus.FAILED
+                        self.state.record_event(
+                            "ticket_forced_failed_gate_deadlock",
+                            identifier=t.identifier,
+                            stuck_for_sec=int(stuck_for),
+                        )
+                    self._no_progress_since = None
+                    break
+            elif in_flight_here or cooling:
+                # Reset grace timer when forward motion is observable.
+                self._no_progress_since = None
 
         # Wave is terminal. Classify.
         # AB-17-d · Plan I §1.4 — tickets that were skipped due to
