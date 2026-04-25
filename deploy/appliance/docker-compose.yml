@@ -92,7 +92,7 @@ services:
     networks:
       - appliance
 
-  # — MCP Services (curated: github, slack, linear, notion) ————
+  # — MCP Services (curated: github, slack, linear, notion) —
   mcp-github:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
     restart: unless-stopped
@@ -167,22 +167,35 @@ services:
     networks:
       - appliance
 
-  # New aletheia service
-  aletheia-svc:
-    image: ghcr.io/salucallc/aletheia-svc:latest
+  # New ops services
+  grafana:
+    image: grafana/grafana-oss:11.4.0
     restart: unless-stopped
     environment:
-      SOUL_API_URL: http://soul-svc:8080
-    depends_on:
-      soul-svc:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
-      interval: 15s
-      timeout: 3s
-      retries: 5
+      GF_SERVER_ROOT_URL: http://${APPLIANCE_HOSTNAME:-localhost}/ops
+    volumes:
+      - grafana_data:/var/lib/grafana
     networks:
       - appliance
+      - mc-ops
+
+  authelia:
+    image: authelia/authelia:4.38.17
+    restart: unless-stopped
+    environment:
+      AUTHELIA_JWT_SECRET: ${AUTHELIA_JWT_SECRET:?must set}
+    networks:
+      - appliance
+      - mc-ops
+
+  infisical:
+    image: infisical/infisical:0.124.0-postgres
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://appliance:${POSTGRES_PASSWORD:?must set}@postgres:5432/infisical
+    networks:
+      - appliance
+      - mc-ops
 
   # — end services
 
