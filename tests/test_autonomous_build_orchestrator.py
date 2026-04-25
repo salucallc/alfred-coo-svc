@@ -3994,3 +3994,264 @@ async def test_sal_2870_state_round_trip_carries_retry_fields():
     assert s2.backed_off_at == {"u1": 1234.5}
     assert s2.no_progress_since == 999.0
 
+
+# ── SAL-2886 · escalate-path discriminator ─────────────────────────────────
+#
+# Reproduces the v7p wave-0 cascade (2026-04-25 evening): four already-merged
+# tickets ran the documented escalate path (linear_create_issue ->
+# grounding-gap), the orchestrator misclassified those completions as silent
+# persona bugs (no PR URL == FAILED), then SAL-2870's retry-budget bounced
+# every ticket through BACKED_OFF and burned retries on tickets that had
+# nothing left to do. Fix: distinguish the escalate emit from the
+# silent-bug emit BEFORE the FAILED fall-through, transition to a new
+# ESCALATED terminal-non-failure state. Evidence:
+# Z:/_evidence/v7p_child_envelopes_2026-04-25.json.
+
+
+async def test_poll_children_grounding_gap_envelope_marks_escalated(
+    monkeypatch,
+):
+    """SAL-2886 happy-path: a child completion whose tool_calls show the
+    documented escalate-path emit (linear_create_issue returning a
+    grounding-gap issue) must transition the ticket to ESCALATED — not
+    FAILED — and must NOT roll Linear back to Backlog. Mirrors the v7p
+    envelope shape captured in
+    Z:/_evidence/v7p_child_envelopes_2026-04-25.json.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-2886-x", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-grounding-gap-1"
+    _seed_graph(orch, [t])
+
+    linear_calls: list[tuple[str, str]] = []
+
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # v7p envelope shape (verbatim from spec): single linear_create_issue
+    # tool call whose result has a grounding-gap title + identifier.
+    mesh.completed_tasks.append({
+        "id": "child-grounding-gap-1",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-2886-x ...",
+        "status": "completed",
+        "result": {
+            "tool_calls": [{
+                "name": "linear_create_issue",
+                "result": {
+                    "identifier": "SAL-2999",
+                    "title": "grounding gap: SAL-X missing target",
+                    "url": "https://linear.app/saluca/issue/SAL-2999",
+                },
+            }],
+            "summary": "Escalated SAL-X due to conflicting target file entries",
+        },
+    })
+
+    updated = await orch._poll_children()
+
+    assert t.status == TicketStatus.ESCALATED, (
+        f"expected ESCALATED for grounding-gap envelope, got {t.status}"
+    )
+    assert t in updated
+
+    # State event recorded with the gap identifier.
+    escalated_events = [
+        e for e in orch.state.events if e["kind"] == "ticket_escalated"
+    ]
+    assert len(escalated_events) == 1, (
+        f"expected one ticket_escalated event, got: {orch.state.events}"
+    )
+    assert escalated_events[0]["identifier"] == "SAL-2886-x"
+    assert escalated_events[0]["grounding_gap"] == "SAL-2999"
+
+    # No Linear -> Backlog transition: operator inspects the gap issue.
+    assert ("SAL-2886-x", "Backlog") not in linear_calls, (
+        f"escalate path must NOT roll Linear back to Backlog: {linear_calls}"
+    )
+
+
+async def test_poll_children_genuine_silent_persona_bug_still_marks_failed(
+    monkeypatch,
+):
+    """SAL-2886 negative: an envelope with NO PR URL AND NO
+    linear_create_issue grounding-gap call is the genuine silent-bug
+    shape (the v7p fix must not weaken it). Such tickets stay FAILED
+    with the legacy "child completed without PR URL" note.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-2886-y", "TIR-02", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-silent-bug-1"
+    t.retry_budget = 0  # SAL-2870: pin terminal-FAILED, no BACKED_OFF bounce
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    # Envelope: a tool call that is NOT linear_create_issue, no PR URL.
+    mesh.completed_tasks.append({
+        "id": "child-silent-bug-1",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-2886-y ...",
+        "status": "completed",
+        "result": {
+            "tool_calls": [{
+                "name": "http_get",
+                "result": "<html>...</html>",
+            }],
+            "summary": "I considered the task but did not open a PR",
+        },
+    })
+
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"genuine silent-bug must still land terminal FAILED, got {t.status}"
+    )
+    failed_events = [
+        e for e in orch.state.events if e["kind"] == "ticket_failed"
+    ]
+    assert any(
+        e.get("note") == "child completed without PR URL"
+        for e in failed_events
+    ), (
+        f"expected the legacy silent-bug note, got: {failed_events}"
+    )
+    # No spurious escalation event.
+    assert not any(
+        e["kind"] == "ticket_escalated" for e in orch.state.events
+    ), "silent-bug envelope must NOT produce a ticket_escalated event"
+
+
+async def test_retry_budget_sweep_skips_escalated(monkeypatch):
+    """SAL-2886 + SAL-2870 interaction: a ticket whose escalate path
+    fired (transitioned to ESCALATED) MUST NOT be picked up by the
+    retry-budget sweep. ESCALATED is terminal-non-failure; retry_count
+    must stay at 0 and _back_off_ticket must not be called. This is
+    the regression test for the v7p cascade where 4 tickets burned
+    retries on already-merged work.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    assert orch.retry_budget == 2  # default budget non-zero
+
+    t = _t("u1", "SAL-2886-z", "TIR-03", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-grounding-gap-z"
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    # Spy on _back_off_ticket — must NOT be called for the ESCALATED ticket.
+    back_off_calls: list[str] = []
+    real_back_off = orch._back_off_ticket
+
+    def _spy_back_off(ticket):
+        back_off_calls.append(ticket.identifier)
+        return real_back_off(ticket)
+
+    monkeypatch.setattr(orch, "_back_off_ticket", _spy_back_off)
+
+    mesh.completed_tasks.append({
+        "id": "child-grounding-gap-z",
+        "status": "completed",
+        "result": {
+            "tool_calls": [{
+                "name": "linear_create_issue",
+                "result": {
+                    "identifier": "SAL-3000",
+                    "title": "grounding gap: SAL-Z target merged in prior wave",
+                },
+            }],
+        },
+    })
+
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.ESCALATED, (
+        f"sanity: discriminator must classify as ESCALATED, got {t.status}"
+    )
+    assert back_off_calls == [], (
+        f"retry-budget sweep must skip ESCALATED, but _back_off_ticket "
+        f"was called for: {back_off_calls}"
+    )
+    assert t.retry_count == 0, (
+        f"retry_count must not be incremented for ESCALATED, got "
+        f"{t.retry_count}"
+    )
+    # And no ticket_backed_off event recorded.
+    assert not any(
+        e["kind"] == "ticket_backed_off" for e in orch.state.events
+    ), "ESCALATED must not emit a ticket_backed_off event"
+
+
+def test_wave_gate_excuses_escalated():
+    """SAL-2886 wave-gate parity: a ticket in ESCALATED is excluded
+    from the green-ratio denominator even when it has no human-assigned
+    label and no PATH_CONFLICT cache hit. Mirrors _is_wave_gate_excused
+    behaviour for PATH_CONFLICT at the per-ticket level.
+    """
+    orch = _mk_orchestrator()
+
+    t = _t("u1", "SAL-2886-w", "UNMAPPED-99", 0, "tiresias")
+    t.status = TicketStatus.ESCALATED
+    # No human-assigned label and no _verified_hints cache entry.
+    t.labels = []
+    orch._verified_hints = {}
+
+    assert orch._is_wave_gate_excused(t) is True, (
+        "ESCALATED ticket without human-assigned/PATH_CONFLICT must be "
+        "excused via the SAL-2886 fall-through"
+    )
+
+
+def test_envelope_helper_does_not_misclassify_propose_pr_with_side_linear_call():
+    """SAL-2886 belt-and-braces: a happy-path envelope with a real
+    propose_pr tool call AND a side-effect linear_create_issue (not a
+    grounding-gap; e.g. a follow-up to track a flake) must NOT be
+    misclassified as the escalate emit. _extract_pr_url returns the URL,
+    _envelope_is_grounding_gap returns False, orchestrator takes
+    PR_OPEN.
+    """
+    envelope = {
+        "summary": "Opened PR with the fix.",
+        "tool_calls": [
+            {
+                "name": "propose_pr",
+                "result": {
+                    "pr_url": "https://github.com/salucallc/repo/pull/123",
+                    "branch": "fix/sal-2886-side",
+                },
+            },
+            {
+                "name": "linear_create_issue",
+                "result": {
+                    "identifier": "SAL-3001",
+                    "title": "track flake in test_foo",
+                },
+            },
+        ],
+    }
+
+    # _extract_pr_url surfaces the real PR URL.
+    assert (
+        AutonomousBuildOrchestrator._extract_pr_url(envelope)
+        == "https://github.com/salucallc/repo/pull/123"
+    )
+    # The grounding-gap discriminator does NOT trigger on a non-gap
+    # follow-up linear_create_issue.
+    assert (
+        AutonomousBuildOrchestrator._envelope_is_grounding_gap(envelope)
+        is False
+    ), "non-grounding-gap linear_create_issue must not match the escalate discriminator"

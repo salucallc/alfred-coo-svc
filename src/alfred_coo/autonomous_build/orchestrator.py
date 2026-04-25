@@ -2514,6 +2514,36 @@ class AutonomousBuildOrchestrator:
             # Successful completion. Look for a PR URL in the structured
             # envelope; missing URL → the child did QA/docs work only.
             pr_url = self._extract_pr_url(result)
+            # SAL-2886: distinguish the two no-PR completion shapes BEFORE
+            # falling through to the silent-bug FAILED branch.
+            #
+            # Persona contract (persona.py:58-67): the alfred-coo-a builder
+            # emits exactly one of (a) propose_pr -> PR URL, (b)
+            # linear_create_issue -> grounding-gap issue id. Mode (b) is the
+            # documented response to "(conflict ...)" / "(unresolved ...)"
+            # markers in the rendered ## Target block - itself produced by
+            # _verify_hint flagging HintStatus.PATH_CONFLICT for new_paths
+            # that already exist on main (i.e. the ticket's work was merged
+            # in a prior wave/run).
+            #
+            # Treat that as terminal-non-failure: ESCALATED. Wave-gate
+            # already excuses PATH_CONFLICT from the green ratio
+            # (_is_wave_gate_excused); ESCALATED is the per-ticket terminal
+            # that mirrors that wave-level excusal so the retry-budget sweep
+            # below does NOT route this ticket through BACKED_OFF and burn
+            # retries (v7p signature).
+            if not pr_url and self._envelope_is_grounding_gap(result):
+                ticket.status = TicketStatus.ESCALATED
+                self.state.record_event(
+                    "ticket_escalated",
+                    identifier=ticket.identifier,
+                    grounding_gap=self._envelope_grounding_gap_identifier(result),
+                )
+                # Linear: no transition - operator inspects the grounding-gap
+                # issue. Parent ticket stays whatever Linear state Step-0
+                # protocol left it in (typically Backlog or In Progress).
+                updated.append(ticket)
+                continue
             if pr_url:
                 ticket.pr_url = pr_url
                 ticket.status = TicketStatus.PR_OPEN
@@ -2742,6 +2772,68 @@ class AutonomousBuildOrchestrator:
             m = _PR_URL_RE.search(cand)
             if m:
                 return m.group(0)
+        return None
+
+    @staticmethod
+    def _envelope_is_grounding_gap(result: Dict[str, Any]) -> bool:
+        """SAL-2886: True iff the child's result envelope shows the
+        documented escalate-path emit (persona.py:58-67 / Step 0):
+        a single ``linear_create_issue`` tool call that returned a
+        Linear issue identifier whose title starts with
+        ``"grounding gap"``. Conservative - requires BOTH the tool name
+        and a recognisable grounding-gap issue identifier in the call's
+        result so an unrelated linear_create_issue (e.g. a side-effect
+        from Step 4 plan-doc work that ALSO produced a PR) does not
+        match. Mode (a) propose_pr emits put the PR URL in
+        ``summary``/``follow_up_tasks``/``tool_calls[*].result.pr_url``;
+        ``_extract_pr_url`` already covers that, so this helper is only
+        consulted when ``_extract_pr_url`` returned None.
+        """
+        if not isinstance(result, dict):
+            return False
+        tool_calls = result.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            return False
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            if call.get("name") != "linear_create_issue":
+                continue
+            out = call.get("result")
+            if isinstance(out, str):
+                try:
+                    out = json.loads(out)
+                except (ValueError, TypeError):
+                    continue
+            if not isinstance(out, dict):
+                continue
+            title = (out.get("title") or "").lower()
+            ident = out.get("identifier") or ""
+            if ident and ("grounding gap" in title or "grounding-gap" in title):
+                return True
+        return False
+
+    @staticmethod
+    def _envelope_grounding_gap_identifier(
+        result: Dict[str, Any],
+    ) -> Optional[str]:
+        """SAL-2886: Return the SAL-NNNN identifier of the grounding-gap
+        Linear issue created by the escalate-path emit, or None if not
+        found.
+        """
+        if not isinstance(result, dict):
+            return None
+        for call in (result.get("tool_calls") or []):
+            if not isinstance(call, dict) or call.get("name") != "linear_create_issue":
+                continue
+            out = call.get("result")
+            if isinstance(out, str):
+                try:
+                    out = json.loads(out)
+                except (ValueError, TypeError):
+                    continue
+            if isinstance(out, dict) and out.get("identifier"):
+                return str(out["identifier"])
         return None
 
     async def _dispatch_review(self, ticket: Ticket) -> None:
@@ -3909,6 +4001,13 @@ class AutonomousBuildOrchestrator:
                 HintStatus.NO_HINT,
             ):
                 return True
+
+        # SAL-2886: per-ticket terminal-escalated mirrors the wave-level
+        # PATH_CONFLICT excusal so a ticket whose escalate path fired
+        # post-dispatch (i.e. was not caught by wave-start verification)
+        # is also excluded from the green ratio.
+        if ticket.status == TicketStatus.ESCALATED:
+            return True
 
         return False
 
