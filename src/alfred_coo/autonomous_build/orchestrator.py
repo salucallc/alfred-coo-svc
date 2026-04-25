@@ -36,6 +36,10 @@ import httpx
 
 from .budget import BudgetTracker, make_tracker
 from .cadence import SlackCadence
+from .destructive_guardrail import (
+    GuardrailResult,
+    compute_destructive_guardrails,
+)
 from .dry_run import maybe_apply_dry_run
 from .graph import (
     TERMINAL_STATES,
@@ -2585,6 +2589,61 @@ class AutonomousBuildOrchestrator:
         if verdict:
             self.state.review_verdicts[ticket.id] = verdict
 
+        # SAL-2869 Layer 2 - destructive-PR verdict override.
+        # If hawkman approved a PR that violates the destructive-PR
+        # guardrail, OVERRIDE to REQUEST_CHANGES regardless of what
+        # hawkman said. The override reason is appended to the respawn
+        # body so the builder sees exactly which gate tripped and why.
+        # Fail-open on infra error: a transport-level glitch fetching
+        # the PR diff must not block legitimate merges.
+        if verdict == "APPROVE":
+            try:
+                guardrail = (
+                    await self._check_destructive_guardrail_for_ticket(ticket)
+                )
+            except Exception:
+                logger.exception(
+                    "destructive_guardrail: override-pass raised for %s; "
+                    "letting verdict stand as APPROVE",
+                    ticket.identifier,
+                )
+                guardrail = GuardrailResult(tripped=False)
+
+            if guardrail.tripped:
+                citations_str = (
+                    "; ".join(guardrail.citations) or "(no citations)"
+                )
+                logger.warning(
+                    "[guardrail-override] PR %s tripped: %s | %s",
+                    ticket.pr_url, guardrail.reason, citations_str,
+                )
+                self.state.record_event(
+                    "verdict_overridden_destructive",
+                    identifier=ticket.identifier,
+                    pr_url=ticket.pr_url,
+                    layer=guardrail.layer,
+                    reason=guardrail.reason,
+                    citations=list(guardrail.citations),
+                )
+                # Override the in-memory verdict + re-record on state.
+                verdict = "REQUEST_CHANGES"
+                self.state.review_verdicts[ticket.id] = verdict
+                # Surface the override reason to the respawn body so
+                # the builder sees which gate tripped. We squirrel it
+                # onto rec.result so _extract_review_body picks it up.
+                if isinstance(rec, dict) and isinstance(
+                    rec.get("result"), dict
+                ):
+                    existing_summary = rec["result"].get("summary") or ""
+                    override_note = (
+                        f"\n\n[SAL-2869 destructive-PR guardrail override "
+                        f"({guardrail.layer})] {guardrail.reason} | "
+                        f"citations: {citations_str}"
+                    )
+                    rec["result"]["summary"] = (
+                        existing_summary + override_note
+                    )
+
         if verdict == "APPROVE":
             ticket.status = TicketStatus.MERGE_REQUESTED
             merged = await self._merge_pr(ticket)
@@ -2726,6 +2785,164 @@ class AutonomousBuildOrchestrator:
                 return "\n".join(parts)
         return ""
 
+    # SAL-2869 destructive-PR guardrail wiring.
+    #
+    # Three layers, one shared helper (compute_destructive_guardrails):
+    #
+    # - Layer 1 (preventive): builder system prompt in persona.py
+    #   carries the DELETION GUARDRAIL clause. Tested by
+    #   tests/test_destructive_guardrail.py.
+    #
+    # - Layer 2 (verdict gate): _handle_review_verdict calls
+    #   _check_destructive_guardrail_for_ticket BEFORE acting on an
+    #   APPROVE verdict. If the guardrail trips, the verdict is
+    #   OVERRIDDEN to REQUEST_CHANGES and the override reason is rolled
+    #   into the respawn body.
+    #
+    # - Layer 3 (pre-merge static check): _merge_pr runs the same
+    #   helper one more time as a belt-and-braces gate. If it trips at
+    #   merge time (e.g. hawkman approved blind, override missed it),
+    #   the merge is REFUSED, the ticket is marked FAILED, and Linear
+    #   is set to Backlog with the citations attached.
+    #
+    # Why both Layer 2 and Layer 3? Layer 2 is the cheap, common path
+    # (programmatic override before merge). Layer 3 catches every other
+    # path into _merge_pr - manual operator merges, future
+    # auto-merge variants, restart-resume races. Two checks, one helper,
+    # zero duplication.
+
+    def _hint_for_ticket(self, ticket: Ticket):
+        """Look up the TargetHint for ticket.code.
+
+        Returns None for tickets with no parsed code or codes not
+        in the static _TARGET_HINTS table - guardrail then runs
+        with hint_description="" (no deletion-license keywords
+        possible) which is the safe-default.
+        """
+        code = (ticket.code or "").upper()
+        if not code:
+            return None
+        return _TARGET_HINTS.get(code)
+
+    @staticmethod
+    def _ticket_has_refactor_label(ticket: Ticket) -> bool:
+        """Case-insensitive `refactor` label presence check."""
+        labels = getattr(ticket, "labels", None) or []
+        for lbl in labels:
+            if isinstance(lbl, str) and lbl.strip().lower() == "refactor":
+                return True
+        return False
+
+    async def _fetch_pr_files_for_guardrail(
+        self, ticket: Ticket
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Fetch GET repos/.../pulls/{N}/files for the ticket's PR.
+
+        Returns the raw list (each entry has filename, status,
+        additions, deletions) or None on transport / parse failure.
+        The guardrail caller treats None as "indeterminate - fail safe
+        and DO NOT trip" - we never want to block a merge on a flaky
+        GitHub API.
+        """
+        if not ticket.pr_url:
+            return None
+        m = re.search(
+            r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", ticket.pr_url
+        )
+        if not m:
+            return None
+        owner, repo, num = m.group(1), m.group(2), m.group(3)
+        try:
+            data = await self._gh_api(
+                f"repos/{owner}/{repo}/pulls/{num}/files?per_page=100"
+            )
+        except Exception:
+            logger.exception(
+                "destructive_guardrail: pr files fetch failed for %s",
+                ticket.pr_url,
+            )
+            return None
+        if not isinstance(data, list):
+            return None
+        return data
+
+    async def _check_destructive_guardrail_for_ticket(
+        self, ticket: Ticket
+    ) -> GuardrailResult:
+        """Run the SAL-2869 destructive-PR guardrail against ticket's PR.
+
+        Best-effort only: any transport / lookup failure returns a
+        non-tripped result so the caller proceeds (fail-open on infra
+        flakiness, fail-closed on a confirmed destructive diff).
+        """
+        pr_files = await self._fetch_pr_files_for_guardrail(ticket)
+        if pr_files is None:
+            return GuardrailResult(tripped=False)
+
+        hint = self._hint_for_ticket(ticket)
+        hint_description = hint.notes if (hint and hint.notes) else ""
+        base_ref = hint.base_branch if hint else "main"
+
+        # Resolve owner/repo from the PR URL.
+        base_repo = ""
+        if ticket.pr_url:
+            m = re.search(
+                r"github\.com/([^/]+)/([^/]+)/pull/\d+", ticket.pr_url
+            )
+            if m:
+                base_repo = f"{m.group(1)}/{m.group(2)}"
+
+        return compute_destructive_guardrails(
+            pr_files,
+            hint_description=hint_description,
+            has_refactor_label=self._ticket_has_refactor_label(ticket),
+            base_repo=base_repo,
+            base_ref=base_ref,
+        )
+
+    async def _post_destructive_guardrail_linear_comment(
+        self, ticket: Ticket, guardrail: GuardrailResult
+    ) -> None:
+        """Post a Linear comment when the SAL-2869 guardrail blocks a merge.
+
+        Best-effort. The comment carries the layer, reason, and
+        citations so a human can audit the refusal without spelunking
+        soul-memory. If linear_add_comment is not in BUILTIN_TOOLS
+        (older deploy), we silently skip - the soul
+        merge_blocked_destructive event still records the trip.
+        """
+        try:
+            from alfred_coo.tools import BUILTIN_TOOLS
+        except Exception:
+            logger.debug("tools not importable; skipping guardrail comment")
+            return
+        spec = BUILTIN_TOOLS.get("linear_add_comment")
+        if spec is None:
+            return
+        body_lines = [
+            f"## SAL-2869 destructive-PR guardrail tripped ({guardrail.layer})",
+            "",
+            f"**Reason:** {guardrail.reason}",
+            "",
+            "**Citations:**",
+        ]
+        for c in guardrail.citations:
+            body_lines.append(f"- {c}")
+        body_lines.extend([
+            "",
+            f"PR `{ticket.pr_url}` was REFUSED by the orchestrator's "
+            "pre-merge static check. Status: FAILED. Linear state moved "
+            "to Backlog. Human intervention required.",
+        ])
+        body = "\n".join(body_lines)
+        try:
+            await spec.handler(issue_id=ticket.id, body=body)
+        except Exception:
+            logger.exception(
+                "linear_add_comment raised for guardrail trip on %s",
+                ticket.identifier,
+            )
+
     async def _merge_pr(self, ticket: Ticket) -> bool:
         """Merge `ticket.pr_url` via the AB-10 ``github_merge_pr`` tool.
 
@@ -2738,6 +2955,11 @@ class AutonomousBuildOrchestrator:
         without calling GitHub. This makes restart-resume idempotent:
         a daemon that died between the GitHub PUT and the status
         transition will see the entry on restore and skip the re-merge.
+
+        SAL-2869 Layer 3: BEFORE merging, run the destructive-PR
+        guardrail one more time. If it trips here, REFUSE the merge
+        (return False); the caller will mark the ticket FAILED and
+        push Linear back to Backlog so a human can intervene.
         """
         # Double-merge guard — restart-idempotent.
         if (
@@ -2755,6 +2977,47 @@ class AutonomousBuildOrchestrator:
             logger.warning(
                 "cannot merge %s: no pr_url on ticket",
                 ticket.identifier,
+            )
+            return False
+
+        # SAL-2869 Layer 3 - pre-merge destructive-PR static check.
+        # Best-effort: a tripped guardrail REFUSES the merge and marks
+        # the ticket failed via the caller's `merged is False` branch.
+        # A non-tripped result (or any infra failure) lets the merge
+        # proceed; we never block on flaky GitHub API responses.
+        try:
+            guardrail = await self._check_destructive_guardrail_for_ticket(
+                ticket
+            )
+        except Exception:
+            logger.exception(
+                "destructive_guardrail: pre-merge check raised for %s; "
+                "proceeding with merge (fail-open on infra error)",
+                ticket.identifier,
+            )
+            guardrail = GuardrailResult(tripped=False)
+
+        if guardrail.tripped:
+            citations_str = "; ".join(guardrail.citations) or "(no citations)"
+            logger.error(
+                "[merge-block] PR %s tripped destructive guardrail "
+                "(layer=%s): %s | citations: %s",
+                ticket.pr_url,
+                guardrail.layer,
+                guardrail.reason,
+                citations_str,
+            )
+            self.state.record_event(
+                "merge_blocked_destructive",
+                identifier=ticket.identifier,
+                pr_url=ticket.pr_url,
+                layer=guardrail.layer,
+                reason=guardrail.reason,
+                citations=list(guardrail.citations),
+            )
+            await self._update_linear_state(ticket, "Backlog")
+            await self._post_destructive_guardrail_linear_comment(
+                ticket, guardrail
             )
             return False
 
