@@ -29,11 +29,66 @@ from dataclasses import dataclass
 from typing import Optional
 
 import httpx
+from tenacity import (
+    AsyncRetrying,
+    RetryError,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from .tools import ToolSpec, execute_tool, openai_tool_schema
 
 
 logger = logging.getLogger("alfred_coo.dispatch")
+
+
+# AB-17-t (2026-04-24): retry wrapper for upstream gateway 5xx flaps.
+#
+# The Oracle ollama proxy at 172.17.0.1:8185 returns intermittent 500s under
+# load (validated 2026-04-24 06:22:13 UTC, mesh task e85d18c0 dispatching
+# SAL-2603 ALT-06). Pre-AB-17-t the 500 propagated as a terminal
+# HTTPStatusError, the existing fallback layer in `call` / `call_with_tools`
+# swapped to `deepseek-v3.2:cloud` on the *next* attempt, and the original
+# model never got a second chance. Result: a transient infra flap misclassified
+# as a model failure, ticket dispatch dropped silently.
+#
+# This wrapper sits BELOW the fallback layer: same model, retried up to
+# `_INFRA_RETRY_MAX_ATTEMPTS` times on 5xx + connection errors with exponential
+# jittered backoff. After exhaustion the original exception is re-raised so the
+# existing fallback chain still kicks in. Additive only.
+#
+# 4xx are NOT retried — those are real client errors (bad model name, malformed
+# body, auth) and a retry would just burn cost on a deterministic failure.
+_INFRA_RETRY_MAX_ATTEMPTS = 3
+_INFRA_RETRY_BASE_SECONDS = 0.5  # 0.5, 1.0, 2.0 + jitter
+_INFRA_RETRY_MAX_SECONDS = 4.0
+
+
+def _is_retryable_infra_error(exc: BaseException) -> bool:
+    """Return True iff `exc` is an upstream-flap that warrants a retry.
+
+    Retryable:
+      * httpx.HTTPStatusError with 5xx response (transient gateway / proxy)
+      * httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+        httpx.RemoteProtocolError, httpx.NetworkError (TCP-level flaps)
+
+    NOT retryable:
+      * httpx.HTTPStatusError with 4xx (client error — bad model, malformed
+        body, auth — retry just burns cost on a deterministic failure)
+      * Any non-httpx exception (logic bugs, JSON decode errors, etc.)
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    if isinstance(exc, (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        httpx.NetworkError,
+    )):
+        return True
+    return False
 
 # AB-17-l (2026-04-24): raised 8 -> 12 after v8-full children truncated mid-investigation
 # on tickets with 4+ http_get probes + propose_pr finalisation (mesh task e7f85521,
@@ -217,10 +272,37 @@ class Dispatcher:
         if tools:
             body["tools"] = tools
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, headers=headers, json=body)
-            resp.raise_for_status()
-            return resp.json()
+        # AB-17-t: retry transient upstream flaps (5xx + connection errors)
+        # before surfacing to the existing fallback layer. The retry sits
+        # BELOW the fallback chain — fallback still triggers if all attempts
+        # exhaust.
+        attempt_no = 0
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(_INFRA_RETRY_MAX_ATTEMPTS),
+                wait=wait_exponential_jitter(
+                    initial=_INFRA_RETRY_BASE_SECONDS,
+                    max=_INFRA_RETRY_MAX_SECONDS,
+                ),
+                retry=retry_if_exception(_is_retryable_infra_error),
+                reraise=True,
+            ):
+                with attempt:
+                    attempt_no += 1
+                    if attempt_no > 1:
+                        logger.warning(
+                            "[infra_retry] %s attempt=%d/%d model=%s",
+                            url, attempt_no, _INFRA_RETRY_MAX_ATTEMPTS, model,
+                        )
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        resp = await client.post(url, headers=headers, json=body)
+                        resp.raise_for_status()
+                        return resp.json()
+        except RetryError as re:  # pragma: no cover - reraise=True bypasses this
+            raise re.last_attempt.exception() from re
+        # Defensive: AsyncRetrying with reraise=True always either returns or
+        # raises; this line is unreachable but satisfies type checkers.
+        raise RuntimeError("dispatch retry loop exited without result")  # pragma: no cover
 
     # ── One-shot call ───────────────────────────────────────────────────
 
