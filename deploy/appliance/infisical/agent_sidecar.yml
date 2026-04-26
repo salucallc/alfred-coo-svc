@@ -1,0 +1,8 @@
+services:
+  infisical-agent:
+    image: infisical/infisical-agent:latest
+    environment:
+      - INFISICAL_TOKEN=${INFISICAL_TOKEN}
+    volumes:
+      - /run/secrets:/run/secrets
+    restart: unless-stopped
