@@ -1,0 +1,11 @@
+# Pricing table for model providers
+ollama:
+  max:
+    flat_monthly_usd: 100
+openrouter:
+  free:
+    input_per_1k: 0.0
+    output_per_1k: 0.0
+  paid:
+    input_per_1k: 0.0001
+    output_per_1k: 0.0002
