@@ -635,6 +635,187 @@ def test_builder_iteration_cap_unknown_persona_returns_none():
     assert _builder_iteration_cap("unknown", task) is None
 
 
+# ── SAL-2978: fix-round cap bump + iteration_count reset ────────────────
+
+
+@pytest.mark.parametrize("label", ["size-s", "size-m", "size-l", None, "", "xyz"])
+def test_iteration_cap_for_dispatch_initial_matches_size(label):
+    """SAL-2978: with `is_fix_round=False` the new helper returns the
+    unchanged size-based cap so existing call sites are unaffected.
+    """
+    from alfred_coo.dispatch import (
+        iteration_cap_for_dispatch,
+        iteration_cap_for_size,
+    )
+    assert iteration_cap_for_dispatch(label, is_fix_round=False) == \
+        iteration_cap_for_size(label)
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("size-s", 16),   # 12 + 4
+    ("size-m", 20),   # 16 + 4 (= MAX_TOOL_ITERATIONS ceiling)
+    ("size-l", 20),   # 20 + 4 = 24, clamped at ceiling
+    (None, 16),       # default 12 + 4
+    ("xyz", 16),
+])
+def test_iteration_cap_for_dispatch_fix_round_bump(label, expected):
+    """SAL-2978: fix-round adds +4 over the size-based cap, clamped at
+    MAX_TOOL_ITERATIONS.
+    """
+    from alfred_coo.dispatch import iteration_cap_for_dispatch
+    assert iteration_cap_for_dispatch(label, is_fix_round=True) == expected
+
+
+@pytest.mark.parametrize("title,expected", [
+    # Live shape: em-dash marker emitted by `_respawn_for_fix_round`.
+    ("[persona:alfred-coo-a] SAL-2588 TIR-06 — fix: round 1 (...)", True),
+    # Forward-compat: ASCII fallback.
+    ("[persona:alfred-coo-a] SAL-1 - fix: round 2 (...)", True),
+    # Initial dispatch — no marker.
+    ("[persona:alfred-coo-a] [wave-0] [tiresias] SAL-2588 TIR-06", False),
+    # Defensive empty.
+    ("", False),
+])
+def test_is_fix_round_dispatch_classification(title, expected):
+    """SAL-2978: detector matches live em-dash + ASCII shapes; rejects
+    initial dispatches and empties.
+    """
+    from alfred_coo.main import _is_fix_round_dispatch
+    assert _is_fix_round_dispatch({"title": title}) is expected
+
+
+def test_fix_round_dispatch_bumps_iteration_cap():
+    """SAL-2978 acceptance criterion: fix-round dispatches get bumped cap
+    (size-S 12→16, size-M 16→20). Reproduces SAL-2588 TIR-06 fix: pre-
+    SAL-2978 the same size-S task got 12 and exhausted it 3x in v7aa.
+    """
+    from alfred_coo.main import _builder_iteration_cap
+    fix_s = {
+        "title": "[persona:alfred-coo-a] SAL-2588 TIR-06 — fix: round 1 (...)",
+        "description": "Size: S\n",
+    }
+    fix_m = {
+        "title": "[persona:alfred-coo-a] SAL-9001 — fix: round 2 (...)",
+        "description": "Size: M\n",
+    }
+    assert _builder_iteration_cap("alfred-coo-a", fix_s) == 16
+    assert _builder_iteration_cap("alfred-coo-a", fix_m) == 20
+
+
+def test_fix_round_does_not_bump_for_reviewer():
+    """SAL-2978: reviewer still gets None — fix-round detection must NOT
+    change the persona allowlist.
+    """
+    from alfred_coo.main import _builder_iteration_cap
+    task = {
+        "title": "[persona:hawkman-qa-a] review SAL-1 — fix: round 1 (...)",
+        "description": "Size: S\n",
+    }
+    assert _builder_iteration_cap("hawkman-qa-a", task) is None
+
+
+@pytest.mark.parametrize("size_letter,expected_cap", [("S", 12), ("M", 16), ("L", 20)])
+def test_initial_dispatch_unchanged_by_fix_round_logic(size_letter, expected_cap):
+    """SAL-2978 regression: initial dispatches (no fix-round marker) keep
+    their legacy size-gated cap.
+    """
+    from alfred_coo.main import _builder_iteration_cap
+    task = {
+        "title": f"[persona:alfred-coo-a] SAL-1 — scaffold size-{size_letter}",
+        "description": f"Size: {size_letter}\n",
+    }
+    assert _builder_iteration_cap("alfred-coo-a", task) == expected_cap
+
+
+@pytest.mark.asyncio
+async def test_iteration_count_resets_on_fresh_dispatch(
+    monkeypatch, dispatcher, ctx, caplog,
+):
+    """SAL-2978 acceptance criterion: the iteration counter resets to 0 on
+    every fresh dispatch. The counter is loop-local in `_tool_loop`
+    (`for iteration in range(effective_cap)`), so two back-to-back
+    dispatches must each report `iterations=N` against the SAME cap with
+    no carryover. Also verifies the explicit
+    `iteration_count_reset=True` log line fires on every dispatch.
+    """
+    import logging as _logging
+    from alfred_coo.tools import ToolSpec
+
+    # Each response asks for one tool call — the tool handler then returns
+    # an "ok" envelope so the model emits a final message on iteration 2.
+    # Two dispatches × 2 iterations each = 4 transport calls total.
+    tool_call_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_x",
+                    "function": {"name": "demo_tool", "arguments": "{}"},
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    final_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done",
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    transport = _RecordingTransport(responses=[
+        tool_call_response, final_response,  # dispatch 1: 2 iterations
+        tool_call_response, final_response,  # dispatch 2: 2 iterations
+    ])
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _demo_handler(**kwargs) -> dict:
+        return {"ok": True}
+
+    tool = ToolSpec(
+        name="demo_tool",
+        description="demo",
+        parameters={"type": "object", "properties": {}},
+        handler=_demo_handler,
+    )
+
+    with caplog.at_level(_logging.INFO, logger="alfred_coo.dispatch"):
+        result1 = await dispatcher.call_with_tools(
+            "qwen3-coder:480b-cloud",
+            "sys", "prompt 1",
+            tools=[tool],
+            context=ctx,
+            max_iterations=12,
+        )
+        result2 = await dispatcher.call_with_tools(
+            "qwen3-coder:480b-cloud",
+            "sys", "prompt 2",
+            tools=[tool],
+            context=ctx,
+            max_iterations=12,
+        )
+
+    # Both dispatches counted iterations from 0 — neither reports 4
+    # (which would be the case if the counter leaked across dispatches).
+    assert result1["iterations"] == 2
+    assert result2["iterations"] == 2
+
+    # The explicit reset log line fired once per dispatch.
+    reset_logs = [
+        r for r in caplog.records
+        if r.levelno == _logging.INFO
+        and "iteration_count_reset=True" in r.message
+        and "tool-use loop entering" in r.message
+    ]
+    assert len(reset_logs) == 2, (
+        f"expected 2 reset log lines (one per dispatch); got "
+        f"{len(reset_logs)}: {[r.message for r in reset_logs]}"
+    )
+
+
 # ── AB-17-t · dispatch 5xx retry wrapper ────────────────────────────────
 
 

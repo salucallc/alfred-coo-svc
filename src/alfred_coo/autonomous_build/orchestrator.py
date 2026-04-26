@@ -2588,11 +2588,41 @@ class AutonomousBuildOrchestrator:
                 # retry (2026-04-23: observed 12 false-greens on first live
                 # run; orchestrator marked MERGED_GREEN in this branch,
                 # skipping the real claim→build→PR→review flow).
+                #
+                # SAL-2978 (2026-04-25): split the FAILED reason into two
+                # explicit shapes so ops can grep + the wave-gate math
+                # cannot mistake either for a happy-path completion:
+                #   (a) silent_complete: empty summary + no PR + no
+                #       follow-up + no grounding-gap artifact, OR a
+                #       truncated tool-loop envelope. Defense-in-depth
+                #       backstop for the iteration-cap fix in main.py.
+                #   (b) no_pr_url: builder produced *some* envelope content
+                #       but no PR URL — model called the wrong tool, or
+                #       summarised work without committing it.
+                if self._envelope_is_silent_complete(result):
+                    failure_reason = "silent_complete"
+                    failure_note = (
+                        "envelope rejected: silent-complete shape "
+                        "(empty summary + no PR + no follow-up). "
+                        "Likely tool-loop hit MAX_TOOL_ITERATIONS or "
+                        "model returned without calling propose_pr."
+                    )
+                    logger.error(
+                        "SAL-2978: %s envelope rejected as silent_complete; "
+                        "result_keys=%s truncated=%s",
+                        ticket.identifier,
+                        list(result.keys()) if isinstance(result, dict) else "non-dict",
+                        result.get("truncated") if isinstance(result, dict) else None,
+                    )
+                else:
+                    failure_reason = "no_pr_url"
+                    failure_note = "child completed without PR URL"
                 ticket.status = TicketStatus.FAILED
                 self.state.record_event(
                     "ticket_failed",
                     identifier=ticket.identifier,
-                    note="child completed without PR URL",
+                    note=failure_note,
+                    reason=failure_reason,
                 )
                 await self._update_linear_state(ticket, "Backlog")
                 updated.append(ticket)
@@ -2791,6 +2821,66 @@ class AutonomousBuildOrchestrator:
             if m:
                 return m.group(0)
         return None
+
+    @staticmethod
+    def _envelope_is_silent_complete(result: Dict[str, Any]) -> bool:
+        """SAL-2978 (2026-04-25): True iff the child's result envelope shows
+        the documented "silent-complete" shape — empty summary AND no PR URL
+        AND no documented escalate-path artifact. This is the failure mode
+        v7aa observed on SAL-2588 TIR-06: the model exhausted its iteration
+        cap mid-tool-chain, the dispatcher returned a partial envelope with
+        no summary / no PR / no follow-up, and ``_poll_children`` marked the
+        ticket FAILED with the generic "child completed without PR URL"
+        reason.
+
+        This helper lets the FAILED branch raise a *specific* error that
+        ops can grep for and that the wave-gate math cannot mistake for
+        a happy-path completion. Defense-in-depth: the iteration-cap fix
+        in `main._builder_iteration_cap` should prevent most of these, but
+        an explicit shape rejection here means any silent-complete envelope
+        that still slips through gets flagged loudly.
+
+        Conservative — requires ALL THREE conditions:
+          1. ``summary`` is missing or empty/whitespace-only
+          2. No PR URL extractable from the envelope (already None at the
+             call site, so callers should pass ``has_pr_url=False``)
+          3. The envelope is NOT a grounding-gap escalation (those have
+             a valid ``linear_create_issue`` tool call and are handled
+             by ``_envelope_is_grounding_gap`` upstream)
+
+        Truncation marker (``"truncated": True``) is also a strong
+        positive signal — a truncated tool-loop envelope is a silent-
+        complete by definition.
+        """
+        if not isinstance(result, dict):
+            # An entirely missing / non-dict result is the worst silent
+            # case; treat it as silent-complete so it gets rejected.
+            return True
+        # Truncated envelopes from `_tool_loop` exhausting the cap. The
+        # dispatcher's partial-return shape is unmistakable.
+        if result.get("truncated") is True:
+            return True
+        summary = result.get("summary")
+        content = result.get("content")
+        # Either field can carry the textual summary depending on persona.
+        text = ""
+        if isinstance(summary, str):
+            text = summary
+        elif isinstance(content, str):
+            text = content
+        if text.strip():
+            return False
+        # Empty summary AND no follow-up artifacts means there's nothing
+        # actionable in the envelope. (The grounding-gap check is done
+        # upstream by `_envelope_is_grounding_gap` so we don't re-check
+        # it here; callers must run that first.)
+        follow = result.get("follow_up_tasks") or []
+        artifacts = result.get("artifacts") or []
+        if isinstance(follow, list) and follow:
+            return False
+        if isinstance(artifacts, list) and artifacts:
+            return False
+        return True
 
     @staticmethod
     def _envelope_is_grounding_gap(result: Dict[str, Any]) -> bool:
@@ -3791,11 +3881,21 @@ class AutonomousBuildOrchestrator:
         # to skip ``propose_pr`` and surface the failure explicitly.
         prior_pr_block = await self._render_prior_pr_block(ticket)
 
+        # SAL-2978 (2026-04-25): include the `Size:` line in the fix-round
+        # body so `_peek_size_label` (in `alfred_coo/main.py`) can still
+        # derive the size-gated iteration cap on respawn. Without this, the
+        # fix-round body had no size signal and `_peek_size_label` fell
+        # through to None → size-S default cap (12), which was the wall
+        # SAL-2588 TIR-06 hit 3x in v7aa. Pair with the +4 fix-round bump
+        # in `_builder_iteration_cap` so the respawn gets size-S=16 / size-M=20.
+        size_line = f"Size: {ticket.size}\n" if ticket.size else ""
+
         body = (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
             f"Wave: {ticket.wave}\n"
             f"Epic: {ticket.epic}\n"
+            f"{size_line}"
             f"Parent autonomous_build kickoff: {self.task_id}\n"
             f"Previous PR: {ticket.pr_url}\n"
             f"Review round: {round_num} of {MAX_REVIEW_CYCLES}\n"

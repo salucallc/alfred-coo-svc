@@ -120,6 +120,42 @@ def iteration_cap_for_size(size_label: str | None) -> int:
     return min(cap, MAX_TOOL_ITERATIONS)
 
 
+# SAL-2978 (2026-04-25): fix-round dispatches need a bigger budget than the
+# initial dispatch because the builder spends extra turns reading the prior PR
+# diff + the review feedback before proposing changes. v7aa evidence: SAL-2588
+# TIR-06 (size-S, est=1) was dispatched 3 times across the run, every dispatch
+# hit MAX_TOOL_ITERATIONS=12. The size-S cap is right for original work; what
+# was missing was headroom on respawn. Bump is +4 turns over the size-based
+# cap; ceiling at MAX_TOOL_ITERATIONS still applies (size-M fix = 20 = ceiling).
+_FIX_ROUND_CAP_BUMP = 4
+
+
+def iteration_cap_for_dispatch(
+    size_label: str | None,
+    is_fix_round: bool = False,
+) -> int:
+    """Return the per-dispatch tool-iteration cap.
+
+    For an initial dispatch this is identical to `iteration_cap_for_size`.
+    For a fix-round dispatch the cap is bumped by ``_FIX_ROUND_CAP_BUMP``
+    (then clamped at ``MAX_TOOL_ITERATIONS``) so the builder gets headroom
+    to read the prior PR + review feedback before pushing fixes.
+
+    The cap is per-dispatch, not per-ticket: every fresh dispatch resets
+    the iteration counter to 0 inside ``_tool_loop``. This helper just
+    sizes the budget for the current dispatch.
+
+    SAL-2978 (2026-04-25):
+      - size-S original: 12, fix-round: 16
+      - size-M original: 16, fix-round: 20
+      - size-L original: 20, fix-round: 20 (already at ceiling)
+    """
+    base = iteration_cap_for_size(size_label)
+    if is_fix_round:
+        return min(base + _FIX_ROUND_CAP_BUMP, MAX_TOOL_ITERATIONS)
+    return base
+
+
 def select_model(task: dict, persona) -> str:
     title = task.get("title", "")
     if "[tag:strategy]" in title:
@@ -427,6 +463,15 @@ class Dispatcher:
         total_in = 0
         total_out = 0
         tool_call_log: list[dict] = []
+
+        # SAL-2978: explicit log line confirming the iteration counter starts
+        # at 0 on every fresh dispatch. The counter is loop-local (the
+        # `for iteration in range(...)` below) so it cannot leak across
+        # dispatches; this log makes that contract observable in production.
+        logger.info(
+            "tool-use loop entering; effective_cap=%d iteration_count_reset=True",
+            effective_cap,
+        )
 
         for iteration in range(effective_cap):
             data = await self._call_gateway(
