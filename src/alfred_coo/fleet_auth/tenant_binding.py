@@ -1,11 +1,14 @@
-def bind_tenant(token_payload: dict, tenant_id: str) -> dict:
-    """Attach tenant information to token payload.
+# Tenant binding logic for fleet endpoints
 
-    Args:
-        token_payload: Original token payload dictionary.
-        tenant_id: Tenant identifier to bind.
-    Returns:
-        Updated payload with tenant information.
+class TenantBinding:
+    """Placeholder for tenant binding implementation.
+    In GA this will enforce that API keys are scoped to a tenant and
+    provide lookup helpers for request authentication.
     """
-    token_payload['tenant'] = {'tenant_id': tenant_id}
-    return token_payload
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+
+    def bind(self, request):
+        # Stub: associate request with tenant_id
+        request.context['tenant_id'] = self.tenant_id
+        return request

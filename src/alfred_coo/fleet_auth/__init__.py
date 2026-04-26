@@ -1,3 +1,3 @@
-# Fleet authentication package for per-tenant support
+# Fleet authentication package
 
-from .tenant_binding import bind_tenant
+"""Initialization for fleet_auth module. Provides tenant‑binding utilities for fleet endpoints."""

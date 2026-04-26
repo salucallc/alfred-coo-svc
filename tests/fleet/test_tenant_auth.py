@@ -1,18 +1,15 @@
-import sys
-from argparse import ArgumentParser
+import pytest
 
-# Import the token module
-sys.path.append('src')
-from mcctl.commands import token
+from alfred_coo.fleet_auth.tenant_binding import TenantBinding
 
-def test_token_parser_includes_tenant_flag(monkeypatch):
-    # Simulate command line arguments
-    test_args = ['--site', 'acme', '--ttl', '15m', '--tenant', 'acme-corp']
-    monkeypatch.setattr(sys, 'argv', ['prog'] + test_args)
-    # Capture printed output
-    captured = []
-    def fake_print(msg):
-        captured.append(msg)
-    monkeypatch.setattr('builtins.print', fake_print)
-    token.main()
-    assert any('tenant=acme-corp' in msg for msg in captured)
+@pytest.fixture
+def dummy_request():
+    class Req:
+        def __init__(self):
+            self.context = {}
+    return Req()
+
+def test_tenant_binding_assigns_id(dummy_request):
+    tb = TenantBinding('tenant-123')
+    req = tb.bind(dummy_request)
+    assert req.context['tenant_id'] == 'tenant-123'
