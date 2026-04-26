@@ -90,6 +90,7 @@ services:
       soul-svc:
         condition: service_healthy
     networks:
+      - mc-egress
       - appliance
 
   # — MCP Services (curated: github, slack, linear, notion) ————
@@ -102,7 +103,7 @@ services:
       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN:?must set}
     command: ["--port", "8203", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @modelcontextprotocol/server-github"]
     networks:
-      - appliance
+      - mc-internal
 
   mcp-slack:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
@@ -114,7 +115,7 @@ services:
       SLACK_TEAM_ID: ${SLACK_TEAM_ID:?must set}
     command: ["--port", "8201", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @modelcontextprotocol/server-slack"]
     networks:
-      - appliance
+      - mc-internal
 
   mcp-linear:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
@@ -125,7 +126,7 @@ services:
       LINEAR_API_KEY: ${LINEAR_API_KEY:?must set}
     command: ["--port", "8208", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y linear-mcp-server"]
     networks:
-      - appliance
+      - mc-internal
 
   mcp-notion:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
@@ -136,7 +137,7 @@ services:
       NOTION_API_KEY: ${NOTION_API_KEY:?must set}
     command: ["--port", "8212", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @notionhq/notion-mcp-server"]
     networks:
-      - appliance
+      - mc-internal
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
@@ -201,4 +202,8 @@ networks:
   appliance:
     driver: bridge
   mc-ops:
+    driver: bridge
+  mc-internal:
+    driver: bridge
+  mc-egress:
     driver: bridge
