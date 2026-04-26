@@ -1488,6 +1488,85 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         branch_hint="feature/c29-multitenant-e2e",
         notes="plan C §5 C-29 + SAL-2677; extends F21 1-hub-3-endpoints suite — one endpoint hosts two tenants (acme-corp + beta-industries); 3 assertion classes: (1) memory isolation, (2) cross-tenant policy leakage, (3) blackout recovery preserves per-tenant global_seq independence. APE/V: pytest tests/fleet/e2e/test_multitenant.py green; jq '.tenant_id' e2e_audit.jsonl | sort -u | wc -l == 2; entire F21 suite runs <15min. Depends on C-26 + C-27 + C-28 + F21",
     ),
+
+    # ── Wave-3 expansion (2026-04-26 evening operator hotfix, follow-on to PR #109/#120) ────────────
+    # 4 entries derived from Z:/_planning/v1-ga/{A,C,E}_*.md.
+    # Resolves the residual wave-3 no_hint gap observed in v7ab autonomous run
+    # (audit doc: C:/Users/cris/AppData/Local/Temp/no_hint_root_cause.md).
+    # PR #109 covered wave-2 + most wave-3 (TIR-09..13, OPS-09/12/14/20/25/27/28,
+    # F11/F14/F16/F17/F19/F22/F25, SS-08); PR #120 fixed gate-3 by adding
+    # `plans/v1-ga/<CODE>.md` to `new_paths` for wave-1/2. This block closes the
+    # remaining 4 wave-3 codes (SS-07, F21, TIR-14, TIR-15) WITH plan-doc paths
+    # included from the start per PR #120 lesson.
+
+    # ── Epic E · soul-svc Wave 3 docs (S-07/SS-07) ───────────────────────
+    "SS-07": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "README.md",
+            "ARCH.md",
+        ),
+        new_paths=(
+            ".github/workflows/docs-lint.yml",
+            "scripts/docs_lint.py",
+            "plans/v1-ga/SS-07.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss07-readme-v2-surface",
+        notes="plan E §5.1 S-07 + SAL-2668; README lists every router in serve.py; /v1/admin/keys documented as tenant-key-minting path; ARCH.md diagram updated; PRODUCTION_GAP.md deleted or replaced; DATABASE_URL documented as canonical backend config with Supabase tips moved to a separate section. APE/V: CI job `docs-lint` verifies every `@router.post/get` decorator referenced in README; `pytest scripts/docs_lint.py` green; grep `PRODUCTION_GAP.md` returns 0 references. Depends on S-01..S-04 + S-09..S-12.",
+    ),
+
+    # ── Epic C · Fleet Wave 6 — F21 E2E integration (multi-endpoint) ─────
+    "F21": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "tests/fleet/__init__.py",
+            "tests/fleet/e2e/__init__.py",
+            "tests/fleet/e2e/test_e2e_fleet.py",
+            "tests/fleet/e2e/docker-compose.fleet-e2e.yml",
+            "tests/fleet/e2e/conftest.py",
+            ".github/workflows/fleet_e2e.yml",
+            "plans/v1-ga/F21.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f21-fleet-e2e-integration",
+        notes="plan C §5 F21 + SAL-2629 [CRITICAL PATH wave 6 long pole]; 1 hub + 3 endpoints on 3 isolated Docker networks; suites: (1) task-completion across mesh, (2) memory-replication with global_seq monotonicity, (3) blackout-recovery (10min hub blackout, 200 local + 150 hub writes, reconcile <60s no dups). APE/V: JUnit XML emitted; CI workflow `fleet_e2e.yml` green on PR; entire suite runs <15min wall-clock; per-endpoint `mode_state` transitions logged. Note: tests/fleet/e2e/__init__.py shared with C-29 multi-tenant amendment (idempotent on coexistence). Depends on F16 + F17 + F20.",
+    ),
+
+    # ── Epic A · Tiresias-sovereign Wave 4 — TIR-14/15 sovereignty smoke + QA ─
+    "TIR-14": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            ".github/workflows/tiresias_sovereignty_smoke.yml",
+            "deploy/appliance/tiresias/smoke_test.sh",
+            "deploy/appliance/tiresias/test_audit_chain_walk.py",
+            "plans/v1-ga/TIR-14.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-14-e2e-sovereignty-smoke",
+        notes="plan A §4 Wave 4 + SAL-2596 [RC tag prerequisite per plan A §8]; new GitHub workflow asserts (1) smoke_test.sh passes end-to-end, (2) direct curl to api.github.com from coo container fails (DNS/conn-refused per TIR-10 network split), (3) proxied call via tiresias-proxy succeeds + audit_chain row written, (4) unregistered soulkey → 403 P1 deny, (5) audit chain walk verifies every row's prev_hash links cleanly. APE/V: workflow green on PR; smoke_test.sh exit 0; test_audit_chain_walk.py finds 0 hash-link breaks across ≥10 rows. Depends on TIR-11 + TIR-12 + TIR-13.",
+    ),
+
+    "TIR-15": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/tiresias/README.md",
+        ),
+        new_paths=(
+            "deploy/appliance/tiresias/PRINCIPLES.md",
+            "deploy/appliance/tiresias/RUNBOOK.md",
+            "plans/v1-ga/TIR-15.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-15-qa-and-docs",
+        notes="plan A §4 Wave 4 + SAL-2597; hawkman-qa-a constrained review on all TIR-09..14 PRs; appliance Tiresias docs lint clean — README + PRINCIPLES.md (12 constitutional principles) + RUNBOOK.md (operator playbook for sovereignty smoke fail, key rotation, audit-chain inspection). APE/V: hawkman-qa-a verdict APPROVED on every TIR-* PR; markdownlint green on all 3 docs; PRINCIPLES.md asserts `.principles | length == 12` matches TIR-02 registry. Depends on TIR-14.",
+    ),
 }
 
 
