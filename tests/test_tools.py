@@ -1540,3 +1540,193 @@ def test_fetch_linear_acceptance_criteria_no_key(monkeypatch):
     assert _fetch_linear_acceptance_criteria("SAL-2965") is None
     assert _fetch_linear_acceptance_criteria(None) is None
     assert _fetch_linear_acceptance_criteria("") is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# SAL-2965 (post-evidence-2026-04-26): hawkman gate-1 verbatim contract.
+#
+# PR #103 (SAL-2601) shipped the *correct format* (## APE/V Citation +
+# fenced block) but still got REQUEST_CHANGES because the citation
+# *paraphrased* the Linear ticket body — semicolons → periods, tuples
+# rewritten with backticks, "and green" dropped. Hawkman does a byte-
+# verbatim substring match against the Linear ticket body, so any
+# normalisation drifts the citation off-source and breaks the gate.
+#
+# These tests pin the helper to a no-rewrite contract.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_acceptance_handles_apev_machinecheckable_heading():
+    """Mission Control v1 GA tickets use ``## APE/V Acceptance (machine-
+    checkable)`` (verified on SAL-2601, SAL-2613). The extractor must
+    match this heading variant and return the body byte-verbatim — not
+    the plan-doc-only ``## Acceptance criteria`` variant the SAL-2953
+    extractor was built for.
+    """
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    sal2601_linear_description = (
+        "**Epic:** B. Aletheia Daemon\n"
+        "**Plan doc:** file:///Z:/_planning/v1-ga/B_aletheia_daemon.md\n"
+        "**Ticket code:** SAL-ALT-04\n"
+        "**Wave:** 1\n\n"
+        "## APE/V Acceptance (machine-checkable)\n\n"
+        "Given 12 (action_class, risk_tier) rows, router returns expected "
+        "model_id; refuses when generator_model == candidate_verifier_model; "
+        "unit tests committed and green\n\n"
+        "## Effort\n\n"
+        "S (estimate = 1 pts)\n"
+    )
+    out = _extract_acceptance_lines(sal2601_linear_description)
+    assert out is not None, "must match `## APE/V Acceptance (machine-checkable)`"
+    # Byte-for-byte preservation of the Linear body — semicolons stay
+    # semicolons, tuples stay un-quoted, "and green" is preserved. The
+    # trailing newline is trimmed (outer whitespace only).
+    expected = (
+        "Given 12 (action_class, risk_tier) rows, router returns expected "
+        "model_id; refuses when generator_model == candidate_verifier_model; "
+        "unit tests committed and green"
+    )
+    assert out == expected, (
+        f"extracted text drifted from Linear source.\n"
+        f"  expected: {expected!r}\n"
+        f"  got:      {out!r}"
+    )
+
+
+def test_extract_acceptance_handles_apev_acceptance_no_parens():
+    """Variant without the parenthetical: ``## APE/V Acceptance``."""
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    src = (
+        "## APE/V Acceptance\n"
+        "Given X; refuses when Y; unit tests green\n\n"
+        "## Effort\nS\n"
+    )
+    out = _extract_acceptance_lines(src)
+    assert out == "Given X; refuses when Y; unit tests green"
+
+
+def test_extract_acceptance_handles_legacy_acceptance_criteria():
+    """Plan-doc / legacy ticket variant: ``## Acceptance criteria``."""
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    src = (
+        "## Acceptance criteria\n"
+        "- foo; bar; baz (with semicolons preserved)\n"
+        "- (tuple, like, this) preserved as-is\n\n"
+        "## Verification\n"
+    )
+    out = _extract_acceptance_lines(src)
+    expected = (
+        "- foo; bar; baz (with semicolons preserved)\n"
+        "- (tuple, like, this) preserved as-is"
+    )
+    assert out == expected
+
+
+def test_extract_acceptance_preserves_semicolons_byte_verbatim():
+    """Hawkman regression: PR #103 paraphrased semicolons to periods.
+    The helper MUST NOT do that. Bytes in must equal bytes out (modulo
+    outer whitespace trim only).
+    """
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    src = (
+        "## APE/V Acceptance (machine-checkable)\n"
+        "Foo; bar; baz\n"
+        "## Next\n"
+    )
+    out = _extract_acceptance_lines(src)
+    # Must NOT be rewritten to "Foo. Bar. Baz."
+    assert out == "Foo; bar; baz"
+    assert "." not in out, (
+        "semicolons must not be rewritten to periods (PR #103 drift bug)"
+    )
+
+
+def test_apev_inject_quotes_linear_body_byte_verbatim():
+    """End-to-end: when Linear returns the canonical ticket body, the
+    auto-injected fenced block must contain that body byte-for-byte.
+    Reproduces the PR #103 (SAL-2601) failure: the Linear text
+    ``"... refuses when generator_model == candidate_verifier_model; unit
+    tests committed and green"`` must land in the citation block exactly
+    — no semicolon-to-period rewriting, no backtick wrapping of the
+    ``(action_class, risk_tier)`` tuple, no dropping ``"and green"``.
+    """
+    canonical_linear_body = (
+        "Given 12 (action_class, risk_tier) rows, router returns expected "
+        "model_id; refuses when generator_model == candidate_verifier_model; "
+        "unit tests committed and green"
+    )
+    out = _maybe_inject_apev_citation(
+        "PR body without citation.\n",
+        files={},
+        branch="feature/sal-2601-router",
+        linear_fetcher=lambda code: (
+            canonical_linear_body if code == "SAL-2601" else None
+        ),
+    )
+    # The exact Linear body string MUST appear unchanged in the output.
+    assert canonical_linear_body in out, (
+        f"verbatim Linear body missing from injected block.\n"
+        f"  expected substring: {canonical_linear_body!r}\n"
+        f"  actual body: {out!r}"
+    )
+    # Negative: none of the PR #103 paraphrase artefacts may appear.
+    forbidden_paraphrases = [
+        # PR #103 split semicolons into separate sentences with periods.
+        "router returns expected model_id.",
+        "Refuses when generator_model",
+        # PR #103 wrapped the tuple in backticks.
+        "`(action_class, risk_tier)`",
+        # PR #103 dropped "and green".
+        "unit tests committed.",
+    ]
+    for bad in forbidden_paraphrases:
+        assert bad not in out, (
+            f"injected body contains paraphrase artefact {bad!r} — "
+            f"hawkman gate-1 will REQUEST_CHANGES.\n  body: {out!r}"
+        )
+
+
+def test_apev_inject_preserves_linear_body_with_special_chars():
+    """Linear bodies in MC v1 GA tickets contain ``==``, ``<``, tuples,
+    and multi-clause semicolon lists. None of these may be normalised.
+    """
+    src_body = (
+        "ack p95 <500ms local; 3 missed -> mode_state=degraded; "
+        "visible in /v1/fleet/endpoints/{id}"
+    )
+    out = _maybe_inject_apev_citation(
+        "no citation",
+        files={},
+        branch="feature/sal-2613-heartbeat",
+        linear_fetcher=lambda code: src_body,
+    )
+    assert src_body in out, (
+        f"special-char body must be preserved verbatim.\n"
+        f"  expected: {src_body!r}\n"
+        f"  got body: {out!r}"
+    )
+
+
+def test_apev_inject_does_not_strip_paths_or_tuples():
+    """Defensive: a body containing slashes, parens, asterisks, and
+    backticks must round-trip unchanged through the helper.
+    """
+    src = (
+        "Given inputs (a, b, c); calls /v1/foo/{id}; returns {\"ok\": true}; "
+        "asserts `state == \"degraded\"` and emits *audit log* entry"
+    )
+    out = _maybe_inject_apev_citation(
+        "x",
+        files={},
+        branch="feature/sal-9999-z",
+        linear_fetcher=lambda code: src,
+    )
+    assert src in out, (
+        f"complex body lost characters in transit.\n"
+        f"  expected: {src!r}\n"
+        f"  got:      {out!r}"
+    )

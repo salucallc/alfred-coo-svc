@@ -353,31 +353,48 @@ _VALID_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # ── SAL-2965: source = Linear ticket body, skip on fix-round ────────────────
 #
 # The original SAL-2953 implementation extracted acceptance criteria from
-# the per-ticket plan doc (`plans/v1-ga/<CODE>.md`). Two failure modes
-# emerged in v7z:
+# the per-ticket plan doc (`plans/v1-ga/<CODE>.md`). Three failure modes
+# observed in v7z (PR #103 SAL-2601 ALT-04 confirmed gate-1 is byte-
+# verbatim substring against Linear, not format-only):
 #
 #   1. Source drift. The plan doc is builder-authored; on a hawkman fix-
 #      round respawn the builder rewrites it and sometimes fills the
-#      `## Acceptance criteria` section with the fix-round directive
-#      ("Address every point in the review feedback below…") instead of
-#      the upstream APE/V text. Hawkman validates against the *Linear
-#      ticket body's* acceptance section, which is canonical, so the
-#      auto-injected citation no longer matched and GATE 1 stayed red.
-#      Concrete case: salucallc/soul-svc#37 (SAL-2613) — auto-inject
-#      shipped the fix-round directive verbatim as "acceptance criteria".
+#      acceptance section with the fix-round directive ("Address every
+#      point in the review feedback below…") instead of the upstream
+#      APE/V text. Hawkman validates against the *Linear ticket body's*
+#      acceptance section, which is canonical, so the auto-injected
+#      citation no longer matched and GATE 1 stayed red. Concrete case:
+#      salucallc/soul-svc#37 (SAL-2613) — auto-inject shipped the fix-
+#      round directive verbatim as "acceptance criteria".
 #   2. Fix-round overwrite. `update_pr` re-ran the auto-inject on every
 #      respawn. If the original PR body had the citation built from the
 #      previous (clean) plan doc, a follow-up rewrite with a drifted
 #      plan doc would replace it with stale text — or worse, append a
 #      second drifted block if the canonical heading regex missed.
+#   3. Paraphrase drift. PR #103 (SAL-2601) shipped a fenced citation
+#      block whose contents had been *paraphrased* — semicolons rewritten
+#      to periods, tuples re-quoted with backticks, the trailing "and
+#      green" dropped. Hawkman REQUEST_CHANGES because it does a byte-
+#      verbatim substring match against the Linear ticket body, not a
+#      semantic / format check. The helper therefore must NOT perform
+#      any string normalisation, markdown enrichment, or stylistic
+#      rewriting on the extracted text — what comes out of Linear must
+#      land inside the fenced block byte-for-byte.
 #
-# The SAL-2965 fix tightens both:
+# The SAL-2965 fix tightens all three:
 #
 #   • Source: prefer Linear ticket body. The orchestrator already has
 #     `LINEAR_API_KEY` configured for `linear_create_issue` and
 #     `linear_update_issue_state`; we reuse it to GET the issue body
-#     by `identifier` (the ticket code) and parse the
-#     `## Acceptance criteria` section from there.
+#     by `identifier` (the ticket code) and parse the acceptance
+#     section from there.
+#   • Heading variants: Mission Control v1 GA tickets use
+#     `## APE/V Acceptance (machine-checkable)`; older tickets and plan
+#     docs use `## Acceptance criteria`. The extraction regex accepts
+#     both (and minor stylistic variants).
+#   • Verbatim: the extraction strips outer whitespace only — content
+#     between the heading and the next heading is preserved byte-for-
+#     byte. No normalisation, no rewriting, no enrichment.
 #   • Fallback: when Linear is unreachable (no key, transport error,
 #     section missing) the helper falls back to the plan-doc path so
 #     air-gapped / fixture-driven tests stay green.
@@ -393,7 +410,30 @@ _PLAN_DOC_PATH_RE = re.compile(
     r"^plans/v1-ga/(?P<code>[A-Za-z0-9][A-Za-z0-9_-]+)\.md$"
 )
 _PLAN_ACCEPTANCE_RE = re.compile(
-    r"(?ims)^\s{0,3}#{2,3}\s*Acceptance(?:\s+criteria)?\s*\n(?P<body>.*?)"
+    # SAL-2965 (post-evidence-2026-04-26): hawkman validates byte-verbatim
+    # substring against the *Linear ticket body's* acceptance section.
+    # Mission Control v1 GA tickets use `## APE/V Acceptance (machine-
+    # checkable)` (verified on SAL-2601 / SAL-2613 / SAL-2611). Older
+    # plan docs and historical tickets use `## Acceptance criteria`.
+    # The regex accepts both — and any common stylistic variant — so the
+    # helper extracts the same canonical text whether the source is the
+    # Linear `description` field or a `plans/v1-ga/<CODE>.md` doc.
+    #
+    # Permissive on the heading wording, strict on what counts as the
+    # *body*: capture stops at the next markdown heading (h1-h3) or EOF
+    # so we do not bleed into `## Effort` / `## Notes` / etc. The capture
+    # is deliberately raw — no whitespace collapsing, no markdown
+    # rewriting, no semicolon-to-period substitution. Whatever bytes the
+    # ticket author wrote between the heading and the next section MUST
+    # appear byte-identical inside the auto-injected fenced block.
+    r"(?ims)"
+    r"^\s{0,3}#{2,3}\s*"  # heading marker (## or ###)
+    r"(?:APE\s*[/\-_]?\s*V\s+)?"  # optional "APE/V" / "APE-V" / "APEV" prefix
+    r"Acceptance"  # core word
+    r"(?:\s+criteria)?"  # optional "criteria" suffix (plan-doc style)
+    r"(?:\s*\([^)]*\))?"  # optional parenthetical e.g. "(machine-checkable)"
+    r"\s*\n"
+    r"(?P<body>.*?)"
     r"(?=^\s{0,3}#{1,3}\s|\Z)"
 )
 
@@ -457,14 +497,25 @@ def _find_plan_doc_in_files(
 
 
 def _extract_acceptance_lines(plan_doc_content: Optional[str]) -> Optional[str]:
-    """Pull the `## Acceptance criteria` body out of a plan-doc markdown.
+    """Pull the acceptance section body out of a plan-doc / Linear-ticket markdown.
 
-    Returns the section's text (trimmed) without the heading itself, or
-    ``None`` if the section is missing. The persona protocol Step 4(a)
-    requires the plan doc to carry this section verbatim from the
-    upstream APE/V, so a present-but-empty extraction means the builder
-    shipped an empty section and the auto-inject still beats no citation
-    at all.
+    Recognised section headings (case-insensitive, h2 or h3):
+      * ``## APE/V Acceptance (machine-checkable)`` — Mission Control v1
+        GA ticket convention (canonical, what hawkman validates against).
+      * ``## APE/V Acceptance`` — same, without the parenthetical.
+      * ``## Acceptance criteria`` — historical plan-doc convention.
+      * ``## Acceptance`` — terse variant.
+
+    Returns the section's text with leading/trailing whitespace trimmed
+    only — content between the heading and the next heading is preserved
+    BYTE-FOR-BYTE. No newline collapsing, no semicolon-to-period
+    rewriting, no backtick wrapping, no markdown enrichment. Hawkman's
+    GATE 1 is a verbatim substring match against the Linear ticket body;
+    any post-processing here introduces drift and breaks the gate.
+
+    Returns ``None`` when the section is missing or the body is empty
+    after outer-whitespace trim. Callers fall back to the plan-doc path
+    on ``None`` from the Linear-bound fetcher.
     """
     if not plan_doc_content or not isinstance(plan_doc_content, str):
         return None
@@ -524,19 +575,27 @@ def _build_apev_citation_block(
 def _fetch_linear_acceptance_criteria(
     ticket_code: Optional[str],
 ) -> Optional[str]:
-    """Fetch the `## Acceptance criteria` section from a Linear ticket body.
+    """Fetch the acceptance section from a Linear ticket body, byte-verbatim.
 
-    SAL-2965: hawkman validates against the *Linear ticket body's*
-    acceptance section, not the plan doc's. The plan doc is builder-
-    authored and drifts (especially on fix-round respawns where the
-    builder pastes the fix-round directive into the section). Pulling
-    canonical text from Linear closes that drift surface.
+    SAL-2965: hawkman validates GATE 1 with a byte-verbatim substring
+    match against the *Linear ticket body's* acceptance section, not the
+    plan doc's. The plan doc is builder-authored and drifts (especially
+    on fix-round respawns where the builder pastes the fix-round
+    directive into the section). Pulling canonical text from Linear and
+    embedding it byte-for-byte closes that drift surface.
 
-    Returns the trimmed section body, or ``None`` when:
+    Mission Control v1 GA tickets use the heading
+    ``## APE/V Acceptance (machine-checkable)``. Older tickets and plan
+    docs use ``## Acceptance criteria``. ``_extract_acceptance_lines``
+    accepts both forms.
+
+    Returns the section body trimmed at the outer edges only — every
+    byte between the heading line and the next markdown heading is
+    preserved exactly as Linear stored it. ``None`` when:
       - ``ticket_code`` is empty / unparseable,
       - ``LINEAR_API_KEY`` (or ``ALFRED_OPS_LINEAR_API_KEY``) is unset,
       - the Linear GraphQL request fails (HTTP / transport),
-      - the issue has no body or no `## Acceptance criteria` heading.
+      - the issue has no body or no recognised acceptance heading.
 
     Callers fall back to the plan-doc path on ``None``.
 
