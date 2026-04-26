@@ -137,16 +137,24 @@ def token_for_persona(persona_name: Optional[str]) -> tuple[str, str]:
       1. ``persona_name`` → identity class (UNKNOWN if not mapped).
       2. If the class is BUILDER / QA / ORCHESTRATOR, try the matching
          per-class env var (``GITHUB_TOKEN_BUILDER`` etc.).
-      3. ORCHESTRATOR has an extra fallback to ``GITHUB_TOKEN_QA`` —
-         "QA approved → QA merges" is the cleanest semantic when no
-         dedicated orchestrator bot exists.
-      4. Anything still unset falls through to legacy ``GITHUB_TOKEN``.
-      5. If even the legacy var is missing, return ``("", "unknown")``
+      3. Anything still unset falls through to legacy ``GITHUB_TOKEN``.
+      4. If even the legacy var is missing, return ``("", "unknown")``
          so the caller's existing missing-token error path fires.
 
     Returns the token string and the *resolved* class label (which may
     differ from the requested class if a fallback fired) so the caller
     can log / route accordingly.
+
+    SAL-2930: ORCHESTRATOR no longer falls back to ``GITHUB_TOKEN_QA``.
+    This function backs read-only probes (``_gh_api`` / ``_gh_contents``
+    in autonomous_build/orchestrator.py + ``http_get`` in tools.py).
+    When ``GITHUB_TOKEN_QA`` is a fine-grained PAT scoped only to Pull
+    requests (correct for a QA reviewer), every orchestrator probe
+    against a private repo 404s for lack of repo-content read. The
+    "QA approved → QA merges" semantic is still preserved at the merge
+    call site — see ``tools._github_token_for`` which keeps the QA-hop
+    for ``github_merge_pr`` only. Coupling READ probes to MERGE actions
+    through the same fallback chain was the original design oversight.
     """
     cls = identity_class_for_persona(persona_name)
 
@@ -157,19 +165,12 @@ def token_for_persona(persona_name: Optional[str]) -> tuple[str, str]:
         if token:
             return token, cls
 
-    # Step 2: orchestrator-specific fallback chain — try QA before
-    # legacy. Rationale in the design doc §4.4.
-    if cls == GitHubIdentityClass.ORCHESTRATOR:
-        qa_token = os.environ.get(_TOKEN_ENV_VARS[GitHubIdentityClass.QA], "").strip()
-        if qa_token:
-            return qa_token, GitHubIdentityClass.QA
-
-    # Step 3: legacy ``GITHUB_TOKEN`` catch-all.
+    # Step 2: legacy ``GITHUB_TOKEN`` catch-all.
     legacy = os.environ.get(_LEGACY_TOKEN_ENV_VAR, "").strip()
     if legacy:
         return legacy, GitHubIdentityClass.UNKNOWN
 
-    # Step 4: nothing configured.
+    # Step 3: nothing configured.
     return "", GitHubIdentityClass.UNKNOWN
 
 
