@@ -1,0 +1,15 @@
+version: "3.9"
+services:
+  infisical-agent:
+    image: infisical/infisical-agent:latest
+    environment:
+      INFISICAL_URL: http://infisical:8080
+      INFISICAL_TOKEN: ${INFISICAL_TOKEN:?must set}
+    volumes:
+      - /run/secrets:/run/secrets
+    restart: unless-stopped
+    networks:
+      - mc-ops
+networks:
+  mc-ops:
+    external: true
