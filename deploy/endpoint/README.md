@@ -1,16 +1,42 @@
-# Endpoint Deployment
+# Deploying an Alfred COoSVC Endpoint
 
-This directory contains the Docker Compose setup for running `alfred-coo-svc` in **endpoint** mode.
+This guide walks through setting up a fresh Debian VM as an **endpoint** for the fleet.
 
-## Files
-- `docker-compose.yml` – service definitions.
-- `.env.template` – template for required environment variables.
-- `bootstrap.sh` – helper script to start the services.
+## Prerequisites
+- Debian 12 (or any recent Debian) with Docker Engine installed.
+- Network access to the hub on outbound port 443.
+- A one‑time `registration_token` from the hub admin (see hub UI or `mcctl token create`).
 
-## Setup
-1. Copy `.env.template` to `.env` and fill in the `REGISTRATION_TOKEN` and `HUB_URL`.
-2. Run `./bootstrap.sh`.
-3. Verify the containers are up with `docker compose ps`.
-4. Check the endpoint registers with the hub (look for heartbeat logs).
+## Steps
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/salucallc/alfred-coo-svc.git
+   cd alfred-coo-svc
+   ```
+2. **Create the compose directory**
+   ```bash
+   mkdir -p deploy/endpoint
+   cp -r docs/endpoint_template/* deploy/endpoint/   # if you have templates
+   ```
+3. **Edit `.env.template`**
+   Replace `YOUR_REGISTRATION_TOKEN_HERE` with the token you obtained.
+   Adjust `HUB_URL` if your hub runs on a custom domain.
+4. **Start the services**
+   ```bash
+   cd deploy/endpoint
+   docker compose up -d
+   ```
+5. **Verify registration**
+   Check the logs of `alfred-coo-svc-endpoint`:
+   ```bash
+   docker logs -f alfred-coo-svc-endpoint
+   ```
+   You should see a successful `201 Created` response and periodic heartbeats.
 
-The entire process should take less than **10 minutes** on a fresh Debian VM.
+## Cleanup
+```bash
+docker compose down
+rm -rf data
+```
+
+The endpoint runs headless – no UI, no Postgres, no portal. It registers once, then continuously sends heartbeats and syncs memory via `soul-lite`.

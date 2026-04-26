@@ -1,18 +1,26 @@
-version: "3.8"
+version: '3.8'
+
 services:
   alfred-coo-svc:
     image: salucallc/alfred-coo-svc:latest
-    environment:
-      - COO_MODE=endpoint
+    container_name: alfred-coo-svc-endpoint
     env_file:
-      - .env
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
+      - ./.env.template
+    command: ["sh", "-c", "COO_MODE=endpoint python -m alfred_coo_svc"]
+    networks:
+      - endpoint-net
+    ports: []
+
   soul-lite:
     image: salucallc/soul-lite:latest
+    container_name: soul-lite-endpoint
     volumes:
-      - soul-lite-data:/data
-    restart: unless-stopped
-volumes:
-  soul-lite-data:
+      - ./data:/data
+    environment:
+      - SQLITE_DB=/data/soul-lite.db
+    networks:
+      - endpoint-net
+
+networks:
+  endpoint-net:
+    driver: bridge
