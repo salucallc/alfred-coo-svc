@@ -1,0 +1,17 @@
+# OIDC client template for Authelia
+# Copy this file to create a new OIDC client configuration.
+# Replace <PROVIDER>, <CLIENT_ID>, <CLIENT_SECRET>, <REDIRECT_URI> as needed.
+
+clients:
+  - name: "<PROVIDER>"
+    client_id: "<CLIENT_ID>"
+    client_secret: "<CLIENT_SECRET>"
+    redirect_uris:
+      - "<REDIRECT_URI>"
+    scopes:
+      - openid
+      - profile
+      - email
+    public: false
+    # Optional: consent_mode can be "auto" or "prompt"
+    consent_mode: "prompt"
