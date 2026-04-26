@@ -9,6 +9,7 @@ task after deployment.
 import asyncio
 import json
 import os
+import re
 
 import pytest
 
@@ -1353,3 +1354,189 @@ def test_build_apev_block_canonical_shape():
     assert "- Verification: CLI test green." in block
     assert "- Acceptance criteria:" in block
     assert "```\nOne-shot token printed; DB row created.\n```" in block
+
+
+# ── SAL-2965: fenced-format regression, Linear source, fix-round skip ───────
+#
+# v7z observed two distinct mismatches between the SAL-2953 auto-inject
+# and hawkman's gate-1 expectations:
+#   1. Source: plan doc is builder-authored and drifts on fix-rounds
+#      (PR #37 SAL-2613: 5 cycles where the fix-round directive was
+#      extracted as acceptance criteria). Linear ticket body is
+#      canonical and what hawkman validates against.
+#   2. Fix-round: update_pr re-running the auto-inject overwrote the
+#      original (clean) PR body with text re-extracted from a drifted
+#      plan doc.
+# The SAL-2965 fix:
+#   - Linear ticket body is the primary source; plan doc is fallback.
+#   - update_pr passes is_fix_round=True; the helper short-circuits.
+#   - Format remains the canonical fenced acceptance block (matches
+#     PR #38 SAL-2665 and PR #35 SAL-2610 hawkman-APPROVED exemplars).
+
+
+def test_builder_pr_body_apev_uses_fenced_acceptance():
+    """Regression: SAL-2965 ticket reported "bullets vs fenced". The
+    auto-inject MUST emit the acceptance criteria inside a triple-
+    backtick fenced block (verbatim), matching the PR #38 SAL-2665 and
+    PR #35 SAL-2610 hawkman-APPROVED exemplars. Hawkman gate-1 grep-
+    matches on the fenced block, not on a bare bullet line.
+    """
+    builder_body = "Patch text only; no citation.\n"
+    files = {"plans/v1-ga/SAL-2965.md": _SAMPLE_PLAN_DOC}
+    out = _maybe_inject_apev_citation(
+        builder_body,
+        files=files,
+        branch="fix/SAL-2965-x",
+        # Force the plan-doc fallback (no Linear) for this test by
+        # passing a fetcher that returns None.
+        linear_fetcher=lambda code: None,
+    )
+    # Must contain a triple-backtick fenced block enclosing the verbatim
+    # acceptance lines from the plan doc.
+    fence_re = re.compile(
+        r"```\n[\s\S]*?Idempotent: existing citations are not duplicated\."
+        r"[\s\S]*?\n```"
+    )
+    assert fence_re.search(out), (
+        f"acceptance criteria must be in a fenced code block, got: {out!r}"
+    )
+    # Sanity-check the fence open / close are balanced (hawkman parser
+    # would reject a stray opening fence with no close): there must be
+    # an even number of triple-backtick markers.
+    assert out.count("```") % 2 == 0, (
+        f"unbalanced fence markers in body: {out!r}"
+    )
+    # The fenced block must directly follow the `- Acceptance criteria:`
+    # bullet (the canonical PR #38 / PR #35 shape: bullet line, then
+    # opening fence on the next non-empty line).
+    canonical_shape_re = re.compile(
+        r"-\s+Acceptance criteria:\s*\n```\n", re.MULTILINE
+    )
+    assert canonical_shape_re.search(out), (
+        f"expected `- Acceptance criteria:` bullet immediately followed "
+        f"by an opening fence, got: {out!r}"
+    )
+
+
+def test_builder_pr_body_apev_extracts_from_linear_not_plan_doc():
+    """SAL-2965 source change: when Linear has the canonical ticket body
+    and the plan doc has drifted, the auto-injected block MUST quote the
+    Linear text, not the plan-doc text. This is the bug hawkman caught
+    on soul-svc#37 SAL-2613 (auto-inject shipped the fix-round directive
+    as acceptance criteria, since the plan doc had been overwritten).
+    """
+    plan_doc_drifted = (
+        "# SAL-2613: drifted plan doc\n\n"
+        "## Acceptance criteria\n"
+        "- [ ] Address every point in the review feedback below.\n"
+        "- [ ] Push fixes to the EXISTING branch via update_pr.\n\n"
+        "## Verification approach\n"
+        "Re-run review.\n"
+    )
+    canonical_linear_body = (
+        "ack p95 <500ms local; 3 missed -> mode_state=degraded; "
+        "visible in /v1/fleet/endpoints/{id}"
+    )
+
+    files = {"plans/v1-ga/SAL-2613.md": plan_doc_drifted}
+    out = _maybe_inject_apev_citation(
+        "no citation here",
+        files=files,
+        branch="feature/sal-2613-heartbeat",
+        # Inject a fake Linear fetcher returning the canonical body.
+        linear_fetcher=lambda code: (
+            canonical_linear_body if code == "SAL-2613" else None
+        ),
+    )
+    # The Linear (canonical) text must appear in the fenced block.
+    assert "ack p95 <500ms local" in out
+    assert "mode_state=degraded" in out
+    # The drifted plan-doc text must NOT appear (would indicate the
+    # helper preferred the wrong source).
+    assert "Address every point in the review feedback" not in out
+    assert "Push fixes to the EXISTING branch" not in out
+
+
+def test_apev_falls_back_to_plan_doc_when_linear_unavailable():
+    """When the Linear fetcher returns None (no API key, transport
+    error, ticket missing) the helper must fall back to the plan-doc
+    extraction so air-gapped tests + offline fixtures still get a
+    deterministic citation block."""
+    files = {"plans/v1-ga/SAL-2953.md": _SAMPLE_PLAN_DOC}
+    out = _maybe_inject_apev_citation(
+        "Patch only.\n",
+        files=files,
+        branch="fix/sal-2953-x",
+        linear_fetcher=lambda code: None,  # Linear unreachable.
+    )
+    # Plan-doc acceptance line lands in the citation.
+    assert "Idempotent: existing citations are not duplicated." in out
+    assert "## APE/V Citation" in out
+
+
+def test_update_pr_skips_apev_auto_inject():
+    """SAL-2965 fix-round skip: update_pr passes is_fix_round=True so
+    the helper returns the body unchanged regardless of whether a
+    citation is present, regardless of plan-doc presence in files,
+    regardless of the Linear fetch outcome. This preserves the
+    original PR body's citation across fix-rounds and prevents the
+    helper from clobbering it with text re-extracted from a drifted
+    plan doc.
+    """
+    body_without_citation = "Body with no APE/V section at all.\n"
+    files = {"plans/v1-ga/SAL-2613.md": _SAMPLE_PLAN_DOC}
+
+    # Sentinel: even with a fetcher that WOULD return acceptance
+    # criteria, fix-round skip means body is returned unchanged.
+    def fetcher_would_return(code):
+        return "this would be injected"
+
+    out = _maybe_inject_apev_citation(
+        body_without_citation,
+        files=files,
+        branch="feature/sal-2613-x",
+        is_fix_round=True,
+        linear_fetcher=fetcher_would_return,
+    )
+    assert out == body_without_citation
+    assert "## APE/V Citation" not in out
+    assert "this would be injected" not in out
+
+    # And: a body that ALREADY has a citation also passes through
+    # unchanged (which would be true even without the skip, but the
+    # contract holds).
+    body_with_citation = (
+        "Original.\n\n## APE/V Citation\n"
+        "- Plan doc path: `plans/v1-ga/SAL-2613.md`\n"
+        "- Verification: original verification\n"
+        "- Acceptance criteria:\n```\noriginal acceptance\n```\n"
+    )
+    out2 = _maybe_inject_apev_citation(
+        body_with_citation,
+        is_fix_round=True,
+        linear_fetcher=fetcher_would_return,
+    )
+    assert out2 == body_with_citation
+
+
+def test_update_pr_skips_apev_with_empty_body():
+    """Edge: fix-round with empty body returns empty string (no inject,
+    no crash). The fix-round contract is "do not touch the body";
+    nothing-to-touch is still nothing-to-touch."""
+    out = _maybe_inject_apev_citation(
+        "",
+        is_fix_round=True,
+        linear_fetcher=lambda code: "would-be-acceptance",
+    )
+    assert out == ""
+
+
+def test_fetch_linear_acceptance_criteria_no_key(monkeypatch):
+    """Without LINEAR_API_KEY the production fetcher must return None
+    cleanly so the caller falls back to plan-doc extraction."""
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("ALFRED_OPS_LINEAR_API_KEY", raising=False)
+    from alfred_coo.tools import _fetch_linear_acceptance_criteria
+    assert _fetch_linear_acceptance_criteria("SAL-2965") is None
+    assert _fetch_linear_acceptance_criteria(None) is None
+    assert _fetch_linear_acceptance_criteria("") is None

@@ -329,11 +329,10 @@ _VALID_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # REQUEST_CHANGES every PR whose body lacks a verbatim APE/V citation.
 # In v7y wave-1 this cost 3 review cycles across 2 dispatched tickets
 # (SAL-2584 finally APPROVED on cycle #3; SAL-2610 escalated). The
-# orchestrator-side fix is deterministic: at propose_pr / update_pr time,
+# orchestrator-side fix is deterministic: at propose_pr time,
 # if the builder's body is missing the `## APE/V` (or `## APE/V Citation`)
-# heading, synthesise one from artifacts already in the call — the
-# `plans/v1-ga/<TICKET>.md` plan doc the builder is required to ship in
-# the same files dict (see persona.py Step 4(a)) — and append it.
+# heading, synthesise one from the canonical Linear ticket body
+# (with a plan-doc fallback when Linear is unreachable) and append it.
 #
 # The block format mirrors the canonical APPROVED PR bodies on
 # salucallc/alfred-coo-svc#96 and salucallc/tiresias-sovereign#8:
@@ -350,6 +349,42 @@ _VALID_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # (case-insensitive, with or without the literal slash) the helper
 # returns the body unchanged. The builder LLM is therefore free to
 # emit its own citation; we only fill in when it forgets.
+#
+# ── SAL-2965: source = Linear ticket body, skip on fix-round ────────────────
+#
+# The original SAL-2953 implementation extracted acceptance criteria from
+# the per-ticket plan doc (`plans/v1-ga/<CODE>.md`). Two failure modes
+# emerged in v7z:
+#
+#   1. Source drift. The plan doc is builder-authored; on a hawkman fix-
+#      round respawn the builder rewrites it and sometimes fills the
+#      `## Acceptance criteria` section with the fix-round directive
+#      ("Address every point in the review feedback below…") instead of
+#      the upstream APE/V text. Hawkman validates against the *Linear
+#      ticket body's* acceptance section, which is canonical, so the
+#      auto-injected citation no longer matched and GATE 1 stayed red.
+#      Concrete case: salucallc/soul-svc#37 (SAL-2613) — auto-inject
+#      shipped the fix-round directive verbatim as "acceptance criteria".
+#   2. Fix-round overwrite. `update_pr` re-ran the auto-inject on every
+#      respawn. If the original PR body had the citation built from the
+#      previous (clean) plan doc, a follow-up rewrite with a drifted
+#      plan doc would replace it with stale text — or worse, append a
+#      second drifted block if the canonical heading regex missed.
+#
+# The SAL-2965 fix tightens both:
+#
+#   • Source: prefer Linear ticket body. The orchestrator already has
+#     `LINEAR_API_KEY` configured for `linear_create_issue` and
+#     `linear_update_issue_state`; we reuse it to GET the issue body
+#     by `identifier` (the ticket code) and parse the
+#     `## Acceptance criteria` section from there.
+#   • Fallback: when Linear is unreachable (no key, transport error,
+#     section missing) the helper falls back to the plan-doc path so
+#     air-gapped / fixture-driven tests stay green.
+#   • Skip on fix-round: `update_pr` calls pass `is_fix_round=True` so
+#     the helper short-circuits without touching the body. The original
+#     PR body's citation is preserved across fix-rounds; the builder is
+#     free to re-edit the body explicitly if they choose.
 _APEV_HEADING_RE = re.compile(
     r"(?im)^\s{0,3}#{2,3}\s*APE\s*[/\-_]?\s*V\b"
 )
@@ -486,6 +521,75 @@ def _build_apev_citation_block(
     )
 
 
+def _fetch_linear_acceptance_criteria(
+    ticket_code: Optional[str],
+) -> Optional[str]:
+    """Fetch the `## Acceptance criteria` section from a Linear ticket body.
+
+    SAL-2965: hawkman validates against the *Linear ticket body's*
+    acceptance section, not the plan doc's. The plan doc is builder-
+    authored and drifts (especially on fix-round respawns where the
+    builder pastes the fix-round directive into the section). Pulling
+    canonical text from Linear closes that drift surface.
+
+    Returns the trimmed section body, or ``None`` when:
+      - ``ticket_code`` is empty / unparseable,
+      - ``LINEAR_API_KEY`` (or ``ALFRED_OPS_LINEAR_API_KEY``) is unset,
+      - the Linear GraphQL request fails (HTTP / transport),
+      - the issue has no body or no `## Acceptance criteria` heading.
+
+    Callers fall back to the plan-doc path on ``None``.
+
+    Synchronous: ``_maybe_inject_apev_citation`` is called from inside
+    sync code paths in ``propose_pr`` / ``update_pr`` flows, and the
+    helper is best-effort (a Linear hiccup must not block PR creation).
+    """
+    if not ticket_code:
+        return None
+    key = os.environ.get("LINEAR_API_KEY") or os.environ.get(
+        "ALFRED_OPS_LINEAR_API_KEY"
+    )
+    if not key:
+        return None
+
+    # Linear's GraphQL `issue(id: ID!)` accepts the human identifier
+    # (e.g. "SAL-2965") — the field is named `id` but takes either UUID
+    # or identifier. Verified against the SAL-2965 / SAL-2611 tickets.
+    query = (
+        "query IssueBody($id: String!) { "
+        "issue(id: $id) { identifier description } }"
+    )
+    payload = json.dumps({
+        "query": query,
+        "variables": {"id": ticket_code},
+    }).encode()
+    req = urllib.request.Request(
+        LINEAR_GRAPHQL,
+        data=payload,
+        headers={
+            "Authorization": key,
+            "Content-Type": "application/json",
+            "User-Agent": "saluca-alfred/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read())
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return None
+    except Exception:
+        return None
+
+    issue = (body.get("data") or {}).get("issue") or {}
+    description = issue.get("description")
+    if not description or not isinstance(description, str):
+        return None
+    # Reuse the same regex the plan-doc path uses — Linear ticket bodies
+    # carry the same `## Acceptance criteria` heading convention.
+    return _extract_acceptance_lines(description)
+
+
 def _maybe_inject_apev_citation(
     body: Optional[str],
     *,
@@ -493,6 +597,8 @@ def _maybe_inject_apev_citation(
     branch: Optional[str] = None,
     title: Optional[str] = None,
     pr_url: Optional[str] = None,
+    is_fix_round: bool = False,
+    linear_fetcher: Optional[Callable[[Optional[str]], Optional[str]]] = None,
 ) -> str:
     """Return ``body`` with a citation block appended iff one is missing.
 
@@ -500,14 +606,34 @@ def _maybe_inject_apev_citation(
     the APE/V heading and burn a hawkman review cycle on a deterministic
     template gap. Idempotent — bodies that already cite are returned
     unchanged.
+
+    SAL-2965 changes:
+      * ``is_fix_round`` (default ``False``) short-circuits the helper
+        when the caller is ``update_pr``. Fix-round respawns must not
+        clobber the original PR body's citation with text re-extracted
+        from a possibly-drifted plan doc; the builder rewrites the body
+        explicitly when needed.
+      * Acceptance criteria are now sourced from the Linear ticket body
+        first (canonical, what hawkman validates against), with a fall
+        back to the plan-doc extraction when Linear is unreachable.
+      * ``linear_fetcher`` is a test-injection seam — production callers
+        leave it ``None`` to use the network-bound default.
     """
+    if is_fix_round:
+        # Fix-round skip: preserve whatever the original propose_pr body
+        # contained. The builder owns the body on every update_pr call.
+        return body or ""
     if _apev_body_has_citation(body):
         return body or ""
     ticket_code = _extract_ticket_code(branch, title, pr_url, body)
     plan_path, plan_content = _find_plan_doc_in_files(
         files or {}, ticket_code=ticket_code
     )
-    acceptance = _extract_acceptance_lines(plan_content)
+    # Source order: Linear ticket body (canonical) → plan-doc fallback.
+    fetcher = linear_fetcher or _fetch_linear_acceptance_criteria
+    acceptance = fetcher(ticket_code)
+    if not acceptance:
+        acceptance = _extract_acceptance_lines(plan_content)
     block = _build_apev_citation_block(
         plan_doc_path=plan_path,
         acceptance_lines=acceptance,
@@ -931,26 +1057,19 @@ async def update_pr(
 
     # ── Step 4: optional PR title / body update.
     if title is not None or body is not None:
-        # SAL-2953: same auto-inject as propose_pr. update_pr fires on the
-        # fix-round respawn after a hawkman REQUEST_CHANGES — the same
-        # builder is rewriting files including the `plans/v1-ga/<TICKET>.md`
-        # plan doc, and may again forget the citation heading. Inject only
-        # when the caller actually replaces the body (body is not None);
-        # passing body=None means "keep existing", which we must not touch.
+        # SAL-2953/SAL-2965: on fix-round respawn we deliberately skip the
+        # auto-inject. The original propose_pr already wrote a citation
+        # block (either builder-authored or auto-injected from Linear);
+        # re-running the inject here would re-extract from a possibly
+        # drifted plan doc and clobber a previously-good citation with
+        # the fix-round directive. The builder owns the body on update_pr.
         if body is not None:
-            files_for_inject: Dict[str, str] = {
-                str(entry["path"]): str(entry["content"])
-                for entry in (files or [])
-                if isinstance(entry, dict)
-                and "path" in entry
-                and "content" in entry
-            }
             body = _maybe_inject_apev_citation(
                 body,
-                files=files_for_inject,
                 branch=branch,
                 title=title,
                 pr_url=pr_url,
+                is_fix_round=True,
             )
 
         patch_payload: Dict[str, Any] = {}
