@@ -35,6 +35,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional
 
+# SAL-2905: per-persona GitHub identity routing. ``token_for_persona``
+# replaces direct ``os.environ.get("GITHUB_TOKEN")`` reads inside the
+# GitHub-touching tool handlers; ``GitHubIdentityClass`` exposes the
+# class tags for fallback decisions.
+from .persona_github import (
+    GitHubIdentityClass,
+    get_current_persona,
+    token_for_persona,
+)
+
 
 # Current-task context for tool handlers. main.py sets this around
 # call_with_tools so handlers that need task scoping (e.g. propose_pr
@@ -55,6 +65,75 @@ def set_current_task_id(task_id: Optional[str]):
 
 def reset_current_task_id(token) -> None:
     _current_task_id.reset(token)
+
+
+def _github_token_for(
+    intended_class: str,
+    *,
+    persona_override: Optional[str] = None,
+) -> tuple[str, str]:
+    """Internal helper: resolve a token for a tool's intended identity class.
+
+    Each tool knows the class it *should* run as (builder writes PRs,
+    QA submits reviews, orchestrator merges). The tool's intended
+    class is authoritative for token routing — that's the whole point
+    of split-identity: pr_review must always use the QA token, even
+    when (e.g.) a builder-persona ContextVar happens to be active.
+
+    Resolution rules:
+      1. Try ``GITHUB_TOKEN_<CLASS>`` for the intended class. If set,
+         return it tagged as that class.
+      2. ORCHESTRATOR-class only: fall back to ``GITHUB_TOKEN_QA`` if
+         set (semantic: "QA approves → QA merges" when no dedicated
+         orchestrator bot exists).
+      3. Fall through to legacy ``GITHUB_TOKEN`` (single-token mode).
+      4. Nothing configured → return ``("", "unknown")`` so the
+         caller's existing missing-token error fires.
+
+    The ``persona_override`` argument is reserved for future use by
+    callers that want to explicitly opt out of intended-class routing
+    (e.g. a builder-driven http_get on a github.com URL where the
+    persona's identity is the audit-relevant one). When non-None and
+    the persona resolves to a different class than ``intended_class``,
+    the persona wins. Default behaviour (intended-class authoritative)
+    matches the design doc §4.4.
+    """
+    # The current persona context is captured for diagnostics only —
+    # the intended class drives token resolution.
+    active_persona = (
+        persona_override
+        if persona_override is not None
+        else get_current_persona()
+    )
+    _ = active_persona  # diagnostic only; future log-line hook
+
+    # Direct class → env-var lookup. Mirrors persona_github._TOKEN_ENV_VARS
+    # without having to import the private dict.
+    class_env_vars = {
+        GitHubIdentityClass.BUILDER: "GITHUB_TOKEN_BUILDER",
+        GitHubIdentityClass.QA: "GITHUB_TOKEN_QA",
+        GitHubIdentityClass.ORCHESTRATOR: "GITHUB_TOKEN_ORCHESTRATOR",
+    }
+    env_var = class_env_vars.get(intended_class)
+    if env_var:
+        token = os.environ.get(env_var, "").strip()
+        if token:
+            return token, intended_class
+
+    # ORCHESTRATOR fallback to QA — see design doc §4.4.
+    if intended_class == GitHubIdentityClass.ORCHESTRATOR:
+        qa_token = os.environ.get(
+            class_env_vars[GitHubIdentityClass.QA], ""
+        ).strip()
+        if qa_token:
+            return qa_token, GitHubIdentityClass.QA
+
+    # Legacy single-token catch-all.
+    legacy = os.environ.get("GITHUB_TOKEN", "").strip()
+    if legacy:
+        return legacy, GitHubIdentityClass.UNKNOWN
+
+    return "", GitHubIdentityClass.UNKNOWN
 
 
 logger = logging.getLogger("alfred_coo.tools")
@@ -313,7 +392,9 @@ async def propose_pr(
     rejected. If any step fails the PR is not opened and the error surfaces
     in the return dict.
     """
-    token = os.environ.get("GITHUB_TOKEN")
+    # SAL-2905: builder identity. Falls back to legacy GITHUB_TOKEN in
+    # single-token deployments (identical behaviour to pre-2905).
+    token, _id_class = _github_token_for(GitHubIdentityClass.BUILDER)
     if not token:
         return {"error": "GITHUB_TOKEN not configured"}
     if owner not in _ALLOWED_ORGS:
@@ -467,7 +548,11 @@ async def update_pr(
     Returns ``{"pushed_sha", "pr_url", "commit_url", "branch", "pr_number",
     "files_written", "commit_message"}``.
     """
-    token = os.environ.get("GITHUB_TOKEN")
+    # SAL-2905: builder identity. update_pr is a fix-round on an
+    # already-open PR; the push must come from the same identity that
+    # opened the PR or hawkman's re-review will see a different commit
+    # author than PR author.
+    token, _id_class = _github_token_for(GitHubIdentityClass.BUILDER)
     if not token:
         return {"error": "GITHUB_TOKEN not configured"}
 
@@ -718,7 +803,10 @@ async def pr_review(
     {"path", "line", "body"} dicts (GitHub review-comment schema). Returns
     {review_id, state, submitted_at, html_url} on success.
     """
-    token = os.environ.get("GITHUB_TOKEN")
+    # SAL-2905: QA identity. With GITHUB_TOKEN_QA set, GitHub's
+    # /reviews endpoint stops 422-ing on builder-authored PRs and
+    # the self-authored fallback in _post_pr_comment never fires.
+    token, _id_class = _github_token_for(GitHubIdentityClass.QA)
     if not token:
         return {"error": "GITHUB_TOKEN not configured"}
     if owner not in _ALLOWED_ORGS:
@@ -768,9 +856,10 @@ async def pr_review(
     except urllib.error.HTTPError as e:
         err_body = e.read().decode(errors="replace")[:800]
         # GitHub 422 on self-authored PRs: fall back to posting the review as a
-        # PR comment so the analysis still lands in a visible place. This is
-        # the current reality because builder and reviewer run under the same
-        # GITHUB_TOKEN identity; split-identity is a separate infra change.
+        # PR comment so the analysis still lands in a visible place. SAL-2905
+        # adds split-identity routing (this handler now uses GITHUB_TOKEN_QA
+        # when set), so this fallback only fires in legacy single-token
+        # deployments. The fallback is retained for backwards compat.
         if e.code == 422 and "own pull request" in err_body.lower():
             comment_result = await _post_pr_comment(
                 owner, repo, pr_num, token,
@@ -891,7 +980,10 @@ async def pr_files_get(
     repos in the allowlisted orgs. Single tool call replaces ~10+ http_get
     calls a QA persona would otherwise need to walk a PR.
     """
-    token = os.environ.get("GITHUB_TOKEN")
+    # SAL-2905: QA identity. Read-only, but keeping the audit trail
+    # cohesive ("hawkman fetched these files" not "the daemon"
+    # account fetched).
+    token, _id_class = _github_token_for(GitHubIdentityClass.QA)
     if not token:
         return {"error": "GITHUB_TOKEN not set"}
     if owner not in _ALLOWED_ORGS:
@@ -1034,7 +1126,11 @@ async def github_merge_pr(
     error dict on 405 (not mergeable), 409 (stale head), 422 (unprocessable),
     or other failure.
     """
-    token = os.environ.get("GITHUB_TOKEN")
+    # SAL-2905: orchestrator identity. Falls back to QA token if
+    # GITHUB_TOKEN_ORCHESTRATOR is unset (semantic: "QA approved →
+    # QA merges"); falls back to legacy GITHUB_TOKEN if neither is
+    # set.
+    token, _id_class = _github_token_for(GitHubIdentityClass.ORCHESTRATOR)
     if not token:
         return {"error": "missing GITHUB_TOKEN"}
     if owner not in _ALLOWED_ORGS:
@@ -1218,7 +1314,14 @@ async def http_get(url: str) -> Dict[str, Any]:
         "Accept": "text/*, application/json;q=0.9, */*;q=0.1",
     }
     if _github_authed_url(url):
-        token = os.environ.get("GITHUB_TOKEN")
+        # SAL-2905: route by current persona — builder personas read
+        # repos for grounding, QA personas read external spec docs.
+        # Falls back to legacy GITHUB_TOKEN if no per-persona token
+        # is set or no persona is active.
+        token, _id_class = token_for_persona(get_current_persona())
+        if not token:
+            # Final legacy fallback for ad-hoc / un-personaed callers.
+            token = os.environ.get("GITHUB_TOKEN", "").strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
             headers["Accept"] = "application/vnd.github+json, text/*, */*;q=0.1"

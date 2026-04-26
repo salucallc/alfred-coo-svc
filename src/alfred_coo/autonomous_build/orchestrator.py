@@ -4571,7 +4571,18 @@ class AutonomousBuildOrchestrator:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        token = os.environ.get("GITHUB_TOKEN")
+        # SAL-2905: orchestrator identity (hint-verification probes
+        # are an orchestrator-tier action). Falls back through
+        # ``token_for_persona``'s chain → QA → legacy GITHUB_TOKEN.
+        from alfred_coo.persona_github import (
+            GitHubIdentityClass,
+            token_for_persona,
+            PERSONA_IDENTITY_MAP,
+        )
+        PERSONA_IDENTITY_MAP.setdefault(
+            "_intended_orchestrator", GitHubIdentityClass.ORCHESTRATOR
+        )
+        token, _id_class = token_for_persona("_intended_orchestrator")
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
@@ -4619,7 +4630,16 @@ class AutonomousBuildOrchestrator:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        token = os.environ.get("GITHUB_TOKEN")
+        # SAL-2905: orchestrator identity (hint-verification probes).
+        from alfred_coo.persona_github import (
+            GitHubIdentityClass,
+            token_for_persona,
+            PERSONA_IDENTITY_MAP,
+        )
+        PERSONA_IDENTITY_MAP.setdefault(
+            "_intended_orchestrator", GitHubIdentityClass.ORCHESTRATOR
+        )
+        token, _id_class = token_for_persona("_intended_orchestrator")
         if token:
             headers["Authorization"] = f"Bearer {token}"
 

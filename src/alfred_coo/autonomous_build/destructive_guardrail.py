@@ -134,8 +134,9 @@ def _fetch_original_file_loc(
     transport / decoding error occurs (caller treats unknown as
     "use absolute cap only" per SAL-2869 first-trip semantics).
 
-    base_repo must be "<owner>/<repo>". Uses GITHUB_TOKEN when set so
-    private repos work; unauthenticated calls hit the 60 req/h
+    base_repo must be "<owner>/<repo>". Uses the orchestrator-class
+    GitHub token when set (SAL-2905) so private repos work; falls
+    back to legacy GITHUB_TOKEN; unauthenticated calls hit the 60 req/h
     public-IP rate limit.
     """
     if not base_repo or not file_path:
@@ -149,7 +150,17 @@ def _fetch_original_file_loc(
         "User-Agent": "alfred-coo-svc/destructive_guardrail",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    token = os.environ.get("GITHUB_TOKEN")
+    # SAL-2905: orchestrator-class probe (pre-merge LOC verification).
+    from alfred_coo.persona_github import (
+        GitHubIdentityClass,
+        token_for_persona,
+        identity_class_for_persona,
+        PERSONA_IDENTITY_MAP,
+    )
+    PERSONA_IDENTITY_MAP.setdefault(
+        "_intended_orchestrator", GitHubIdentityClass.ORCHESTRATOR
+    )
+    token, _id_class = token_for_persona("_intended_orchestrator")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
