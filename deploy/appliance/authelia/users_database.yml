@@ -1,0 +1,13 @@
+# Users database for Authelia file backend
+# Simple admin user for initial setup. Password hashed with argon2id.
+
+users:
+  admin:
+    password: "$argon2id$v=19$m=65536,t=3,p=2$gZG9wH6VwVJrFqf8vJLEzg$6cVqzV0t2SJpYuqbMArQvYB2NZ4dQfPiOcE5eOv7fZc"
+    displayname: "Administrator"
+    email: "admin@example.com"
+    groups:
+      - admin
+      - appliance-admin
+
+# Note: password is placeholder; replace with secure hash after deployment.
