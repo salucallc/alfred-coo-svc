@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  alfred-coo-svc:
+    image: salucallc/alfred-coo-svc:latest
+    env_file:
+      - .env.template
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
