@@ -9,6 +9,7 @@ task after deployment.
 import asyncio
 import json
 import os
+import re
 
 import pytest
 
@@ -1353,3 +1354,379 @@ def test_build_apev_block_canonical_shape():
     assert "- Verification: CLI test green." in block
     assert "- Acceptance criteria:" in block
     assert "```\nOne-shot token printed; DB row created.\n```" in block
+
+
+# ── SAL-2965: fenced-format regression, Linear source, fix-round skip ───────
+#
+# v7z observed two distinct mismatches between the SAL-2953 auto-inject
+# and hawkman's gate-1 expectations:
+#   1. Source: plan doc is builder-authored and drifts on fix-rounds
+#      (PR #37 SAL-2613: 5 cycles where the fix-round directive was
+#      extracted as acceptance criteria). Linear ticket body is
+#      canonical and what hawkman validates against.
+#   2. Fix-round: update_pr re-running the auto-inject overwrote the
+#      original (clean) PR body with text re-extracted from a drifted
+#      plan doc.
+# The SAL-2965 fix:
+#   - Linear ticket body is the primary source; plan doc is fallback.
+#   - update_pr passes is_fix_round=True; the helper short-circuits.
+#   - Format remains the canonical fenced acceptance block (matches
+#     PR #38 SAL-2665 and PR #35 SAL-2610 hawkman-APPROVED exemplars).
+
+
+def test_builder_pr_body_apev_uses_fenced_acceptance():
+    """Regression: SAL-2965 ticket reported "bullets vs fenced". The
+    auto-inject MUST emit the acceptance criteria inside a triple-
+    backtick fenced block (verbatim), matching the PR #38 SAL-2665 and
+    PR #35 SAL-2610 hawkman-APPROVED exemplars. Hawkman gate-1 grep-
+    matches on the fenced block, not on a bare bullet line.
+    """
+    builder_body = "Patch text only; no citation.\n"
+    files = {"plans/v1-ga/SAL-2965.md": _SAMPLE_PLAN_DOC}
+    out = _maybe_inject_apev_citation(
+        builder_body,
+        files=files,
+        branch="fix/SAL-2965-x",
+        # Force the plan-doc fallback (no Linear) for this test by
+        # passing a fetcher that returns None.
+        linear_fetcher=lambda code: None,
+    )
+    # Must contain a triple-backtick fenced block enclosing the verbatim
+    # acceptance lines from the plan doc.
+    fence_re = re.compile(
+        r"```\n[\s\S]*?Idempotent: existing citations are not duplicated\."
+        r"[\s\S]*?\n```"
+    )
+    assert fence_re.search(out), (
+        f"acceptance criteria must be in a fenced code block, got: {out!r}"
+    )
+    # Sanity-check the fence open / close are balanced (hawkman parser
+    # would reject a stray opening fence with no close): there must be
+    # an even number of triple-backtick markers.
+    assert out.count("```") % 2 == 0, (
+        f"unbalanced fence markers in body: {out!r}"
+    )
+    # The fenced block must directly follow the `- Acceptance criteria:`
+    # bullet (the canonical PR #38 / PR #35 shape: bullet line, then
+    # opening fence on the next non-empty line).
+    canonical_shape_re = re.compile(
+        r"-\s+Acceptance criteria:\s*\n```\n", re.MULTILINE
+    )
+    assert canonical_shape_re.search(out), (
+        f"expected `- Acceptance criteria:` bullet immediately followed "
+        f"by an opening fence, got: {out!r}"
+    )
+
+
+def test_builder_pr_body_apev_extracts_from_linear_not_plan_doc():
+    """SAL-2965 source change: when Linear has the canonical ticket body
+    and the plan doc has drifted, the auto-injected block MUST quote the
+    Linear text, not the plan-doc text. This is the bug hawkman caught
+    on soul-svc#37 SAL-2613 (auto-inject shipped the fix-round directive
+    as acceptance criteria, since the plan doc had been overwritten).
+    """
+    plan_doc_drifted = (
+        "# SAL-2613: drifted plan doc\n\n"
+        "## Acceptance criteria\n"
+        "- [ ] Address every point in the review feedback below.\n"
+        "- [ ] Push fixes to the EXISTING branch via update_pr.\n\n"
+        "## Verification approach\n"
+        "Re-run review.\n"
+    )
+    canonical_linear_body = (
+        "ack p95 <500ms local; 3 missed -> mode_state=degraded; "
+        "visible in /v1/fleet/endpoints/{id}"
+    )
+
+    files = {"plans/v1-ga/SAL-2613.md": plan_doc_drifted}
+    out = _maybe_inject_apev_citation(
+        "no citation here",
+        files=files,
+        branch="feature/sal-2613-heartbeat",
+        # Inject a fake Linear fetcher returning the canonical body.
+        linear_fetcher=lambda code: (
+            canonical_linear_body if code == "SAL-2613" else None
+        ),
+    )
+    # The Linear (canonical) text must appear in the fenced block.
+    assert "ack p95 <500ms local" in out
+    assert "mode_state=degraded" in out
+    # The drifted plan-doc text must NOT appear (would indicate the
+    # helper preferred the wrong source).
+    assert "Address every point in the review feedback" not in out
+    assert "Push fixes to the EXISTING branch" not in out
+
+
+def test_apev_falls_back_to_plan_doc_when_linear_unavailable():
+    """When the Linear fetcher returns None (no API key, transport
+    error, ticket missing) the helper must fall back to the plan-doc
+    extraction so air-gapped tests + offline fixtures still get a
+    deterministic citation block."""
+    files = {"plans/v1-ga/SAL-2953.md": _SAMPLE_PLAN_DOC}
+    out = _maybe_inject_apev_citation(
+        "Patch only.\n",
+        files=files,
+        branch="fix/sal-2953-x",
+        linear_fetcher=lambda code: None,  # Linear unreachable.
+    )
+    # Plan-doc acceptance line lands in the citation.
+    assert "Idempotent: existing citations are not duplicated." in out
+    assert "## APE/V Citation" in out
+
+
+def test_update_pr_skips_apev_auto_inject():
+    """SAL-2965 fix-round skip: update_pr passes is_fix_round=True so
+    the helper returns the body unchanged regardless of whether a
+    citation is present, regardless of plan-doc presence in files,
+    regardless of the Linear fetch outcome. This preserves the
+    original PR body's citation across fix-rounds and prevents the
+    helper from clobbering it with text re-extracted from a drifted
+    plan doc.
+    """
+    body_without_citation = "Body with no APE/V section at all.\n"
+    files = {"plans/v1-ga/SAL-2613.md": _SAMPLE_PLAN_DOC}
+
+    # Sentinel: even with a fetcher that WOULD return acceptance
+    # criteria, fix-round skip means body is returned unchanged.
+    def fetcher_would_return(code):
+        return "this would be injected"
+
+    out = _maybe_inject_apev_citation(
+        body_without_citation,
+        files=files,
+        branch="feature/sal-2613-x",
+        is_fix_round=True,
+        linear_fetcher=fetcher_would_return,
+    )
+    assert out == body_without_citation
+    assert "## APE/V Citation" not in out
+    assert "this would be injected" not in out
+
+    # And: a body that ALREADY has a citation also passes through
+    # unchanged (which would be true even without the skip, but the
+    # contract holds).
+    body_with_citation = (
+        "Original.\n\n## APE/V Citation\n"
+        "- Plan doc path: `plans/v1-ga/SAL-2613.md`\n"
+        "- Verification: original verification\n"
+        "- Acceptance criteria:\n```\noriginal acceptance\n```\n"
+    )
+    out2 = _maybe_inject_apev_citation(
+        body_with_citation,
+        is_fix_round=True,
+        linear_fetcher=fetcher_would_return,
+    )
+    assert out2 == body_with_citation
+
+
+def test_update_pr_skips_apev_with_empty_body():
+    """Edge: fix-round with empty body returns empty string (no inject,
+    no crash). The fix-round contract is "do not touch the body";
+    nothing-to-touch is still nothing-to-touch."""
+    out = _maybe_inject_apev_citation(
+        "",
+        is_fix_round=True,
+        linear_fetcher=lambda code: "would-be-acceptance",
+    )
+    assert out == ""
+
+
+def test_fetch_linear_acceptance_criteria_no_key(monkeypatch):
+    """Without LINEAR_API_KEY the production fetcher must return None
+    cleanly so the caller falls back to plan-doc extraction."""
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("ALFRED_OPS_LINEAR_API_KEY", raising=False)
+    from alfred_coo.tools import _fetch_linear_acceptance_criteria
+    assert _fetch_linear_acceptance_criteria("SAL-2965") is None
+    assert _fetch_linear_acceptance_criteria(None) is None
+    assert _fetch_linear_acceptance_criteria("") is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# SAL-2965 (post-evidence-2026-04-26): hawkman gate-1 verbatim contract.
+#
+# PR #103 (SAL-2601) shipped the *correct format* (## APE/V Citation +
+# fenced block) but still got REQUEST_CHANGES because the citation
+# *paraphrased* the Linear ticket body — semicolons → periods, tuples
+# rewritten with backticks, "and green" dropped. Hawkman does a byte-
+# verbatim substring match against the Linear ticket body, so any
+# normalisation drifts the citation off-source and breaks the gate.
+#
+# These tests pin the helper to a no-rewrite contract.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_acceptance_handles_apev_machinecheckable_heading():
+    """Mission Control v1 GA tickets use ``## APE/V Acceptance (machine-
+    checkable)`` (verified on SAL-2601, SAL-2613). The extractor must
+    match this heading variant and return the body byte-verbatim — not
+    the plan-doc-only ``## Acceptance criteria`` variant the SAL-2953
+    extractor was built for.
+    """
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    sal2601_linear_description = (
+        "**Epic:** B. Aletheia Daemon\n"
+        "**Plan doc:** file:///Z:/_planning/v1-ga/B_aletheia_daemon.md\n"
+        "**Ticket code:** SAL-ALT-04\n"
+        "**Wave:** 1\n\n"
+        "## APE/V Acceptance (machine-checkable)\n\n"
+        "Given 12 (action_class, risk_tier) rows, router returns expected "
+        "model_id; refuses when generator_model == candidate_verifier_model; "
+        "unit tests committed and green\n\n"
+        "## Effort\n\n"
+        "S (estimate = 1 pts)\n"
+    )
+    out = _extract_acceptance_lines(sal2601_linear_description)
+    assert out is not None, "must match `## APE/V Acceptance (machine-checkable)`"
+    # Byte-for-byte preservation of the Linear body — semicolons stay
+    # semicolons, tuples stay un-quoted, "and green" is preserved. The
+    # trailing newline is trimmed (outer whitespace only).
+    expected = (
+        "Given 12 (action_class, risk_tier) rows, router returns expected "
+        "model_id; refuses when generator_model == candidate_verifier_model; "
+        "unit tests committed and green"
+    )
+    assert out == expected, (
+        f"extracted text drifted from Linear source.\n"
+        f"  expected: {expected!r}\n"
+        f"  got:      {out!r}"
+    )
+
+
+def test_extract_acceptance_handles_apev_acceptance_no_parens():
+    """Variant without the parenthetical: ``## APE/V Acceptance``."""
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    src = (
+        "## APE/V Acceptance\n"
+        "Given X; refuses when Y; unit tests green\n\n"
+        "## Effort\nS\n"
+    )
+    out = _extract_acceptance_lines(src)
+    assert out == "Given X; refuses when Y; unit tests green"
+
+
+def test_extract_acceptance_handles_legacy_acceptance_criteria():
+    """Plan-doc / legacy ticket variant: ``## Acceptance criteria``."""
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    src = (
+        "## Acceptance criteria\n"
+        "- foo; bar; baz (with semicolons preserved)\n"
+        "- (tuple, like, this) preserved as-is\n\n"
+        "## Verification\n"
+    )
+    out = _extract_acceptance_lines(src)
+    expected = (
+        "- foo; bar; baz (with semicolons preserved)\n"
+        "- (tuple, like, this) preserved as-is"
+    )
+    assert out == expected
+
+
+def test_extract_acceptance_preserves_semicolons_byte_verbatim():
+    """Hawkman regression: PR #103 paraphrased semicolons to periods.
+    The helper MUST NOT do that. Bytes in must equal bytes out (modulo
+    outer whitespace trim only).
+    """
+    from alfred_coo.tools import _extract_acceptance_lines
+
+    src = (
+        "## APE/V Acceptance (machine-checkable)\n"
+        "Foo; bar; baz\n"
+        "## Next\n"
+    )
+    out = _extract_acceptance_lines(src)
+    # Must NOT be rewritten to "Foo. Bar. Baz."
+    assert out == "Foo; bar; baz"
+    assert "." not in out, (
+        "semicolons must not be rewritten to periods (PR #103 drift bug)"
+    )
+
+
+def test_apev_inject_quotes_linear_body_byte_verbatim():
+    """End-to-end: when Linear returns the canonical ticket body, the
+    auto-injected fenced block must contain that body byte-for-byte.
+    Reproduces the PR #103 (SAL-2601) failure: the Linear text
+    ``"... refuses when generator_model == candidate_verifier_model; unit
+    tests committed and green"`` must land in the citation block exactly
+    — no semicolon-to-period rewriting, no backtick wrapping of the
+    ``(action_class, risk_tier)`` tuple, no dropping ``"and green"``.
+    """
+    canonical_linear_body = (
+        "Given 12 (action_class, risk_tier) rows, router returns expected "
+        "model_id; refuses when generator_model == candidate_verifier_model; "
+        "unit tests committed and green"
+    )
+    out = _maybe_inject_apev_citation(
+        "PR body without citation.\n",
+        files={},
+        branch="feature/sal-2601-router",
+        linear_fetcher=lambda code: (
+            canonical_linear_body if code == "SAL-2601" else None
+        ),
+    )
+    # The exact Linear body string MUST appear unchanged in the output.
+    assert canonical_linear_body in out, (
+        f"verbatim Linear body missing from injected block.\n"
+        f"  expected substring: {canonical_linear_body!r}\n"
+        f"  actual body: {out!r}"
+    )
+    # Negative: none of the PR #103 paraphrase artefacts may appear.
+    forbidden_paraphrases = [
+        # PR #103 split semicolons into separate sentences with periods.
+        "router returns expected model_id.",
+        "Refuses when generator_model",
+        # PR #103 wrapped the tuple in backticks.
+        "`(action_class, risk_tier)`",
+        # PR #103 dropped "and green".
+        "unit tests committed.",
+    ]
+    for bad in forbidden_paraphrases:
+        assert bad not in out, (
+            f"injected body contains paraphrase artefact {bad!r} — "
+            f"hawkman gate-1 will REQUEST_CHANGES.\n  body: {out!r}"
+        )
+
+
+def test_apev_inject_preserves_linear_body_with_special_chars():
+    """Linear bodies in MC v1 GA tickets contain ``==``, ``<``, tuples,
+    and multi-clause semicolon lists. None of these may be normalised.
+    """
+    src_body = (
+        "ack p95 <500ms local; 3 missed -> mode_state=degraded; "
+        "visible in /v1/fleet/endpoints/{id}"
+    )
+    out = _maybe_inject_apev_citation(
+        "no citation",
+        files={},
+        branch="feature/sal-2613-heartbeat",
+        linear_fetcher=lambda code: src_body,
+    )
+    assert src_body in out, (
+        f"special-char body must be preserved verbatim.\n"
+        f"  expected: {src_body!r}\n"
+        f"  got body: {out!r}"
+    )
+
+
+def test_apev_inject_does_not_strip_paths_or_tuples():
+    """Defensive: a body containing slashes, parens, asterisks, and
+    backticks must round-trip unchanged through the helper.
+    """
+    src = (
+        "Given inputs (a, b, c); calls /v1/foo/{id}; returns {\"ok\": true}; "
+        "asserts `state == \"degraded\"` and emits *audit log* entry"
+    )
+    out = _maybe_inject_apev_citation(
+        "x",
+        files={},
+        branch="feature/sal-9999-z",
+        linear_fetcher=lambda code: src,
+    )
+    assert src in out, (
+        f"complex body lost characters in transit.\n"
+        f"  expected: {src!r}\n"
+        f"  got:      {out!r}"
+    )
