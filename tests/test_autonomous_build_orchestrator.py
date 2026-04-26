@@ -822,6 +822,202 @@ async def test_poll_children_marks_failed_when_no_pr_url(monkeypatch):
     )
 
 
+# ── SAL-2978 · silent-complete envelope rejection ─────────────────────────
+
+
+@pytest.mark.parametrize("envelope,expected,case", [
+    # Truncated tool-loop envelope (dominant Mode A shape from v7aa).
+    (
+        {"content": "[tool-use loop exceeded max iterations]",
+         "truncated": True, "tool_calls": [], "iterations": 12},
+        True, "truncated_envelope",
+    ),
+    # Empty summary, no follow-up, no artifacts.
+    ({"summary": "", "follow_up_tasks": [], "tool_calls": []}, True, "empty_summary"),
+    # Whitespace-only summary.
+    ({"summary": "   \n  \t ", "tool_calls": []}, True, "whitespace_summary"),
+    # Missing / non-dict results — worst silent case.
+    (None, True, "none_result"),
+    ("oops", True, "string_result"),
+    ([], True, "list_result"),
+    # Valid envelope: real summary content.
+    (
+        {"summary": "Opened PR https://github.com/foo/bar/pull/1.",
+         "follow_up_tasks": [], "tool_calls": []},
+        False, "valid_envelope",
+    ),
+    # Empty summary but populated follow-up list: still actionable.
+    (
+        {"summary": "",
+         "follow_up_tasks": ["queue SAL-9999 to retry with bigger context"]},
+        False, "empty_summary_with_followup",
+    ),
+    # Empty summary but populated artifacts: still actionable.
+    (
+        {"summary": "", "artifacts": [{"path": "x.md", "content": "..."}]},
+        False, "empty_summary_with_artifacts",
+    ),
+])
+def test_envelope_is_silent_complete_classification(envelope, expected, case):
+    """SAL-2978: shape classifier covers truncated, empty-summary, non-dict
+    silent shapes; rejects valid envelopes + empty-summary-with-followup
+    + empty-summary-with-artifacts as actionable.
+    """
+    from alfred_coo.autonomous_build.orchestrator import (
+        AutonomousBuildOrchestrator,
+    )
+    assert (
+        AutonomousBuildOrchestrator._envelope_is_silent_complete(envelope)
+        is expected
+    ), f"case={case}"
+
+
+async def test_envelope_validator_rejects_silent_complete(monkeypatch, caplog):
+    """SAL-2978 acceptance criterion: a silent-complete envelope routes
+    the ticket to FAILED with a clear error log + `silent_complete`
+    failure reason on the recorded event. This is the defense-in-depth
+    backstop for the iteration-cap fix in main.py.
+    """
+    import logging as _logging
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u1", "SAL-2588", "TIR-06", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-silent-1"
+    t.retry_budget = 0  # pin terminal-FAILED behaviour for the assertion
+    _seed_graph(orch, [t])
+
+    linear_calls = []
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Simulate the truncated tool-loop envelope from `_tool_loop` (the
+    # MAX_TOOL_ITERATIONS partial). No summary, truncated=True, no PR.
+    mesh.completed_tasks.append({
+        "id": "child-silent-1",
+        "title": (
+            "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-2588 TIR-06 "
+            "— fix: round 1 (...)"
+        ),
+        "status": "completed",
+        "result": {
+            "content": "[tool-use loop exceeded max iterations; partial]",
+            "truncated": True,
+            "tool_calls": [],
+            "iterations": 12,
+        },
+    })
+
+    with caplog.at_level(
+        _logging.ERROR,
+        logger="alfred_coo.autonomous_build.orchestrator",
+    ):
+        await orch._poll_children()
+
+    assert t.status == TicketStatus.FAILED, (
+        f"expected FAILED for silent-complete envelope, got {t.status}"
+    )
+    assert ("SAL-2588", "Backlog") in linear_calls, (
+        f"expected Linear rollback to Backlog, got: {linear_calls}"
+    )
+    # The ticket_failed event must carry the explicit `silent_complete`
+    # reason so wave-gate math + ops triage can disambiguate from a
+    # generic no-PR fail.
+    silent_events = [
+        ev for ev in orch.state.events
+        if ev.get("kind") == "ticket_failed"
+        and ev.get("reason") == "silent_complete"
+    ]
+    assert silent_events, (
+        f"expected a ticket_failed event with reason=silent_complete; "
+        f"got events: "
+        f"{[ev for ev in orch.state.events if ev.get('kind') == 'ticket_failed']}"
+    )
+    # And a clear ERROR log line was emitted so ops can grep on SAL-2978.
+    sal_logs = [
+        r for r in caplog.records
+        if r.levelno == _logging.ERROR and "SAL-2978" in r.message
+    ]
+    assert sal_logs, (
+        f"expected a SAL-2978 ERROR log line; got: "
+        f"{[r.message for r in caplog.records]}"
+    )
+
+
+async def test_envelope_validator_accepts_valid_envelope(monkeypatch):
+    """SAL-2978 acceptance criterion (regression): a valid envelope with
+    a real PR URL and summary follows the happy path → PR_OPEN → REVIEWING,
+    NOT FAILED. Don't break the happy path with the new validator.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p",
+            "budget": {"max_usd": 30},
+            "wave_order": [0],
+            "on_all_green": [],
+        },
+        mesh=mesh,
+    )
+
+    t = _t("u1", "SAL-1", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-happy-1"
+    _seed_graph(orch, [t])
+
+    # Stub out review dispatch so we don't need to mock the full review path.
+    async def _fake_review(ticket):
+        ticket.review_task_id = "review-1"
+    monkeypatch.setattr(orch, "_dispatch_review", _fake_review)
+
+    async def _fake_update(ticket, state_name):
+        pass
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    mesh.completed_tasks.append({
+        "id": "child-happy-1",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-1 TIR-01 ...",
+        "status": "completed",
+        "result": {
+            "summary": (
+                "Opened PR https://github.com/salucallc/alfred-coo-svc/pull/123 "
+                "with the new TIR-01 module."
+            ),
+            "follow_up_tasks": [],
+            "tool_calls": [],
+        },
+    })
+
+    await orch._poll_children()
+
+    # Valid envelope → REVIEWING (PR_OPEN → REVIEWING transition fires
+    # immediately because `_dispatch_review` is stubbed).
+    assert t.status == TicketStatus.REVIEWING, (
+        f"expected REVIEWING for valid envelope, got {t.status}"
+    )
+    assert t.pr_url == "https://github.com/salucallc/alfred-coo-svc/pull/123"
+    # No silent_complete event recorded.
+    silent_events = [
+        ev for ev in orch.state.events
+        if ev.get("kind") == "ticket_failed"
+        and ev.get("reason") == "silent_complete"
+    ]
+    assert not silent_events, (
+        f"happy path falsely flagged silent_complete: {silent_events}"
+    )
+
+
 # ── AB-17-x · phantom-child reconciliation (post-v7k 2026-04-25) ────────────
 #
 # Reproduces the silent-stuck scenario observed twice on 2026-04-25:

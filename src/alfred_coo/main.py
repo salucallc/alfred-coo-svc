@@ -25,7 +25,11 @@ from . import config, log, dispatch, health
 from .mesh import MeshClient, parse_persona_tag
 from .soul import SoulClient
 from .persona import Persona, get_persona
-from .dispatch import Dispatcher, DispatchContext, iteration_cap_for_size
+from .dispatch import (
+    Dispatcher,
+    DispatchContext,
+    iteration_cap_for_dispatch,
+)
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
 from .tools import resolve_tools, set_current_task_id, reset_current_task_id
@@ -69,6 +73,40 @@ _SIZE_LABEL_RE = re.compile(
 # inflate cost on noisy reviewer misfires.
 _BUILDER_PERSONAS = frozenset({"alfred-coo-a", "autonomous-build-a"})
 
+# SAL-2978 (2026-04-25): fix-round dispatch detector.
+#
+# The autonomous-build orchestrator's `_respawn_for_fix_round` (in
+# `autonomous_build/orchestrator.py`) renders the respawn task title as:
+#
+#     "[persona:alfred-coo-a] [wave-N] [<epic>] <ident><code> — fix: round N (...)"
+#
+# We match the literal "— fix: round " substring (the em-dash is U+2014, the
+# orchestrator emits the same character) so initial dispatches and fix-round
+# respawns can be distinguished without a separate flag in the task body.
+# Falls back to ASCII " - fix: round " for forward-compat in case the
+# orchestrator ever stops using the em-dash.
+_FIX_ROUND_TITLE_RE = re.compile(
+    r"(?:—|--|-)\s*fix:\s*round\s+\d+",
+    re.IGNORECASE,
+)
+
+
+def _is_fix_round_dispatch(task: dict) -> bool:
+    """Best-effort detection of a fix-round respawn task.
+
+    Returns ``True`` iff the task title carries the orchestrator's
+    "— fix: round N" marker. Falls back to ``False`` on missing title or
+    no match.
+
+    Used by `_builder_iteration_cap` to bump the size-gated cap by 4 on
+    fix-round dispatches so the builder has headroom to read the prior PR
+    + review feedback before pushing fixes (see SAL-2978).
+    """
+    title = task.get("title") or ""
+    if not title:
+        return False
+    return bool(_FIX_ROUND_TITLE_RE.search(title))
+
 
 def _peek_size_label(task: dict) -> Optional[str]:
     """Best-effort extraction of a ticket size label from the mesh task.
@@ -102,11 +140,19 @@ def _builder_iteration_cap(persona_name: str, task: dict) -> Optional[int]:
     ``None`` so ``dispatcher.call_with_tools`` falls back to the module-level
     ``MAX_TOOL_ITERATIONS`` ceiling. Kept as a pure helper so tests can
     exercise the mapping without spinning up a full dispatcher.
+
+    SAL-2978 (2026-04-25): fix-round dispatches now get a +4 bump over the
+    size-based cap (clamped at MAX_TOOL_ITERATIONS). v7aa evidence: SAL-2588
+    TIR-06 (size-S, est=1) hit MAX_TOOL_ITERATIONS=12 on every dispatch
+    because the size-S cap was right for original work but didn't account
+    for the extra turns a fix-round spends reading the prior PR + review
+    feedback before pushing fixes.
     """
     if persona_name not in _BUILDER_PERSONAS:
         return None
     size = _peek_size_label(task)
-    return iteration_cap_for_size(size)
+    is_fix_round = _is_fix_round_dispatch(task)
+    return iteration_cap_for_dispatch(size, is_fix_round=is_fix_round)
 
 
 # Module-level registry of long-running orchestrator tasks, keyed by the mesh
@@ -598,6 +644,9 @@ async def main() -> None:
                 # turns). Computed once so the log + the call agree.
                 iteration_cap = _builder_iteration_cap(persona.name, task)
                 size_label = _peek_size_label(task)
+                # SAL-2978: surface fix-round flag in dispatch log so ops can
+                # tell at a glance whether the bumped cap kicked in.
+                is_fix_round = _is_fix_round_dispatch(task)
                 logger.info("dispatching",
                             extra={"task_id": task.get("id"),
                                    "model": model,
@@ -606,13 +655,19 @@ async def main() -> None:
                                    "tools_enabled": len(tool_specs) > 0,
                                    "tool_count": len(tool_specs),
                                    "iteration_cap": iteration_cap,
-                                   "size_label": size_label})
+                                   "size_label": size_label,
+                                   "is_fix_round": is_fix_round,
+                                   "iteration_count_reset": True})
                 if iteration_cap is not None:
                     # AB-17-m: separate human-readable log so ops can grep for
                     # per-ticket caps without digging through structured extras.
+                    # SAL-2978: include fix-round flag so the log line at this
+                    # level is self-describing.
                     logger.info(
-                        "dispatching with iteration_cap=%d size=%s",
+                        "dispatching with iteration_cap=%d size=%s "
+                        "fix_round=%s iteration_count_reset=True",
                         iteration_cap, size_label or "unknown",
+                        is_fix_round,
                     )
 
                 try:
