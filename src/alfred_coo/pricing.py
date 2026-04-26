@@ -1,17 +1,15 @@
 import yaml
-from pathlib import Path
+import os
 
 def load() -> dict:
-    config_path = Path(__file__).resolve().parents[1] / "configs" / "model_pricing.yaml"
-    with open(config_path, "r") as f:
-        data = yaml.safe_load(f)
+    """
+    Load the model pricing configuration from the YAML file.
 
-    result = {}
-    for provider, details in data.get("providers", {}).items():
-        if isinstance(details, dict) and any(isinstance(v, dict) for v in details.values()):
-            for model, pricing in details.items():
-                key = f"{provider}/{model}"
-                result[key] = pricing
-        else:
-            result[provider] = details
-    return result
+    Returns:
+        dict: Parsed pricing configuration.
+    """
+    base_dir = os.path.dirname(__file__)
+    # The pricing config resides in the top-level configs directory
+    config_path = os.path.abspath(os.path.join(base_dir, "..", "..", "configs", "model_pricing.yaml"))
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
