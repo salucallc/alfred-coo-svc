@@ -1,0 +1,8 @@
+{
+  "title": "Appliance Health",
+  "uid": "appliance_health",
+  "panels": [],
+  "templating": {"list": []},
+  "schemaVersion": 30,
+  "version": 1
+}
