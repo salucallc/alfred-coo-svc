@@ -1,0 +1,20 @@
+version: '3.8'
+services:
+  hub:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=hub
+    ports:
+      - "443:443"
+  endpoint1:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=endpoint
+  endpoint2:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=endpoint
+  endpoint3:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=endpoint
