@@ -1,14 +1,15 @@
 # TIR-10: Split docker networks
 
 ## Target paths
+- deploy/appliance/docker-compose.yml
 - deploy/appliance/tiresias/network_split.md
 
 ## Acceptance criteria
-- `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails
-- `docker exec mcp-github curl https://api.github.com` succeeds
+- `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails with DNS/connection refused.
+- `docker exec mcp-github curl --max-time 5 https://api.github.com` succeeds.
 
 ## Verification approach
-Run the above docker exec commands; expect the first to fail (connection refused/DNS) and the second to succeed (200 OK).
+- Execute the above Docker commands in the respective containers and assert the expected outcomes.
 
 ## Risks
-- Risk R1: Internal network may break DNS; fallback iptables OUTPUT REJECT may be needed (see SAL-09).
+- R1 (plan A §6): if `internal:true` breaks DNS, fallback to iptables OUTPUT REJECT in init container; depends on TIR-09.
