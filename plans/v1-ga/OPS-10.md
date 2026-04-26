@@ -1,18 +1,19 @@
-# OPS-10: Authelia file backend
+# OPS-10: Authelia file backend integration
 
 ## Target paths
-- deploy/appliance/authelia/configuration.yml
-- deploy/appliance/authelia/users_database.yml
-- deploy/appliance/authelia/README.md
+- deploy/appliance/docker-compose.yml
+- deploy/appliance/authelia/configuration.yml (new)
+- deploy/appliance/authelia/users_database.yml (new)
+- deploy/appliance/authelia/README.md (new)
 
 ## Acceptance criteria
-- `/auth/` renders; admin login returns 200
+- "/auth/" renders
+- admin login returns 200
 
 ## Verification approach
-- Run `docker compose up -d` and ensure the Authelia service starts.
-- Execute `curl -f http://localhost/auth/` and expect HTTP 200.
-- Perform admin login via the wizard (Screen 8) and verify a 200 response.
+- Run `docker compose up` and access `http://localhost/auth/` expecting a login page.
+- Use wizard admin credentials to log in; expect HTTP 200 response.
 
 ## Risks
 - Misconfiguration of file backend could lock out admin access.
-- Ensure the admin passphrase is set correctly in the wizard.
+- Ensure proper volume mounts for configuration and user database files.
