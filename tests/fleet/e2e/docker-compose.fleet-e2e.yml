@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  hub:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=hub
+  endpoint_a:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=endpoint
+  endpoint_b:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=endpoint
+  endpoint_c:
+    image: salucallc/alfred-coo-svc:latest
+    environment:
+      - COO_MODE=endpoint
