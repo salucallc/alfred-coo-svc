@@ -1,14 +1,21 @@
-# Tenant binding logic for fleet endpoints
+"""Utilities for binding a tenant to fleet authentication flows.
 
-class TenantBinding:
-    """Placeholder for tenant binding implementation.
-    In GA this will enforce that API keys are scoped to a tenant and
-    provide lookup helpers for request authentication.
+This module provides a minimal placeholder implementation required for the
+C‑27 ticket. The real implementation will integrate with the backend
+services to persist tenant bindings.
+"""
+
+def bind_tenant(tenant_id: str, endpoint_id: str) -> dict:
+    """Return a payload representing a tenant‑endpoint binding.
+
+    Args:
+        tenant_id: Identifier of the tenant.
+        endpoint_id: Identifier of the endpoint.
+
+    Returns:
+        A dictionary that would be sent to the backend in a real system.
     """
-    def __init__(self, tenant_id: str):
-        self.tenant_id = tenant_id
-
-    def bind(self, request):
-        # Stub: associate request with tenant_id
-        request.context['tenant_id'] = self.tenant_id
-        return request
+    return {
+        "tenant_id": tenant_id,
+        "endpoint_id": endpoint_id,
+    }

@@ -1,1 +1,1 @@
-# Init for fleet tests package
+# Test package for fleet authentication

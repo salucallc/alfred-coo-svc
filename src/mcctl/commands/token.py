@@ -7,5 +7,10 @@ def main():
     parser.add_argument('--tenant', required=False, help='Tenant ID (optional)')
     args = parser.parse_args()
     # Placeholder implementation – in real code this would call the backend service
-    tenant_part = f" for tenant {args.tenant}" if args.tenant else ''
-    print(f"Generated token for site {args.site}{tenant_part} with ttl {args.ttl}")
+    if args.tenant:
+        print(f"Generated token for site {args.site} with ttl {args.ttl} bound to tenant {args.tenant}")
+    else:
+        print(f"Generated token for site {args.site} with ttl {args.ttl}")
+
+if __name__ == '__main__':
+    main()
