@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if [ -z "${1:-}" ]; then
-  echo "Usage: $0 <passphrase>"
+
+# Usage: ./mc_auth_init_admin.sh <passphrase>
+PASS="${1:-${MC_ADMIN_PASSPHRASE:-}}"
+if [[ -z "$PASS" ]]; then
+  echo "Error: passphrase not provided." >&2
   exit 1
 fi
-PASS="$1"
+
+# Initialize admin user in Authelia via mc tool
 ./mc.sh auth init-admin --passphrase "$PASS"
-echo "Admin initialized."
