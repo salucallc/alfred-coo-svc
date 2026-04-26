@@ -1,4 +1,4 @@
-# TIR-10: Split docker networks for egress isolation
+# SAL-2592: Split docker networks — mc-internal (no internet route) for coo/portal/open-webui/soul; mc-egress for caddy/mcp-*/tiresias only.
 
 ## Target paths
 - deploy/appliance/docker-compose.yml
@@ -6,13 +6,12 @@
 - plans/v1-ga/TIR-10.md
 
 ## Acceptance criteria
-- APE/V: `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails; `docker exec mcp-github curl` same URL succeeds
+- `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails with DNS/conn-refused
+- `docker exec mcp-github curl https://api.github.com` succeeds
 
 ## Verification approach
-- Run the two Docker exec commands inside the running appliance container stack and verify the expected success/failure.
-- CI test script `tests/network_split_test.sh` asserts the exit codes.
+Run the above Docker exec commands on the appliance and confirm the expected outcomes.
 
 ## Risks
-- Incorrect network assignment could break internal service communication.
-- Misconfiguration might allow unwanted internet egress from COO.
-- Ensure both `mc-internal` and `mc-egress` bridges are defined and not overlapping with existing `appliance` network.
+- Potential DNS resolution issues within the internal network causing service disruptions.
+- Misconfiguration may inadvertently block legitimate egress traffic.
