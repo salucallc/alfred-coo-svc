@@ -4,10 +4,12 @@
 - deploy/appliance/docker-compose.yml
 
 ## Acceptance criteria
-- `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails with DNS/conn-refused; `docker exec mcp-github curl` same URL succeeds
+- `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails
+- `docker exec mcp-github curl --max-time 5 https://api.github.com` succeeds
 
 ## Verification approach
-Run the two docker exec commands and assert the first times out or returns a DNS/connect error, while the second returns HTTP 200.
+Run the above Docker exec commands in the respective containers. The first should error (no DNS/connection), the second should return a successful HTTP response (200).
 
 ## Risks
-- Risk R1 (plan A §6): if internal:true breaks DNS, fallback to iptables OUTPUT REJECT in init container; depends on TIR-09.
+- R1: Internal network DNS breakage may prevent service discovery. Mitigation: fallback iptables OUTPUT REJECT rule in init container.
+- R2: Misconfiguration could expose internal services. Mitigation: CI test ensures correct network attachment.

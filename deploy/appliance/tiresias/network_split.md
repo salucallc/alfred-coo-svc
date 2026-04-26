@@ -1,8 +1,8 @@
-# Network Split for Tiresias Integration (TIR-10)
+# Network Split Overview
 
-This document describes the split Docker networks introduced in **TIR-10**:
+This document describes the Docker network segmentation introduced in TIR-10.
 
-- **mc-internal** – internal bridge used by services that must **not** have direct internet egress (COO daemon, portal, open‑webui, soul‑svc). All traffic from these services must flow through the `tiresias-proxy`.
-- **mc-egress** – bridge for edge services (Caddy, all MCP gateways, `aletheia-svc`) that are allowed to reach external APIs. These services connect to the internet via the `mc-egress` bridge.
+- **mc-internal**: Bridge network for internal services (`alfred-coo`, `portal`, `open-webui`, `soul`). No internet egress.
+- **mc-egress**: Bridge network for egress services (`caddy`, `mcp-github`, `mcp-slack`, `mcp-linear`, `mcp-notion`, `mcp-llm`). Allows outbound traffic to external APIs.
 
-The split ensures that the COO daemon cannot bypass the policy proxy, satisfying the APE/V condition that a direct `curl` to `https://api.github.com` fails, while the `mcp-github` service can still reach the same endpoint.
+The `docker-compose.yml` is updated to attach services to the appropriate network. See the compose file for exact network names.
