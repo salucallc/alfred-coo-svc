@@ -1,16 +1,17 @@
-import os
 import yaml
+from pathlib import Path
 
 def load() -> dict:
-    """Load model pricing configuration.
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "model_pricing.yaml"
+    with open(config_path, "r") as f:
+        data = yaml.safe_load(f)
 
-    Returns:
-        dict: Pricing data structured as a mapping.
-    """
-    config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "model_pricing.yaml")
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        data = {}
-    return data
+    result = {}
+    for provider, details in data.get("providers", {}).items():
+        if isinstance(details, dict) and any(isinstance(v, dict) for v in details.values()):
+            for model, pricing in details.items():
+                key = f"{provider}/{model}"
+                result[key] = pricing
+        else:
+            result[provider] = details
+    return result
