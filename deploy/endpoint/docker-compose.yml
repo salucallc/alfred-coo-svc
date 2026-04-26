@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  alfred-coo-endpoint:
+    image: salucallc/alfred-coo-svc:latest
+    container_name: alfred-coo-endpoint
+    env_file:
+      - .env
+    environment:
+      - COO_MODE=endpoint
+      - PERSONA_CONFIG=/etc/persona.yaml
+    ports:
+      - "8080:8080"
+    volumes:
+      - endpoint-data:/data
+    restart: unless-stopped
+volumes:
+  endpoint-data:
+    driver: local
