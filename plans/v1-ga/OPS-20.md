@@ -1,23 +1,18 @@
-# OPS-20: 4 provisioned dashboards
+# OPS-20: 4 provisioned Grafana dashboards
 
 ## Target paths
 - deploy/appliance/grafana/dashboards/appliance_health.json
 - deploy/appliance/grafana/dashboards/cost_and_tokens.json
 - deploy/appliance/grafana/dashboards/soul_activity.json
 - deploy/appliance/grafana/dashboards/auth_and_access.json
+- plans/v1-ga/OPS-20.md
 
 ## Acceptance criteria
-- [ ] Implementation matches the plan section for this ticket.
-- [ ] Unit + integration tests added or updated.
-- [ ] `ruff` + `pytest` green in CI.
-- [ ] PR opened via `propose_pr`; orchestrator will dispatch a hawkman-qa-a review on merge-ready.
-- [ ] Structured output envelope includes the PR URL in `summary` or `follow_up_tasks`.
+- All 4 uids resolve; mc-health green on clean install
 
 ## Verification approach
-- Add the dashboard JSON files.
-- Verify each dashboard is accessible via Grafana API: `curl -s http://grafana:3000/api/dashboards/uid/<uid>` returns HTTP 200.
-- Run unit and integration tests; ensure CI passes.
+Deploy the compose stack and query Grafana API `/api/search?type=dash-db` to confirm the four dashboard UIDs exist and the health panel reports green on a clean install. Automated test in `tests/test_grafana_dashboards.py` asserts HTTP 200 and correct UID presence.
 
 ## Risks
-- UID collisions if dashboards already exist.
-- Grafana service must be running for verification.
+- Future Grafana schema changes may require dashboard updates.
+- Caddy routing misconfiguration could block Grafana access.
