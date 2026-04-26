@@ -4402,3 +4402,249 @@ def test_envelope_helper_does_not_misclassify_propose_pr_with_side_linear_call()
         AutonomousBuildOrchestrator._envelope_is_grounding_gap(envelope)
         is False
     ), "non-grounding-gap linear_create_issue must not match the escalate discriminator"
+
+
+# ── SAL-2893: ESCALATED transitions Linear to Done ───────────────────────────
+#
+# PR #91 (SAL-2886) deliberately left Linear untouched on ESCALATED so the
+# operator could inspect the spawned grounding-gap issue. That created a
+# downstream stall: every subsequent kickoff's ``build_ticket_graph`` reads
+# Linear, sees "In Progress", maps it to ``in_progress``, and AB-17-y catches
+# it as an orphan-active 30 min later. Each kickoff burned 30 min on the same
+# stale ticket. SAL-2893 fix: transition Linear -> "Done" with a comment
+# linking the grounding-gap issue, so the next kickoff sees a terminal state
+# and the ticket leaves the active loop entirely. The grounding-gap link in
+# the comment carries the audit trail forward without spelunking soul memory.
+
+
+async def test_escalated_transitions_linear_to_done_with_grounding_gap_link(
+    monkeypatch,
+):
+    """SAL-2893 happy-path: when ``_poll_children`` classifies an envelope
+    as the SAL-2886 escalate emit, it MUST transition Linear to "Done"
+    AND post a comment whose body contains the grounding-gap issue's
+    identifier so the operator can navigate to it from the parent ticket.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-2893-x", "TIR-01", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-2893-x"
+    t.linear_state = "In Progress"  # the stale state SAL-2893 fixes
+    _seed_graph(orch, [t])
+
+    linear_calls: list[tuple[str, str]] = []
+
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    comment_calls: list[tuple[str, str]] = []
+
+    async def _fake_comment(ticket, grounding_gap_ident):
+        comment_calls.append((ticket.identifier, grounding_gap_ident))
+
+    monkeypatch.setattr(
+        orch, "_post_escalated_linear_comment", _fake_comment
+    )
+
+    mesh.completed_tasks.append({
+        "id": "child-2893-x",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-2893-x ...",
+        "status": "completed",
+        "result": {
+            "tool_calls": [{
+                "name": "linear_create_issue",
+                "result": {
+                    "identifier": "SAL-2999",
+                    "title": "grounding gap: SAL-2893-x missing target",
+                    "url": "https://linear.app/saluca/issue/SAL-2999",
+                },
+            }],
+            "summary": "Escalated due to PATH_CONFLICT on already-merged target",
+        },
+    })
+
+    await orch._poll_children()
+
+    assert t.status == TicketStatus.ESCALATED, (
+        f"sanity: discriminator must classify as ESCALATED, got {t.status}"
+    )
+    # Linear MUST receive a Done transition (the SAL-2893 fix).
+    assert ("SAL-2893-x", "Done") in linear_calls, (
+        f"SAL-2893: ESCALATED must transition Linear to Done; got {linear_calls}"
+    )
+    # And NOT Backlog — the SAL-2886 negative invariant still holds.
+    assert ("SAL-2893-x", "Backlog") not in linear_calls, (
+        f"escalate path must NOT roll Linear back to Backlog: {linear_calls}"
+    )
+    # Comment helper invoked exactly once with the grounding-gap identifier.
+    assert comment_calls == [("SAL-2893-x", "SAL-2999")], (
+        f"escalated comment helper not invoked correctly: {comment_calls}"
+    )
+    # ticket.linear_state was updated locally to mirror the Linear write so
+    # the next tick / restore sees the new state without a Linear re-read.
+    assert t.linear_state == "Done", (
+        f"ticket.linear_state must be updated to Done locally: {t.linear_state}"
+    )
+
+
+async def test_escalated_does_not_transition_if_already_done(monkeypatch):
+    """SAL-2893 idempotency guard: if Linear is already "Done" on entry to
+    the ESCALATED branch (e.g. operator manually closed it, or this is a
+    re-entry from rehydrated state), the orchestrator must NOT call
+    ``_update_linear_state`` again and must NOT post a duplicate comment.
+    The ticket still transitions to ``TicketStatus.ESCALATED`` and still
+    records the ``ticket_escalated`` event.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-2893-y", "TIR-02", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-2893-y"
+    t.linear_state = "Done"  # already there — the idempotency case
+    _seed_graph(orch, [t])
+
+    linear_calls: list[tuple[str, str]] = []
+
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    comment_calls: list[tuple[str, str]] = []
+
+    async def _fake_comment(ticket, grounding_gap_ident):
+        comment_calls.append((ticket.identifier, grounding_gap_ident))
+
+    monkeypatch.setattr(
+        orch, "_post_escalated_linear_comment", _fake_comment
+    )
+
+    mesh.completed_tasks.append({
+        "id": "child-2893-y",
+        "status": "completed",
+        "result": {
+            "tool_calls": [{
+                "name": "linear_create_issue",
+                "result": {
+                    "identifier": "SAL-3000",
+                    "title": "grounding gap: SAL-2893-y duplicate",
+                },
+            }],
+        },
+    })
+
+    await orch._poll_children()
+
+    # Status transition still happens — ESCALATED is the orchestrator's
+    # internal terminal regardless of Linear state.
+    assert t.status == TicketStatus.ESCALATED
+    # Event still recorded with the gap identifier (audit trail intact).
+    escalated_events = [
+        e for e in orch.state.events if e["kind"] == "ticket_escalated"
+    ]
+    assert len(escalated_events) == 1
+    assert escalated_events[0]["grounding_gap"] == "SAL-3000"
+    # Idempotency: no Linear write, no comment.
+    assert linear_calls == [], (
+        f"idempotency violated: Linear must not be re-written when already "
+        f"Done; got {linear_calls}"
+    )
+    assert comment_calls == [], (
+        f"idempotency violated: comment must not be re-posted when already "
+        f"Done; got {comment_calls}"
+    )
+
+
+async def test_grounding_gap_link_in_done_comment_matches_record_event_id(
+    monkeypatch,
+):
+    """SAL-2893 audit-trail invariant: the grounding-gap identifier
+    embedded in the Linear "Done" comment body MUST be byte-identical to
+    the ``grounding_gap`` value recorded in the ``ticket_escalated`` soul
+    event for the same tick. This is what lets a human follow the
+    operator-readable Linear comment back to the soul-memory event log
+    without ambiguity.
+
+    Drives the real ``_post_escalated_linear_comment`` (no monkeypatch on
+    that helper) but stubs the underlying ``linear_add_comment`` tool spec
+    so we can capture the body string.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-2893-z", "TIR-03", 0, "tiresias", size="S", estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-2893-z"
+    t.linear_state = "In Progress"
+    _seed_graph(orch, [t])
+
+    async def _fake_update(ticket, state_name):
+        return None
+
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # Inject a fake ``linear_add_comment`` spec into BUILTIN_TOOLS for
+    # this test — the real tool isn't registered yet and the helper has
+    # a defensive ``if spec is None: return`` short-circuit. Restore the
+    # original entry on teardown via monkeypatch.setitem so other tests
+    # don't see our stub.
+    from alfred_coo import tools as _tools
+
+    captured: dict = {}
+
+    async def _spy_handler(*, issue_id, body):
+        captured["issue_id"] = issue_id
+        captured["body"] = body
+        return {"ok": True}
+
+    class _StubSpec:
+        handler = staticmethod(_spy_handler)
+
+    monkeypatch.setitem(_tools.BUILTIN_TOOLS, "linear_add_comment", _StubSpec)
+
+    expected_gap = "SAL-3001"
+    mesh.completed_tasks.append({
+        "id": "child-2893-z",
+        "status": "completed",
+        "result": {
+            "tool_calls": [{
+                "name": "linear_create_issue",
+                "result": {
+                    "identifier": expected_gap,
+                    "title": "grounding gap: SAL-2893-z merged in prior wave",
+                    "url": f"https://linear.app/saluca/issue/{expected_gap}",
+                },
+            }],
+        },
+    })
+
+    await orch._poll_children()
+
+    # The recorded event's grounding_gap (the "record_event_id" the spec
+    # refers to) is the source of truth.
+    escalated_events = [
+        e for e in orch.state.events if e["kind"] == "ticket_escalated"
+    ]
+    assert len(escalated_events) == 1
+    recorded_gap = escalated_events[0]["grounding_gap"]
+    assert recorded_gap == expected_gap
+
+    # The comment was posted against the parent ticket UUID (NOT the gap
+    # identifier — comments attach to the parent so a Linear viewer
+    # following the parent thread sees the link).
+    assert captured.get("issue_id") == t.id
+    body = captured.get("body") or ""
+    # The grounding-gap identifier MUST appear verbatim in the body so
+    # the human can copy/click straight to it.
+    assert recorded_gap in body, (
+        f"comment body missing grounding-gap id {recorded_gap!r}: {body!r}"
+    )
+    # And the link form (a real Linear URL) must also be present.
+    assert f"https://linear.app/saluca/issue/{recorded_gap}" in body, (
+        f"comment body missing grounding-gap URL: {body!r}"
+    )
