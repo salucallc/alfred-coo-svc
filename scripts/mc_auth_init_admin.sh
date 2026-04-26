@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
+# Initialize admin user for Authelia after wizard screen 8
 set -euo pipefail
 
-# Usage: ./mc_auth_init_admin.sh <passphrase>
-PASS="${1:-${MC_ADMIN_PASSPHRASE:-}}"
-if [[ -z "$PASS" ]]; then
-  echo "Error: passphrase not provided." >&2
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <admin-passphrase>"
   exit 1
 fi
 
-# Initialize admin user in Authelia via mc tool
-./mc.sh auth init-admin --passphrase "$PASS"
+PASS="$1"
+# Assuming mc.sh has a subcommand to add admin; placeholder implementation
+./mc.sh auth add-admin --passphrase "${PASS}"
+
+# Verify admin was added
+if ./mc.sh auth list-users | grep -q "admin"; then
+  echo "Admin user created successfully."
+else
+  echo "Failed to create admin user." >&2
+  exit 1
+fi

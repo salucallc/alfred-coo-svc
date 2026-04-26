@@ -2,15 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Wizard Screen 8 – Admin Init</title>
+  <title>Wizard - Admin Init</title>
 </head>
 <body>
   <h1>Admin Initialization</h1>
-  <p>Set the appliance-admin passphrase to enable admin access.</p>
-  <form method="post" action="/wizard/8">
-    <label for="passphrase">Passphrase:</label>
+  <form action="/wizard/complete" method="post">
+    <label for="passphrase">Admin Passphrase:</label>
     <input type="password" id="passphrase" name="passphrase" required />
-    <button type="submit">Initialize</button>
+    <button type="submit">Continue</button>
   </form>
 </body>
 </html>
