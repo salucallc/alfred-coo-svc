@@ -29,6 +29,11 @@ from .dispatch import Dispatcher, DispatchContext, iteration_cap_for_size
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
 from .tools import resolve_tools, set_current_task_id, reset_current_task_id
+from .persona_github import (
+    set_current_persona,
+    reset_current_persona,
+    log_identity_summary,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -415,6 +420,10 @@ async def main() -> None:
     logger.info("alfred-coo v0 starting",
                 extra={"session_id": settings.soul_session_id,
                        "node_id": settings.soul_node_id})
+    # SAL-2905: emit one INFO line summarising the configured GitHub
+    # identities (or single-token-mode warning) so operators can
+    # verify split-identity is in effect from the daemon log alone.
+    log_identity_summary()
 
     fallback = _fallback_urls(settings)
 
@@ -558,6 +567,10 @@ async def main() -> None:
                 try:
                     if tool_specs:
                         ctx_token = set_current_task_id(task["id"])
+                        # SAL-2905: stamp the active persona so
+                        # GitHub-touching tool handlers can route to
+                        # the right identity-class token.
+                        persona_token = set_current_persona(persona.name)
                         try:
                             result = await dispatcher.call_with_tools(
                                 model,
@@ -569,6 +582,7 @@ async def main() -> None:
                                 max_iterations=iteration_cap,
                             )
                         finally:
+                            reset_current_persona(persona_token)
                             reset_current_task_id(ctx_token)
                     else:
                         result = await dispatcher.call(
