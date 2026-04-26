@@ -41,7 +41,7 @@ services:
       - mcp-notion
       - open-webui
     networks:
-      - appliance
+      - mc-egress
 
   alfred-portal:
     image: ghcr.io/salucallc/alfred-portal:latest
@@ -55,7 +55,7 @@ services:
       soul-svc:
         condition: service_started
     networks:
-      - appliance
+      - mc-internal
 
   soul-svc:
     image: ghcr.io/salucallc/soul-svc:latest
@@ -74,7 +74,7 @@ services:
       timeout: 3s
       retries: 5
     networks:
-      - appliance
+      - mc-internal
 
   alfred-coo-svc:
     image: ghcr.io/salucallc/alfred-coo-svc:latest
@@ -90,9 +90,9 @@ services:
       soul-svc:
         condition: service_healthy
     networks:
-      - appliance
+      - mc-internal
 
-  # — MCP Services (curated: github, slack, linear, notion) ————
+  # — MCP Services (curated: github, slack, linear, notion) —
   mcp-github:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
     restart: unless-stopped
@@ -102,7 +102,7 @@ services:
       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN:?must set}
     command: ["--port", "8203", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @modelcontextprotocol/server-github"]
     networks:
-      - appliance
+      - mc-egress
 
   mcp-slack:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
@@ -114,7 +114,7 @@ services:
       SLACK_TEAM_ID: ${SLACK_TEAM_ID:?must set}
     command: ["--port", "8201", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @modelcontextprotocol/server-slack"]
     networks:
-      - appliance
+      - mc-egress
 
   mcp-linear:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
@@ -125,7 +125,7 @@ services:
       LINEAR_API_KEY: ${LINEAR_API_KEY:?must set}
     command: ["--port", "8208", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y linear-mcp-server"]
     networks:
-      - appliance
+      - mc-egress
 
   mcp-notion:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
@@ -136,7 +136,7 @@ services:
       NOTION_API_KEY: ${NOTION_API_KEY:?must set}
     command: ["--port", "8212", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y @notionhq/notion-mcp-server"]
     networks:
-      - appliance
+      - mc-egress
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
@@ -148,7 +148,7 @@ services:
     volumes:
       - open_webui_data:/app/backend/data
     networks:
-      - appliance
+      - mc-internal
 
   postgres:
     image: postgres:16-alpine
@@ -165,7 +165,7 @@ services:
       timeout: 3s
       retries: 10
     networks:
-      - appliance
+      - mc-internal
 
   # New aletheia service
   aletheia-svc:
@@ -182,7 +182,7 @@ services:
       timeout: 3s
       retries: 5
     networks:
-      - appliance
+      - mc-internal
 
   # — end services
 
@@ -198,7 +198,8 @@ volumes:
   restic_data:
 
 networks:
-  appliance:
+  mc-internal:
     driver: bridge
-  mc-ops:
+    internal: true
+  mc-egress:
     driver: bridge
