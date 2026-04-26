@@ -1,0 +1,1 @@
+- targets: ['soul-svc:9090','tiresias:9090','coo:9090','portal:9090','prometheus:9090']
