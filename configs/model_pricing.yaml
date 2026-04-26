@@ -1,12 +1,10 @@
 # Model pricing table
-# Ollama Max: flat $100/month amortized
-# Free tiers: $0
-# Paid providers: per-token pricing
+openrouter:
+  free:
+    input_per_1k: 0.0
+    output_per_1k: 0.0
+  paid:
+    input_per_1k: 0.02
+    output_per_1k: 0.03
 ollama_max:
   flat_monthly_usd: 100
-free:
-  input_per_1k: 0.0
-  output_per_1k: 0.0
-openrouter:
-  input_per_1k: 0.001
-  output_per_1k: 0.002
