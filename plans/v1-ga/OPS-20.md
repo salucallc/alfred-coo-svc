@@ -1,18 +1,22 @@
-# OPS-20: 4 provisioned Grafana dashboards
+# OPS-20: 4 pre-provisioned Grafana dashboards
 
 ## Target paths
 - deploy/appliance/grafana/dashboards/appliance_health.json
 - deploy/appliance/grafana/dashboards/cost_and_tokens.json
 - deploy/appliance/grafana/dashboards/soul_activity.json
 - deploy/appliance/grafana/dashboards/auth_and_access.json
-- plans/v1-ga/OPS-20.md
 
 ## Acceptance criteria
-- All 4 uids resolve; mc-health green on clean install
+- All 4 uids resolve via /api/dashboards/uid/<id>; mc-health green on clean install.
 
 ## Verification approach
-Deploy the compose stack and query Grafana API `/api/search?type=dash-db` to confirm the four dashboard UIDs exist and the health panel reports green on a clean install. Automated test in `tests/test_grafana_dashboards.py` asserts HTTP 200 and correct UID presence.
+- Add the four JSON dashboard files under `deploy/appliance/grafana/dashboards/`.
+- Run `docker compose up -d` for the appliance.
+- Verify Grafana loads each dashboard without errors.
+- Curl each dashboard UID endpoint (`/api/dashboards/uid/<uid>`) returns HTTP 200.
+- Query the health endpoint (`/health` or `mc-health`) returns green status.
 
 ## Risks
-- Future Grafana schema changes may require dashboard updates.
-- Caddy routing misconfiguration could block Grafana access.
+- Incorrect UID values would cause dashboard load failures.
+- Grafana version mismatch could break JSON schema.
+- Deployment ordering: Grafana must be ready before dashboards are provisioned.
