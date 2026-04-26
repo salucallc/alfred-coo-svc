@@ -2534,14 +2534,32 @@ class AutonomousBuildOrchestrator:
             # retries (v7p signature).
             if not pr_url and self._envelope_is_grounding_gap(result):
                 ticket.status = TicketStatus.ESCALATED
+                grounding_gap_ident = self._envelope_grounding_gap_identifier(
+                    result
+                )
                 self.state.record_event(
                     "ticket_escalated",
                     identifier=ticket.identifier,
-                    grounding_gap=self._envelope_grounding_gap_identifier(result),
+                    grounding_gap=grounding_gap_ident,
                 )
-                # Linear: no transition - operator inspects the grounding-gap
-                # issue. Parent ticket stays whatever Linear state Step-0
-                # protocol left it in (typically Backlog or In Progress).
+                # SAL-2893: transition Linear to "Done" with a grounding-gap
+                # link. PR #91 left Linear untouched on ESCALATED, so each
+                # subsequent kickoff's ``build_ticket_graph`` re-read it as
+                # ``in_progress`` and AB-17-y burned 30 min on the orphan-
+                # active sweep. Moving Linear to "Done" here makes the next
+                # kickoff see a terminal state and skip the ticket entirely.
+                # Idempotency guard: skip the write + comment if Linear is
+                # already in a "done"-equivalent state (operator closed it
+                # manually, or this is re-entry from rehydrated state).
+                already_done = (ticket.linear_state or "").strip().lower() in (
+                    "done", "merged", "released", "completed",
+                )
+                if not already_done:
+                    await self._update_linear_state(ticket, "Done")
+                    await self._post_escalated_linear_comment(
+                        ticket, grounding_gap_ident
+                    )
+                    ticket.linear_state = "Done"
                 updated.append(ticket)
                 continue
             if pr_url:
@@ -3440,6 +3458,62 @@ class AutonomousBuildOrchestrator:
         except Exception:
             logger.exception(
                 "linear_add_comment raised for guardrail trip on %s",
+                ticket.identifier,
+            )
+
+    async def _post_escalated_linear_comment(
+        self, ticket: Ticket, grounding_gap_ident: Optional[str]
+    ) -> None:
+        """SAL-2893: Post a Linear comment explaining the SAL-2886 escalate
+        transition and linking the spawned grounding-gap issue.
+
+        Best-effort. Mirrors ``_post_destructive_guardrail_linear_comment``
+        - if ``linear_add_comment`` is not in BUILTIN_TOOLS (older deploy)
+        we silently skip; the soul ``ticket_escalated`` event still records
+        the same ``grounding_gap`` identifier so the audit trail survives
+        the missing comment. ``grounding_gap_ident`` matches whatever
+        ``record_event(kind="ticket_escalated", grounding_gap=...)``
+        recorded on this same tick (see SAL-2886 / persona.py:58-67).
+        """
+        try:
+            from alfred_coo.tools import BUILTIN_TOOLS
+        except Exception:
+            logger.debug("tools not importable; skipping escalated comment")
+            return
+        spec = BUILTIN_TOOLS.get("linear_add_comment")
+        if spec is None:
+            return
+        if grounding_gap_ident:
+            link_line = (
+                f"**Grounding gap:** {grounding_gap_ident} "
+                f"(https://linear.app/saluca/issue/{grounding_gap_ident})"
+            )
+        else:
+            link_line = (
+                "**Grounding gap:** identifier unavailable in child envelope"
+            )
+        body_lines = [
+            "## SAL-2886 escalate-path fired (SAL-2893)",
+            "",
+            link_line,
+            "",
+            (
+                "The alfred-coo-a builder emitted a `linear_create_issue` "
+                "tool call resolving to a grounding-gap issue rather than "
+                "opening a PR. The orchestrator transitioned this parent "
+                "ticket to `Done` to prevent stale orphan-active across "
+                "subsequent kickoffs (PR #91 left Linear untouched, which "
+                "blocked 30 min on AB-17-y every kickoff). Operator: "
+                "inspect the linked grounding-gap issue, resolve the gap, "
+                "then re-open or re-file this ticket as needed."
+            ),
+        ]
+        body = "\n".join(body_lines)
+        try:
+            await spec.handler(issue_id=ticket.id, body=body)
+        except Exception:
+            logger.exception(
+                "linear_add_comment raised for escalated transition on %s",
                 ticket.identifier,
             )
 
