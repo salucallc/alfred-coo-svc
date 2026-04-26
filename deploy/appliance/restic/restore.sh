@@ -1,25 +1,12 @@
 #!/usr/bin/env bash
-# Restore a restic snapshot for the appliance volume.
-# Usage: ./restore.sh --snapshot <snapshot-id>
 set -euo pipefail
-
-if [[ $# -lt 2 ]]; then
-  echo "Usage: $0 --snapshot <snapshot-id>"
+# restore.sh – restore a restic snapshot to the appliance volumes
+# Usage: ./restore.sh <snapshot-id>
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 <snapshot-id>"
   exit 1
 fi
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --snapshot)
-      SNAPSHOT_ID="$2"
-      shift 2
-      ;;
-    *)
-      echo "Unknown argument: $1"
-      exit 1
-      ;;
-  esac
-done
-
-# Assume RESTIC_REPOSITORY and RESTIC_PASSWORD are set in the environment.
-restic restore "$SNAPSHOT_ID" --target / --host "$(hostname)" --path / --verbose
+SNAPSHOT_ID="$1"
+# Assume restic repository is configured via environment variables (RESTIC_REPOSITORY, RESTIC_PASSWORD)
+restic -r "$RESTIC_REPOSITORY" -p "$RESTIC_PASSWORD" restore "$SNAPSHOT_ID" --target /var/lib/restore-target
+echo "Restore of snapshot $SNAPSHOT_ID completed."
