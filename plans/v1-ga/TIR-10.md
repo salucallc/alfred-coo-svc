@@ -1,17 +1,13 @@
-# SAL-2592: Split docker networks — mc-internal (no internet route) for coo/portal/open-webui/soul; mc-egress for caddy/mcp-*/tiresias only.
+# TIR-10: Split docker networks
 
 ## Target paths
 - deploy/appliance/docker-compose.yml
-- deploy/appliance/tiresias/network_split.md
-- plans/v1-ga/TIR-10.md
 
 ## Acceptance criteria
-- `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails with DNS/conn-refused
-- `docker exec mcp-github curl https://api.github.com` succeeds
+- `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails with DNS/conn-refused; `docker exec mcp-github curl` same URL succeeds
 
 ## Verification approach
-Run the above Docker exec commands on the appliance and confirm the expected outcomes.
+Run the two docker exec commands and assert the first times out or returns a DNS/connect error, while the second returns HTTP 200.
 
 ## Risks
-- Potential DNS resolution issues within the internal network causing service disruptions.
-- Misconfiguration may inadvertently block legitimate egress traffic.
+- Risk R1 (plan A §6): if internal:true breaks DNS, fallback to iptables OUTPUT REJECT in init container; depends on TIR-09.
