@@ -4573,7 +4573,9 @@ class AutonomousBuildOrchestrator:
         }
         # SAL-2905: orchestrator identity (hint-verification probes
         # are an orchestrator-tier action). Falls back through
-        # ``token_for_persona``'s chain → QA → legacy GITHUB_TOKEN.
+        # ``token_for_persona``'s chain → legacy GITHUB_TOKEN.
+        # SAL-2930: QA-hop removed; QA PATs scoped only to Pull
+        # requests 404 on private-repo content reads.
         from alfred_coo.persona_github import (
             GitHubIdentityClass,
             token_for_persona,

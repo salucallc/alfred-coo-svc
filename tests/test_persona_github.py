@@ -89,29 +89,55 @@ def test_token_for_persona_no_tokens_returns_empty(monkeypatch):
     assert cls == GitHubIdentityClass.UNKNOWN
 
 
-def test_token_for_persona_orchestrator_falls_back_to_qa_then_legacy(monkeypatch):
-    """ORCHESTRATOR has a special chain: own → QA → legacy."""
+def test_token_for_persona_orchestrator_no_qa_hop(monkeypatch):
+    """SAL-2930 regression: ORCHESTRATOR class must NOT fall back to
+    GITHUB_TOKEN_QA. The QA-hop in token_for_persona caused private-
+    repo READ probes (``_gh_api`` / ``_gh_contents`` / ``http_get``)
+    to 404 when GITHUB_TOKEN_QA was a fine-grained PAT scoped only to
+    Pull requests. With orchestrator unset and QA + legacy set, the
+    orchestrator must resolve to legacy GITHUB_TOKEN, not QA."""
     _clear_all_github_env(monkeypatch)
     monkeypatch.setenv("GITHUB_TOKEN_QA", "qa-tok")
     monkeypatch.setenv("GITHUB_TOKEN", "legacy-tok")
     token, cls = token_for_persona("autonomous-build-a")
-    assert token == "qa-tok"
-    assert cls == GitHubIdentityClass.QA  # resolved via fallback
+    assert token == "legacy-tok", (
+        "orchestrator hopped to QA token despite SAL-2930 fix; "
+        f"got {token!r}"
+    )
+    assert cls == GitHubIdentityClass.UNKNOWN  # legacy resolves as UNKNOWN
 
-    # Now add the dedicated orchestrator token — should win.
+    # And with QA only (no legacy), orchestrator must NOT use QA — it
+    # falls through to empty (caller's missing-token error path fires).
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    token, cls = token_for_persona("autonomous-build-a")
+    assert token == "", f"orchestrator picked up QA token; got {token!r}"
+    assert cls == GitHubIdentityClass.UNKNOWN
+
+
+def test_token_for_persona_orchestrator_explicit_override(monkeypatch):
+    """SAL-2930: when GITHUB_TOKEN_ORCHESTRATOR is set, the orchestrator
+    class must resolve to that token regardless of QA / legacy."""
+    _clear_all_github_env(monkeypatch)
     monkeypatch.setenv("GITHUB_TOKEN_ORCHESTRATOR", "orch-tok")
+    monkeypatch.setenv("GITHUB_TOKEN_QA", "qa-tok")
+    monkeypatch.setenv("GITHUB_TOKEN", "legacy-tok")
     token, cls = token_for_persona("autonomous-build-a")
     assert token == "orch-tok"
     assert cls == GitHubIdentityClass.ORCHESTRATOR
 
-    # Now drop QA — orchestrator still resolves directly.
+    # Drop QA + legacy — orchestrator still resolves directly.
     monkeypatch.delenv("GITHUB_TOKEN_QA", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     token, cls = token_for_persona("autonomous-build-a")
     assert token == "orch-tok"
     assert cls == GitHubIdentityClass.ORCHESTRATOR
 
-    # Drop everything except legacy — orchestrator falls all the way through.
-    monkeypatch.delenv("GITHUB_TOKEN_ORCHESTRATOR", raising=False)
+
+def test_token_for_persona_orchestrator_falls_through_to_legacy(monkeypatch):
+    """SAL-2930: with only legacy GITHUB_TOKEN set, orchestrator
+    resolves to legacy. (Single-token deployment baseline.)"""
+    _clear_all_github_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "legacy-tok")
     token, cls = token_for_persona("autonomous-build-a")
     assert token == "legacy-tok"
     assert cls == GitHubIdentityClass.UNKNOWN
@@ -294,11 +320,18 @@ async def test_github_merge_pr_uses_orchestrator_token(monkeypatch, captured_req
 
 
 @pytest.mark.asyncio
-async def test_github_merge_pr_falls_back_to_qa_token(monkeypatch, captured_request):
-    """No GITHUB_TOKEN_ORCHESTRATOR but GITHUB_TOKEN_QA set →
-    orchestrator chain falls back to QA. Documented in §4.4 of the
-    design doc — 'QA approved → QA merges' when no dedicated
-    orchestrator bot exists."""
+async def test_pr_merge_still_uses_qa_identity(monkeypatch, captured_request):
+    """SAL-2930 (intent-preservation): even after the orchestrator-class
+    QA-hop is removed from ``token_for_persona``, the merge call site
+    (``github_merge_pr`` via ``_github_token_for``) must still fall
+    back to ``GITHUB_TOKEN_QA`` when ``GITHUB_TOKEN_ORCHESTRATOR`` is
+    unset. The 'QA approved → QA merges' semantic survives because
+    the QA-hop now lives only at the merge call site, decoupled from
+    READ probes that would otherwise 404 on private repos.
+
+    Documented in §4.4 of the SAL-2905 design doc; SAL-2930 narrowed
+    the scope from the global ``token_for_persona`` chain to the
+    single legitimate merge call site."""
     _clear_all_github_env(monkeypatch)
     monkeypatch.setenv("GITHUB_TOKEN_QA", "qa-tok")
     monkeypatch.setenv("GITHUB_TOKEN", "legacy-tok")
