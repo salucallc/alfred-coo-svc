@@ -1,20 +1,10 @@
 # Network Split Documentation
 
-This document describes the two Docker networks introduced for the appliance:
+This document describes the split of Docker networks for the appliance.
 
-- **`mc-internal`** – a bridge network marked `internal: true`. Services attached to this network have **no external internet access**. It includes:
-  - `alfred-coo-svc`
-  - `alfred-portal`
-  - `soul-svc`
-  - `open-webui`
-  - `postgres`
-  - `aletheia-svc`
+- **mc-internal**: No internet route; services: alfred-coo, alfred-portal, open-webui, soul-svc.
+- **mc-egress**: Allows outbound traffic for MCP services (github, slack, linear, notion, llm) and caddy.
 
-- **`mc-egress`** – a standard bridge network with internet access. It is used by services that need to reach external APIs via the Tiresias proxy, such as the MCP gateway services:
-  - `caddy`
-  - `mcp-github`
-  - `mcp-slack`
-  - `mcp-linear`
-  - `mcp-notion`
+Configuration changes to Docker Compose will place `alfred-coo-svc` and related services on `mc-internal`, while MCP services attach to `mc-egress`.
 
-The configuration ensures that the COO daemon (`alfred-coo-svc`) cannot directly reach `api.github.com`; instead it must go through the `tiresias-proxy` on the `mc-egress` network.
+The split ensures that internal services cannot directly reach external APIs, enforcing egress via the Tiresias proxy.
