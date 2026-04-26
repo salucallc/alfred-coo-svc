@@ -962,6 +962,474 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         branch_hint="feature/c28-fleet-tenant-policy",
         notes="plan C §5 C-28 + SAL-2676; /v1/fleet/policy keyed by tenant {bundles:{tenant_a:{signed},tenant_b:{...}}}; F12 signer signs each tenant's bundle separately; mcctl push-policy --tenant only bumps that tenant's policy_version; mesh_scope.allowed_topics_prefix per-tenant. mcctl push-policy command itself is from F19 (later wave) — C-28 only adds tenant_bundles module + test, mcctl extension lands inline. Depends on C-27 + F12",
     ),
+
+    # ── Wave-2 expansion (2026-04-26 evening operator hotfix) ────────────
+    # 33 entries derived from Z:/_planning/v1-ga/{A,B,C,D,E}_*.md.
+    # Resolves the wave-2 no_hint crash observed in v7ab autonomous run
+    # (audit doc: C:/Users/cris/AppData/Local/Temp/no_hint_root_cause.md).
+    # Wave-1 expansion at line 604 covered SAL-2585..SAL-2676; this block
+    # closes the remaining wave-2 codes that hit `{'no_hint': 33}` in
+    # _verify_wave_hints. Per audit §3.8 path-forward: dict expansion is
+    # the immediate unblocker; body-parser fallback is the durable repair
+    # tracked separately.
+
+    # ── Epic A · Tiresias-sovereign Wave 3 — appliance wire-in (TIR-09..13) ─
+    "TIR-09": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/tiresias/README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-09-compose-wire-in",
+        notes="plan A §4 Wave 3 + SAL-2591; add tiresias-proxy service block (image ghcr.io/salucallc/tiresias-sovereign:v1.0.0) to appliance compose + Caddy /tiresias/* path-routes (already in OPS-03 scope; coordinate); APE/V: /tiresias/healthz + /tiresias/policies accessible via Caddy, .principles | length == 12; depends on TIR-01..08",
+    ),
+
+    "TIR-10": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/tiresias/network_split.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-10-network-split",
+        notes="plan A §4 Wave 3 + SAL-2592; split docker networks — mc-internal (no internet route) for coo/portal/open-webui/soul; mc-egress for caddy/mcp-*/tiresias only. APE/V: docker exec alfred-coo curl --max-time 5 https://api.github.com fails; docker exec mcp-github curl same URL succeeds. Risk R1 (plan A §6): if internal:true breaks DNS, fallback to iptables OUTPUT REJECT in init container; depends on TIR-09",
+    ),
+
+    "TIR-11": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/docker-compose.yml",
+            "deploy/appliance/.env.template",
+            "src/alfred_coo/main.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/tiresias_client.py",
+            "tests/test_tiresias_client.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-11-remove-raw-tokens",
+        notes="plan A §4 Wave 4 + SAL-2593 [CRITICAL PATH]; remove raw GITHUB_TOKEN/SLACK_BOT_TOKEN/LINEAR_API_KEY/NOTION_API_KEY/ANTHROPIC_API_KEY/OPENAI_API_KEY from coo env; wire SOULKEY_FILE + TIRESIAS_URL=http://tiresias-proxy:8840; new tiresias_client.py replaces direct provider SDKs with /proxy/<service>/<path> calls. APE/V: grep image filesystem for ghp_|xoxb-|lin_api_|secret_|sk-ant-|sk- returns 0; coo issues test GitHub issue via proxy; audit_chain row exists. Risk R2 (plan A §6): probe each SDK for custom baseUrl support; swap to raw fetch if any reject. Depends on TIR-09 + TIR-10",
+    ),
+
+    "TIR-12": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/mc-init/mint_soulkeys.sh",
+            "deploy/appliance/mc-init/register_allowlist.sh",
+            "deploy/appliance/mc-init/README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-12-mint-soulkeys",
+        notes="plan A §4 Wave 3 + SAL-2594; mc-init mints 6 soulkeys (sk_agent_appliance_<service>_<sha256_tail64>) idempotently on first boot, writes to state/secrets/, SHA-512 hash in tiresias _soulkeys table; registers allowlist rows in _soulkey_allowlist for coo (≥4 entries). APE/V: rowcount(_soulkeys)=6; rowcount(_soulkey_allowlist for coo)>=4. Depends on TIR-07 + TIR-09",
+    ),
+
+    "TIR-13": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/docker-compose.yml",
+            "deploy/appliance/.env.template",
+        ),
+        new_paths=(
+            "deploy/appliance/open-webui/tiresias_routing.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-13-openwebui-routing",
+        notes="plan A §4 Wave 3 + SAL-2595; route open-webui chat completions through tiresias-proxy (OPENAI_API_BASE_URL=http://tiresias-proxy:8840/proxy/openai or anthropic-equivalent); strip raw provider keys from open-webui env. APE/V: chat completion via browser works; tiresias_audit row increments per turn. Depends on TIR-11 + TIR-12",
+    ),
+
+    # ── Epic B · Aletheia daemon Wave 2 (ALT-07/08) ──────────────────────
+    "ALT-07": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "aletheia/app/watchers/mesh_subscriber.py",
+            "aletheia/tests/test_mesh_subscriber.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-07-mesh-subscriber",
+        notes="plan B §5 Track B ALT-07 + SAL-2604; subscribes soul-svc pub/sub for mesh_task_complete events; enqueues verify job to Redis aletheia:pending; APE/V: fire mcp__alfred__mesh_task_complete with known id, within 10s verdict record written, soul_memory_search finds it. Depends on ALT-05 + soul-svc pub/sub epic",
+    ),
+
+    "ALT-08": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "aletheia/app/preflight/__init__.py",
+            "aletheia/app/preflight/server.py",
+            "aletheia/tests/test_preflight.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-08-mcp-preflight",
+        notes="plan B §5 Track B ALT-08 + SAL-2605; POST /v1/preflight endpoint blocks up to 90s for verdict; FAIL aborts MCP with HTTP 412, UNCERTAIN proceeds with marked-for-review flag; circuit-breaker (>50% 5xx for 2min → fail-open + #batcave per R5). APE/V: forge preflight to non-existent slack channel → FAIL with abort; Log in soul-svc topic=aletheia.verdict. Depends on ALT-05",
+    ),
+
+    # ── Epic C · Fleet Wave 4-5 (F09/F10/F11/F14/F16/F17/F19/F20/F22/F25) ─
+    "F09": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/__init__.py",
+            "src/alfred_coo/fleet_endpoint/memory_push.py",
+            "tests/test_fleet_memory_push.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f09-endpoint-memory-push",
+        notes="plan C §3.3 + SAL-2617; endpoint-side push loop POST /v1/fleet/memory/push 30s cadence or queue >=50; idempotent dup retry; monotonic local_seq. APE/V: 1000 writes reflected in hub fleet_memory_sync_log within 60s; depends on F06 + F08",
+    ),
+
+    "F10": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/memory_pull.py",
+            "tests/test_fleet_memory_pull.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f10-endpoint-memory-pull",
+        notes="plan C §3.3 + SAL-2618; endpoint pull loop GET /v1/fleet/memory/pull?since_global_seq=N 60s cadence; advance global cursor; APE/V: two endpoints A,B; A writes shared.* topic; B's local search returns within 90s; depends on F09",
+    ),
+
+    "F11": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=("routers/fleet.py",),
+        new_paths=(
+            "fleet/conflict_journal.py",
+            "tests/test_fleet_conflict_journal.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f11-conflict-journal",
+        notes="plan C §3.3 + SAL-2619; hub-side fleet.conflict journal row when content_hash mismatch on *.singleton topic; mcctl endpoint conflicts surfaces. APE/V: force content_hash conflict, hub writes row, mcctl lists. Depends on F10",
+    ),
+
+    "F14": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/mcctl/commands/__init__.py",),
+        new_paths=(
+            "src/mcctl/commands/policy.py",
+            "tests/test_mcctl_policy_immediate.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f14-emergency-policy-push",
+        notes="plan C §3.4 + SAL-2622; mcctl policy push --immediate interrupts endpoints <5s; in-flight task requeued with requeue_reason=policy_immediate. APE/V: synthetic immediate-policy push, endpoint logs interrupt + requeue. Depends on F13",
+    ),
+
+    "F16": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/degraded_mode.py",
+            "src/alfred_coo/fleet_endpoint/tool_fallback.py",
+            "tests/test_degraded_mode_matrix.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f16-degraded-mode-matrix",
+        notes="plan C §3.5 + SAL-2624 [CRITICAL PATH]; 8-case degraded-mode tool behavior matrix (github cache_then_503, linear queue_and_drain, fs passthrough, etc.); cut hub connectivity → tests pass; reconnect drains queue. APE/V: pytest test_degraded_mode_matrix all 8 cases green. Depends on F07 + F13",
+    ),
+
+    "F17": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/reconcile.py",
+            "tests/test_fleet_reconcile.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f17-endpoint-reconcile",
+        notes="plan C §3.3 recovery + SAL-2625 [CRITICAL PATH]; on WS reconnect endpoint sends fleet.reconcile with cursor; hub responds with plan; order policy → persona → inbox → memory push → memory pull → resume; <60s for <100k buffered writes. APE/V: 10min blackout, 200 local + 150 hub writes; reconciles within 60s; no dups; global_seq monotonic. Depends on F10 + F16",
+    ),
+
+    "F19": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/mcctl/commands/policy.py",),
+        new_paths=(
+            "src/mcctl/commands/persona.py",
+            "tests/test_mcctl_push_persona.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f19-mcctl-push",
+        notes="plan C §5 F19 + SAL-2627; mcctl push-policy / push-persona uploads bundle, hub creates version row, endpoint heartbeat shows persona_version match within 60s. Extends policy.py from F14 + new persona.py. Depends on F12 + F13",
+    ),
+
+    "F20": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "deploy/endpoint/docker-compose.yml",
+            "deploy/endpoint/.env.template",
+            "deploy/endpoint/README.md",
+            "deploy/endpoint/bootstrap.sh",
+        ),
+        base_branch="main",
+        branch_hint="feature/f20-endpoint-compose",
+        notes="plan C §5 F20 + SAL-2628; endpoint footprint compose (alfred-coo-svc COO_MODE=endpoint + soul-lite + optional local MCP shims); no postgres/portal/open-webui — headless; bootstrap README walks fresh-Debian operator <10min. APE/V: clean Debian VM, paste registration_token, endpoint registers + heartbeats. Depends on F06 + F08",
+    ),
+
+    "F22": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/quarantine.py",
+            "src/mcctl/commands/quarantine.py",
+            "tests/test_fleet_quarantine.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/f22-quarantine-state",
+        notes="plan C §3.5 quarantine + SAL-2630; force api_key expiry during severe-degraded → mode_state=quarantine (no writes, read-only, refuses tasks); recovery via mcctl endpoint unquarantine. APE/V: synthetic key expiry + 16min hub blackout; endpoint enters quarantine; recovery flag clears state. Depends on F15 + F16",
+    ),
+
+    "F25": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "docs/fleet/protocol.md",
+            "docs/fleet/runbook.md",
+            "docs/fleet/threat_model.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f25-fleet-docs",
+        notes="plan C §5 F25 + SAL-2633; protocol spec (registration, heartbeat, replication, policy push, degraded matrix, reconciliation), runbook (provisioning, key rotation, quarantine recovery, unquarantine), threat model (R1-R5 mitigations). docs-lint clean; markdown only, no code. Depends on F17 + F22",
+    ),
+
+    # ── Epic D · Ops layer Wave 2-6 (OPS-07/08/09/10/11/12/13/14/15/20/24/25/27/28) ─
+    "OPS-07": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/infisical/agent_sidecar.yml",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-07-agent-sidecars",
+        notes="plan D §3.5 + SAL-2640; infisical-agent sidecar (~20MB) for tiresias/portal/mcp-core writes secrets to tmpfs /run/secrets/; APE/V: cat /run/secrets/<svc>_<key> matches infisical UI value for each service. Depends on OPS-06",
+    ),
+
+    "OPS-08": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/infisical/migrate_state_secrets.sh",
+            "deploy/appliance/infisical/MIGRATION.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-08-migrate-state-secrets",
+        notes="plan D §3.5 + SAL-2641; init container reads ./state/secrets/* on first boot, pushes into infisical, then chmod 000 (disabled-but-recoverable). APE/V: delete state/secrets dir, restart → all services healthy, secrets visible in infisical UI. Depends on OPS-06 + OPS-07",
+    ),
+
+    "OPS-09": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/infisical/rotation_endpoint.md",
+            "tests/test_infisical_rotation.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-09-rotation-endpoint",
+        notes="plan D §3.5 + SAL-2642; POST /api/v3/secrets/:id/rotate generates new value; agents pick up next 60s poll; services with requires_restart:true auto-restart. APE/V: rotate test key, services pick up within 90s. Depends on OPS-08",
+    ),
+
+    "OPS-10": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/authelia/configuration.yml",
+            "deploy/appliance/authelia/users_database.yml",
+            "deploy/appliance/authelia/README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-10-authelia-file-backend",
+        notes="plan D §3.3 + SAL-2643; authelia/authelia:4.38.17 with file-based user backend (air-gap fallback); admin passphrase set in wizard Screen 8. APE/V: /auth/ renders; admin login returns 200. Depends on OPS-03 + OPS-07",
+    ),
+
+    "OPS-11": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/Caddyfile",
+            "deploy/appliance/docker-compose.yml",
+        ),
+        new_paths=(),
+        base_branch="main",
+        branch_hint="feature/ops-11-caddy-forward-auth",
+        notes="plan D §3.3 + SAL-2644; Caddyfile forward_auth directive on /ops/* routes; unauth → 302 /auth; valid session cookie → 200. APE/V: curl -I /ops/ returns 302; curl with cookie returns 200. Depends on OPS-10",
+    ),
+
+    "OPS-12": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/authelia/configuration.yml",),
+        new_paths=(
+            "deploy/appliance/authelia/oidc_clients_template.yml",
+            "deploy/appliance/authelia/BYO_OIDC.md",
+            "scripts/mc_auth_add_oidc.sh",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-12-byo-oidc",
+        notes="plan D §3.3 + SAL-2645; ./mc.sh auth add-oidc <provider> --client-id X adds OIDC client to authelia config; supports google/okta/azure-ad templates. APE/V: add test IdP, login via that IdP works end-to-end. Depends on OPS-10",
+    ),
+
+    "OPS-13": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/authelia/configuration.yml",),
+        new_paths=(
+            "deploy/appliance/authelia/access_control.yml",
+            "tests/test_authelia_rbac.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-13-rbac-groups",
+        notes="plan D §3.3 + SAL-2646; appliance-admin (full /ops/*, /vault/*, /auth/*, all backend APIs) + tenant-user (only /, /soul/*, /chat/*) groups. APE/V: tenant-user → 403 on /ops; appliance-admin → 200. Depends on OPS-10",
+    ),
+
+    "OPS-14": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/authelia/configuration.yml",),
+        new_paths=(
+            "deploy/appliance/authelia/oauth2_clients.yml",
+            "src/alfred_coo/auth/scoped_tokens.py",
+            "tests/test_scoped_oauth_tokens.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-14-scoped-oauth2-tokens",
+        notes="plan D §3.3 + SAL-2647; OAuth2 client_credentials flow, scopes soul:memory:read/write, tiresias:audit:read, tiresias:cost:read, mcp:tools:invoke, vault:read/write; 24h TTL; portal rotation. APE/V: soul:memory:read scope → 200 on search but 403 on write. Depends on OPS-13",
+    ),
+
+    "OPS-15": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/Caddyfile",
+            "deploy/appliance/authelia/configuration.yml",
+        ),
+        new_paths=(
+            "deploy/appliance/wizard/screen_8_admin_init.html",
+            "scripts/mc_auth_init_admin.sh",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-15-wizard-admin-init",
+        notes="plan D §3.3 + SAL-2648; Wizard Screen 8 (between 7 and Open MC) — operator sets appliance-admin passphrase; ./mc.sh auth init-admin --passphrase X seeds users_database.yml. APE/V: post-wizard admin row exists; ./mc.sh auth list-users >=1 row. Depends on OPS-10 + portal-team coordination",
+    ),
+
+    "OPS-20": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/grafana/dashboards/appliance_health.json",
+            "deploy/appliance/grafana/dashboards/cost_and_tokens.json",
+            "deploy/appliance/grafana/dashboards/soul_activity.json",
+            "deploy/appliance/grafana/dashboards/auth_and_access.json",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-20-grafana-dashboards",
+        notes="plan D §3.2 + SAL-2653; 4 pre-provisioned Grafana dashboards (Appliance Health, Cost & Tokens, Soul Activity, Auth & Access). APE/V: all 4 uids resolve via /api/dashboards/uid/<id>; mc-health green on clean install. Depends on OPS-19",
+    ),
+
+    "OPS-24": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/tiresias-cost-exporter/main.go",
+            "deploy/appliance/tiresias-cost-exporter/Dockerfile",
+            "deploy/appliance/tiresias-cost-exporter/go.mod",
+            "deploy/appliance/tiresias-cost-exporter/README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-24-cost-exporter",
+        notes="plan D §3.1 + SAL-2657; Go 150-LOC exporter scrapes tiresias_audit_log every 60s, emits mc_tokens_total{tenant_id,persona_id,model,provider} + mc_cost_usd_total{...} gauges via /metrics. Risk R5: qwen3 weaker on Go — template from existing mcp-gateway exporters; fallback deepseek if qwen falters. APE/V: /metrics returns counters with labels. Depends on OPS-17 + OPS-23",
+    ),
+
+    "OPS-25": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/alertmanager/budget_rules.yml",
+            "deploy/appliance/alertmanager/budget_rules_README.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-25-budget-alerts",
+        notes="plan D §3.1 + SAL-2658; per-tenant daily budget (default $10) + per-persona monthly budget (default $50) Prometheus alert rules → Slack webhook to #batcave (C0ASAKFTR1C). APE/V: synthetic $15 test row in tiresias_audit_log → #batcave alert within 120s. Depends on OPS-21 + OPS-24",
+    ),
+
+    "OPS-27": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/restic/restore.sh",
+            "scripts/mc_restore.sh",
+            "tests/test_restic_restore.sh",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-27-restic-restore",
+        notes="plan D §3.4 + SAL-2660; ./mc.sh restore --snapshot <id> walks operator through restic restore with KEK-derived password; RTO 20min target. APE/V: tamper a volume, run restore, smoke_test.sh passes after. Depends on OPS-26",
+    ),
+
+    "OPS-28": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/alertmanager/budget_rules.yml",),
+        new_paths=(
+            "deploy/appliance/DISASTER_RECOVERY.md",
+            "deploy/appliance/alertmanager/stale_backup_rule.yml",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-28-dr-runbook",
+        notes="plan D §3.4 + SAL-2661; DISASTER_RECOVERY.md with 3 scenarios (disk failure, whole-host loss, ransomware); 36h-stale-backup Prometheus alert. APE/V: DR doc exists with all 3 scenarios; synthetic 37h since last snapshot fires alert to #batcave. Depends on OPS-20 + OPS-21 + OPS-26",
+    ),
+
+    # ── Epic E · soul-svc PQ wire-up (SS-08, conditional) ────────────────
+    "SS-08": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "routers/challenge.py",
+        ),
+        new_paths=(
+            "tests/test_challenge_verify_receipt.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss08-pq-receipt",
+        notes="plan E §5.1 S-08 + SAL-2669 [CONDITIONAL on D2 approval]; POST /v1/challenge/verify with {tenant_id, ed25519_sig, mldsa44_sig, nonce} returns JWS-signed {receipt, pubkey_sha, signed_at}; Portal wizard screen 4 renders PQ-verified badge; pq_crypto_lib already vendored. Risk R4: requires Cristian sign-off on JWS claims schema before merge. Defer if D2 not approved.",
+    ),
+
+    # ── Epic C amendment · C-29 (multi-tenant E2E folded into F21) ───────
+    "C-29": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "tests/fleet/e2e/__init__.py",
+            "tests/fleet/e2e/test_multitenant.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/c29-multitenant-e2e",
+        notes="plan C §5 C-29 + SAL-2677; extends F21 1-hub-3-endpoints suite — one endpoint hosts two tenants (acme-corp + beta-industries); 3 assertion classes: (1) memory isolation, (2) cross-tenant policy leakage, (3) blackout recovery preserves per-tenant global_seq independence. APE/V: pytest tests/fleet/e2e/test_multitenant.py green; jq '.tenant_id' e2e_audit.jsonl | sort -u | wc -l == 2; entire F21 suite runs <15min. Depends on C-26 + C-27 + C-28 + F21",
+    ),
 }
 
 
