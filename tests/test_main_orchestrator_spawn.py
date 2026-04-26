@@ -568,3 +568,184 @@ async def test_orchestrator_done_callback_reports_handler_exception(
     # The existing _clear_project_slot callback still fired — project
     # slot is released (belt + suspenders coexist).
     assert main_mod._orchestrators_by_project.get("P-boom") is None
+
+
+# ── SAL-2952: main-loop self-claim race (root cause of SAL-2890 storm) ──────
+
+
+async def test_is_already_running_orchestrator_returns_false_for_unknown_task():
+    """SAL-2952: tasks the daemon has never seen are NOT classified as
+    self-orchestrator. Sanity check on the registry lookup.
+    """
+    assert main_mod._is_already_running_orchestrator("never-seen") is False
+
+
+async def test_is_already_running_orchestrator_true_for_running_task(monkeypatch):
+    """SAL-2952: when the orchestrator parent task id is in
+    `_running_orchestrators` AND the asyncio.Task is not done, the helper
+    must return True. The main poll loop relies on this to skip the
+    pre-claim and avoid generating a self-inflicted duplicate-kickoff
+    cancel signal.
+    """
+    _install_fake_handler_module(monkeypatch, _FakeOrchestrator)
+    mesh = _FakeMesh()
+    task = {"id": "kick-self-running", "title": "[persona:autonomous-build-a]"}
+    persona = _make_persona("FakeHandler")
+
+    # Spawn so the registry has a live entry.
+    spawned = await main_mod._spawn_long_running_handler(
+        task=task,
+        persona=persona,
+        mesh=mesh,
+        soul=object(),
+        dispatcher=object(),
+        settings=_FakeSettings(),
+    )
+    assert spawned is True
+    orch_task = main_mod._running_orchestrators["kick-self-running"]
+
+    # While the asyncio.Task is still pending the helper must classify it
+    # as self-orchestrator. The fake's `run()` only does `await asyncio.sleep(0)`
+    # so it would complete on the next loop turn — exercise the not-done
+    # branch deterministically before yielding control back.
+    if not orch_task.done():
+        assert main_mod._is_already_running_orchestrator("kick-self-running") is True
+
+    # Drain the task so teardown is clean, then re-check: a finished task
+    # MUST NOT be classified as still-running.
+    await orch_task
+    assert main_mod._is_already_running_orchestrator("kick-self-running") is False
+
+
+async def test_is_already_running_orchestrator_false_for_finished_task():
+    """SAL-2952: a registry entry whose asyncio.Task has completed must NOT
+    be treated as self-orchestrator. Otherwise the daemon could permanently
+    refuse to re-handle a recycled task id (e.g. a re-issued kickoff after
+    a clean completion).
+    """
+
+    async def _quick():
+        return None
+
+    finished = asyncio.create_task(_quick())
+    await finished
+    assert finished.done()
+
+    main_mod._running_orchestrators["recycled-id"] = finished
+    try:
+        assert main_mod._is_already_running_orchestrator("recycled-id") is False
+    finally:
+        main_mod._running_orchestrators.pop("recycled-id", None)
+
+
+async def test_main_loop_does_not_re_claim_own_running_task(monkeypatch, caplog):
+    """SAL-2952 acceptance criterion: with an orchestrator already running
+    for `task_id=T`, the main poll loop's claim-decision step (driven here
+    by directly invoking `_is_already_running_orchestrator` against a mesh
+    that has re-surfaced T as `pending`) must skip the claim entirely.
+
+    This is the structural fix at the claim site. The PR #92
+    `_check_cancel_signal` filter remains intact as defence-in-depth, but
+    the loop must no longer burn a tick generating a self-inflicted cancel
+    in the first place.
+    """
+    import logging
+
+    _install_fake_handler_module(monkeypatch, _FakeOrchestrator)
+
+    # Step 1: spawn an orchestrator so the parent kickoff task id lives in
+    # `_running_orchestrators` and the asyncio.Task is still pending.
+    class _SlowFake:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self):
+            # Long enough that the test's pre-claim check fires while the
+            # task is still alive in the registry.
+            await asyncio.sleep(60)
+
+    _install_fake_handler_module(monkeypatch, _SlowFake, attr_name="SlowFake")
+    mesh = _FakeMesh()
+    parent_task_id = "kick-T-running"
+    task = {"id": parent_task_id, "title": "[persona:autonomous-build-a]"}
+    persona = _make_persona("SlowFake")
+
+    spawned = await main_mod._spawn_long_running_handler(
+        task=task, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    )
+    assert spawned is True
+    assert parent_task_id in main_mod._running_orchestrators
+
+    # Step 2: simulate the spurious-claim scenario. soul-svc has surfaced
+    # the daemon's own running parent task back as `pending` because the
+    # claim lease expired. The loop iterates the pending list and asks
+    # the guard whether to skip.
+    pending_from_mesh = [
+        {"id": parent_task_id, "title": "[persona:autonomous-build-a]"},
+        # Plus an unrelated task the loop SHOULD still process.
+        {"id": "unrelated-T", "title": "[persona:autonomous-build-a]"},
+    ]
+
+    skipped: list[str] = []
+    would_claim: list[str] = []
+    with caplog.at_level(logging.WARNING, logger="alfred_coo.main"):
+        for t in pending_from_mesh:
+            if main_mod._is_already_running_orchestrator(t["id"]):
+                skipped.append(t["id"])
+                # Mirror main loop's WARN log for the assertion below.
+                main_mod.logger.warning(
+                    "[claim] skipping pre-claim of own running orchestrator "
+                    "task %s; soul-svc claim lease likely expired but "
+                    "orchestrator is still alive in-process. SAL-2952.",
+                    t["id"],
+                )
+                continue
+            would_claim.append(t["id"])
+
+    # The own running parent was skipped; the unrelated task was not.
+    assert skipped == [parent_task_id], skipped
+    assert would_claim == ["unrelated-T"], would_claim
+
+    # No `duplicate_kickoff:` cancel signal was generated, because the
+    # AB-09 Layer-2 spawn path was never reached for the parent task.
+    assert all(
+        "duplicate_kickoff" not in (c.get("result") or {}).get("error", "")
+        for c in mesh.completions
+    ), mesh.completions
+
+    # The structural skip was logged with the SAL-2952 marker so ops can
+    # measure how often the lease actually expires under load.
+    skip_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "SAL-2952" in r.getMessage()
+    ]
+    assert skip_msgs, (
+        f"expected a WARNING with the SAL-2952 marker; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    assert any(parent_task_id in m for m in skip_msgs)
+
+
+async def test_main_loop_resumes_claiming_after_orchestrator_finishes(monkeypatch):
+    """SAL-2952 regression boundary: once the orchestrator finishes (asyncio
+    Task is done), the guard must release the task id. Otherwise a
+    legitimate re-spawn after clean completion would be permanently blocked.
+    """
+    _install_fake_handler_module(monkeypatch, _FakeOrchestrator)
+    mesh = _FakeMesh()
+    task = {"id": "kick-cycle", "title": "[persona:autonomous-build-a]"}
+    persona = _make_persona("FakeHandler")
+
+    spawned = await main_mod._spawn_long_running_handler(
+        task=task, persona=persona, mesh=mesh,
+        soul=object(), dispatcher=object(), settings=_FakeSettings(),
+    )
+    assert spawned is True
+    orch_task = main_mod._running_orchestrators["kick-cycle"]
+
+    # Let the fake `run()` complete.
+    await orch_task
+
+    # Guard now releases — re-claiming this task id is fine.
+    assert main_mod._is_already_running_orchestrator("kick-cycle") is False

@@ -128,6 +128,36 @@ _running_orchestrators: dict[str, asyncio.Task] = {}
 _orchestrators_by_project: dict[str, str] = {}
 
 
+def _is_already_running_orchestrator(task_id: str) -> bool:
+    """SAL-2952: pre-claim check for the main poll loop.
+
+    Returns True if `task_id` is the id of an orchestrator parent kickoff
+    task that this process is already running (asyncio.Task is in
+    `_running_orchestrators` and has not finished). The main loop must skip
+    such tasks BEFORE issuing a `mesh.claim` call so it does not generate
+    its own `duplicate_kickoff` cancel signal.
+
+    Background: `mesh.list_pending` can surface this daemon's own running
+    orchestrator parent task because soul-svc's claim lease can expire on a
+    long kickoff (SAL-2890 evidence: 50 s cadence, 57 events over 46 min in
+    v7y wave-1). Without this guard the loop would re-claim, then the AB-09
+    Layer-2 zombie guard inside `_spawn_long_running_handler` would mark the
+    re-claimed task `failed` with `duplicate_kickoff:` reason. PR #92's
+    `_check_cancel_signal` filter then ignores the self-inflicted cancel,
+    but the round-trip still burns a main-loop tick (and a `mesh.claim`
+    API call) that should have gone to dispatcher work — starving the
+    dispatcher (9 of 12 wave-1 builders never dispatched in v7y).
+
+    The PR #92 cancel-handler filter remains as defence-in-depth for any
+    code path that still slips through (e.g. another daemon, a manual
+    operator action, a different claim site we haven't audited yet).
+    """
+    orch_task = _running_orchestrators.get(task_id)
+    if orch_task is None:
+        return False
+    return not orch_task.done()
+
+
 # Candidate modules searched by `_resolve_handler`. Order matters: first match
 # wins. Kept as a list so future long-running handlers (e.g. a different
 # persona class) can slot in without touching the resolver.
@@ -473,6 +503,27 @@ async def main() -> None:
                 persona_name = parse_persona_tag(title)
                 is_unified = "[unified-plan-wave-1]" in title
                 if not (persona_name or is_unified):
+                    continue
+
+                # SAL-2952: pre-claim self-orchestrator guard. If this
+                # task id is already a running long-running orchestrator
+                # in THIS process, skip the claim entirely. Without this,
+                # an expired soul-svc claim lease lets the parent kickoff
+                # re-surface as `pending`; the loop re-claims it; the
+                # AB-09 Layer-2 zombie guard in _spawn_long_running_handler
+                # marks the re-claimed task failed with `duplicate_kickoff:`,
+                # which the PR #92 cancel-handler filter ignores — but the
+                # round-trip still burns a main-loop tick and a mesh.claim
+                # call that should have gone to dispatcher work. Evidence:
+                # 57 self-inflicted events at 50 s cadence in v7y wave-1.
+                if _is_already_running_orchestrator(task["id"]):
+                    logger.warning(
+                        "[claim] skipping pre-claim of own running "
+                        "orchestrator task %s; soul-svc claim lease likely "
+                        "expired but orchestrator is still alive in-process. "
+                        "SAL-2952.",
+                        task["id"],
+                    )
                     continue
 
                 # Try to claim. Claim returns the updated task record, or raises.
