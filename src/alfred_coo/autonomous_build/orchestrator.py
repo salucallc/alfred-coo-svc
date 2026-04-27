@@ -4087,6 +4087,11 @@ class AutonomousBuildOrchestrator:
             f"\n"
             f"Use constrained prompt: 2-tool-call budget, <300 char body.\n"
             f"Approve with APPROVE; else REQUEST_CHANGES with actionable notes.\n"
+            f"Gate 4 (per-criterion evidence) is mandatory: for each APE/V "
+            f"criterion either quote one diff line of evidence OR mark "
+            f"DEFERRED-RUNTIME-VERIFICATION; reject placeholder/stub bodies "
+            f"(`assert True`, `pass`, `NotImplementedError`) and any plan-doc "
+            f"that admits 'Placeholder implementations may need to be replaced'.\n"
         )
         resp = await self.mesh.create_task(
             title=title,
