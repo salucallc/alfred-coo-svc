@@ -1,42 +1,48 @@
 #!/usr/bin/env bash
 # migrate_state_secrets.sh
-# This script migrates legacy state secrets to Infisical and secures the original files.
+# Migrates legacy state secrets to Infisical and secures the original files.
 
 set -euo pipefail
 
-# OPS-08 placeholder guard.
-# This script was merged as scaffolding only (PR #166). The Infisical CLI
-# integration, secret-push loop, and verification steps are NOT wired.
-# Refuse to execute so accidental runs can't half-migrate state or chmod 000
-# the originals before they're actually copied anywhere.
-#
-# The structure below (STATE_DIR / TARGET_DIR / loop / chmod) is preserved
-# as a design artifact for the OPS-08c child ticket to replace.
-echo "OPS-08 placeholder -- Infisical client not wired. See SAL-2641 and child OPS-08c. Refusing to run." >&2
-exit 1
+# Parse dry-run flag
+DRY_RUN=false
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN=true
+fi
 
-# --- Scaffolding below this line is intentionally unreachable. ---
-# It documents the intended shape of the real migration for OPS-08c.
-
+# Directory containing legacy secrets
 STATE_DIR="./state/secrets"
-TARGET_DIR="/app/infisical/secrets"
-
 if [ ! -d "$STATE_DIR" ]; then
   echo "State directory $STATE_DIR does not exist. Exiting."
   exit 0
 fi
 
-mkdir -p "$TARGET_DIR"
+# Expected number of secrets (optional, can be set via env var)
+EXPECTED_COUNT=${EXPECTED_COUNT:-0}
 
-# Example: iterate over files and push to Infisical via CLI (placeholder)
-for file in "$STATE_DIR"/*; do
-  [ -e "$file" ] || continue
+# Gather secret files
+mapfile -t files < <(find "$STATE_DIR" -type f)
+actual_count="${#files[@]}"
+
+if [ "$EXPECTED_COUNT" -ne 0 ] && [ "$actual_count" -lt "$EXPECTED_COUNT" ]; then
+  echo "ERROR: missing secret" >&2
+  exit 1
+fi
+
+# Ensure target directory exists (placeholder, not used by Infisical directly)
+mkdir -p "/app/infisical/secrets"
+
+for file in "${files[@]}"; do
   secret_name=$(basename "$file")
-  # Placeholder: infisical-cli secret set $secret_name "$(cat $file)"
-  echo "Would import $secret_name to Infisical"
+  secret_value=$(cat "$file")
+  cmd="infisical-cli secret set --env=dev --path=/app/infisical/secrets $secret_name=\"$secret_value\""
+  if $DRY_RUN; then
+    echo "$cmd"
+  else
+    eval "$cmd"
+  fi
 done
 
 # Secure the original secret files
 chmod 000 -R "$STATE_DIR"
-
 echo "Migration completed. Original state secrets are now chmod 000."
