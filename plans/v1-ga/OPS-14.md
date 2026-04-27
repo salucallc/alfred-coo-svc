@@ -1,16 +1,20 @@
-# OPS-14: Scoped OAuth2 API tokens
+# OPS-14: Scoped OAuth2 client_credentials flow
 
 ## Target paths
-- deploy/appliance/authelia/oauth2_clients.yml
-- src/alfred_coo/auth/scoped_tokens.py
-- tests/test_scoped_oauth_tokens.py
+- `deploy/appliance/authelia/oauth2_clients.yml`
+- `src/alfred_coo/auth/scoped_tokens.py`
+- `tests/test_scoped_oauth_tokens.py`
+- `plans/v1-ga/OPS-14.md`
 
 ## Acceptance criteria
-Token with scope soul:memory:read -> 200 on search endpoint, 403 on write; 24h TTL enforced; portal rotation UI issues new token
+- Token with scope soul:memory:read -> 200 on search endpoint, 403 on write; 24h TTL enforced; portal rotation UI issues new token
 
 ## Verification approach
-Unit test validates token retrieval; manual curl to Authelia confirms scopes and TTL; portal UI rotation creates fresh token.
+- Unit test `tests/test_scoped_oauth_tokens.py` validates token retrieval.
+- Manual curl to Authelia token endpoint confirms 200 response and correct TTL.
+- Integration test against search endpoint verifies 200 for read scope and 403 for write scope.
 
 ## Risks
-- Secret leakage if client_secret is hard‑coded (mitigated by env injection)
-- TTL enforcement relies on Authelia config correctness
+- Misconfiguration of client secret could lock out services.
+- TTL mismatch may cause unexpected token expiration.
+- Scope spelling errors could lead to unauthorized access.
