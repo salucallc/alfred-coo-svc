@@ -146,6 +146,17 @@ class Ticket:
     # elapsed and the ticket should flip back to PENDING. ``None`` outside
     # the BACKED_OFF state.
     backed_off_at: Optional[float] = None
+    # SAL-2870 (phantom-child carve-out, 2026-04-26): short tag describing
+    # the most recent FAILED transition's root cause. Read by the retry-
+    # budget sweep in ``_poll_children`` so the sweep can route ``phantom_*``
+    # cleanups STRAIGHT to PENDING (no BACKED_OFF, no retry-count bump)
+    # while real failures (silent_complete, no_pr_url, mesh-failed,
+    # review_changes) still pass through the BACKED_OFF cooling window.
+    # Cleared by the sweep once handled so it doesn't leak across rounds.
+    # Values currently emitted by orchestrator: ``"phantom_child"`` (AB-17-x
+    # force-fail) + ``"no_child_task_id"`` (AB-17-y orphan-active force-fail).
+    # ``None`` when the ticket has never failed in this run.
+    last_failure_reason: Optional[str] = None
     # Raw Linear state name for debugging / resume logic.
     linear_state: str = ""
 
