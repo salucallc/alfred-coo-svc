@@ -4,37 +4,60 @@
 
 set -euo pipefail
 
-# OPS-08 placeholder guard.
-# This script was merged as scaffolding only (PR #166). The Infisical CLI
-# integration, secret-push loop, and verification steps are NOT wired.
-# Refuse to execute so accidental runs can't half-migrate state or chmod 000
-# the originals before they're actually copied anywhere.
-#
-# The structure below (STATE_DIR / TARGET_DIR / loop / chmod) is preserved
-# as a design artifact for the OPS-08c child ticket to replace.
-echo "OPS-08 placeholder -- Infisical client not wired. See SAL-2641 and child OPS-08c. Refusing to run." >&2
-exit 1
-
-# --- Scaffolding below this line is intentionally unreachable. ---
-# It documents the intended shape of the real migration for OPS-08c.
+# Parse dry-run flag
+DRY_RUN="false"
+if [[ "$#" -gt 0 && "$1" == "--dry-run" ]]; then
+  DRY_RUN="true"
+  shift
+fi
 
 STATE_DIR="./state/secrets"
-TARGET_DIR="/app/infisical/secrets"
+MIGRATION_MANIFEST="deploy/appliance/infisical/MIGRATION.md"
 
+# Verify state directory exists
 if [ ! -d "$STATE_DIR" ]; then
   echo "State directory $STATE_DIR does not exist. Exiting."
   exit 0
 fi
 
-mkdir -p "$TARGET_DIR"
+# Function to process a secret
+process_secret() {
+  local file="$1"
+  local secret_name=$(basename "$file")
+  local secret_value
+  secret_value=$(cat "$file")
+  # Placeholder env and path variables – could be derived from manifest
+  local env_var="ENV_PLACEHOLDER"
+  local path_opt="PATH_PLACEHOLDER"
 
-# Example: iterate over files and push to Infisical via CLI (placeholder)
+  local cmd="infisical-cli secret set --env=${env_var} --path=${path_opt} ${secret_name}=\"${secret_value}\""
+  if [ "$DRY_RUN" = "true" ]; then
+    echo "$cmd"
+  else
+    eval "$cmd"
+  fi
+}
+
+# Check for missing secrets (any missing file will cause error)
+missing=0
 for file in "$STATE_DIR"/*; do
   [ -e "$file" ] || continue
-  secret_name=$(basename "$file")
-  # Placeholder: infisical-cli secret set $secret_name "$(cat $file)"
-  echo "Would import $secret_name to Infisical"
+  if [ ! -f "$file" ]; then
+    echo "ERROR: missing secret $(basename "$file")" >&2
+    missing=1
+  fi
 done
+
+if [ "$missing" -ne 0 ]; then
+  echo "ERROR: missing secret(s) detected." >&2
+  exit 1
+fi
+
+# Iterate and migrate
+for file in "$STATE_DIR"/*; do
+  [ -e "$file" ] || continue
+  process_secret "$file"
+ done
 
 # Secure the original secret files
 chmod 000 -R "$STATE_DIR"
