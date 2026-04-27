@@ -4,50 +4,44 @@
 
 set -euo pipefail
 
-# Handle dry-run flag
+# Parse arguments for dry-run flag
 DRY_RUN=false
-if [[ "$#" -ge 1 && "$1" == "--dry-run" ]]; then
-  DRY_RUN=true
-  shift
-fi
+for arg in "$@"; do
+  if [[ "$arg" == "--dry-run" ]]; then
+    DRY_RUN=true
+  fi
+done
 
-# Environment variables for Infisical (can be overridden)
-INFISICAL_ENV="${INFISICAL_ENV:-default}"
-INFISICAL_PATH="${INFISICAL_PATH:-/}"
+# Source migration manifest if present (expects export statements for ENV and PATH)
+MANIFEST="deploy/appliance/infisical/MIGRATION.md"
+if [ -f "$MANIFEST" ]; then
+  # shellcheck source=/dev/null
+  source "$MANIFEST"
+fi
 
 STATE_DIR="./state/secrets"
 TARGET_DIR="/app/infisical/secrets"
 
-if [[ ! -d "$STATE_DIR" ]]; then
+if [ ! -d "$STATE_DIR" ]; then
   echo "State directory $STATE_DIR does not exist. Exiting."
   exit 0
 fi
 
 mkdir -p "$TARGET_DIR"
 
-# Determine expected secret files (all files in STATE_DIR)
-expected_files=()
-while IFS= read -r -d $'\0' file; do
-  expected_files+=("$(basename "$file")")
-done < <(find "$STATE_DIR" -type f -print0)
-
-# Verify all expected secrets are present
-for secret in "${expected_files[@]}"; do
-  if [[ ! -f "$STATE_DIR/$secret" ]]; then
-    echo "ERROR: missing secret $secret" >&2
-    exit 1
-  fi
-done
-
-# Process each secret
-for secret in "${expected_files[@]}"; do
-  secret_path="$STATE_DIR/$secret"
-  secret_value="$(cat "$secret_path")"
-  cmd="infisical-cli secret set --env=\"$INFISICAL_ENV\" --path=\"$INFISICAL_PATH\" $secret=\"$secret_value\""
-  if $DRY_RUN; then
-    echo "$cmd"
+# Iterate over secret files and push to Infisical
+for file in "$STATE_DIR"/*; do
+  [ -e "$file" ] || continue
+  secret_name=$(basename "$file")
+  secret_value=$(cat "$file")
+  if [ "$DRY_RUN" = "true" ]; then
+    echo "infisical-cli secret set --env=$INFISICAL_ENV --path=$INFISICAL_PATH $secret_name=\"$secret_value\""
   else
-    eval "$cmd"
+    if [ -z "$secret_value" ]; then
+      echo "ERROR: missing secret $secret_name" >&2
+      exit 1
+    fi
+    infisical-cli secret set --env=$INFISICAL_ENV --path=$INFISICAL_PATH $secret_name="$secret_value"
   fi
 done
 

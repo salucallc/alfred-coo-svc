@@ -1,33 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prepare fixture directory
-FIXTURE_DIR="./state/secrets"
-mkdir -p "$FIXTURE_DIR"
+# Determine repository root
+REPO_ROOT=$(git rev-parse --show-toplevel)
+SCRIPT="$REPO_ROOT/deploy/appliance/infisical/migrate_state_secrets.sh"
+
+# Create temporary fixture directory
+TMPDIR=$(mktemp -d)
+STATE_DIR="$TMPDIR/state/secrets"
+mkdir -p "$STATE_DIR"
 
 # Create mock secret files
-echo "value1" > "$FIXTURE_DIR/secret1"
-echo "value2" > "$FIXTURE_DIR/secret2"
+echo "valueA" > "$STATE_DIR/SECRET_A"
+echo "valueB" > "$STATE_DIR/SECRET_B"
 
-# Export env vars used by the migration script
-export INFISICAL_ENV="testenv"
+# Export expected env vars for the script (as defined in MIGRATION.md)
+export INFISICAL_ENV="test-env"
 export INFISICAL_PATH="/test/path"
 
-# Run migration script in dry‑run mode and capture output
-output=$(bash ../../deploy/appliance/infisical/migrate_state_secrets.sh --dry-run)
+# Run dry-run and capture output
+DRY_OUTPUT=$($SCRIPT --dry-run 2>&1)
 
-# Assert both expected commands are echoed
-echo "$output" | grep -q 'infisical-cli secret set --env="testenv" --path="/test/path" secret1="value1"'
-echo "$output" | grep -q 'infisical-cli secret set --env="testenv" --path="/test/path" secret2="value2"'
+# Verify that expected commands are echoed
+echo "$DRY_OUTPUT" | grep -q "infisical-cli secret set --env=$INFISICAL_ENV --path=$INFISICAL_PATH SECRET_A=\"valueA\""
+echo "$DRY_OUTPUT" | grep -q "infisical-cli secret set --env=$INFISICAL_ENV --path=$INFISICAL_PATH SECRET_B=\"valueB\""
 
-# Now test failure when a secret is missing
-rm "$FIXTURE_DIR/secret2"
-if bash ../../deploy/appliance/infisical/migrate_state_secrets.sh; then
-  echo "Expected failure due to missing secret" >&2
+# Ensure exit code was zero (dry-run should not fail)
+# The script already exits on error; reaching here means success
+
+# Remove one secret to simulate missing secret
+rm "$STATE_DIR/SECRET_B"
+
+# Run real migration, expect failure
+set +e
+REAL_OUTPUT=$($SCRIPT 2>&1)
+EXIT_CODE=$?
+set -e
+if [ $EXIT_CODE -eq 0 ]; then
+  echo "Expected failure due to missing secret, but script exited 0"
   exit 1
-else
-  err=$(bash ../../deploy/appliance/infisical/migrate_state_secrets.sh 2>&1 || true)
-  echo "$err" | grep -q 'ERROR: missing secret secret2'
 fi
 
-echo "All tests passed."
+echo "$REAL_OUTPUT" | grep -q "ERROR: missing secret SECRET_B"
+
+# Cleanup
+chmod -R 777 "$TMPDIR" || true
+rm -rf "$TMPDIR"
+
+echo "All tests passed"
