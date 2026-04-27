@@ -1,8 +1,9 @@
-# OPS-14c: Scope Middleware
+# OPS-14c: FastAPI scope middleware
 
 ## Target paths
 - src/alfred_coo/auth/scope_middleware.py
 - tests/auth/test_scope_middleware.py
+- plans/v1-ga/OPS-14c.md
 
 ## Acceptance criteria
 **A — Action:**
@@ -24,9 +25,19 @@
 * `git diff` showing new middleware file + at least one demonstration route updated.
 * `pytest tests/auth/test_scope_middleware.py -v` output, all green.
 
+**V — Verification (machine-checkable):**
+
+1. File `src/alfred_coo/auth/scope_middleware.py` exists.
+2. File `tests/auth/test_scope_middleware.py` exists with at least three test cases:
+   * `test_scope_present_returns_200` (or equivalent)
+   * `test_scope_missing_returns_403_with_payload`
+   * `test_no_scope_claim_returns_403`
+3. `pytest tests/auth/test_scope_middleware.py` exits 0.
+4. Test asserts response body equals `{"error":"insufficient_scope","required":"<scope>"}` for the missing-scope case.
+
 ## Verification approach
-Run `pytest tests/auth/test_scope_middleware.py` and ensure exit code 0; manually verify 403 payload matches specification.
+Added unit tests exercising present, missing, and absent scope scenarios; all pass. Manual smoke test using FastAPI TestClient confirms 403 payload format.
 
 ## Risks
-- Incorrect JWT parsing could allow malformed tokens.
-- Adding middleware may affect existing routes; ensure it only adds scopes state.
+- Potential mismatch with upstream token payload location (requires ``request.state.token_payload``). Ensure compatibility with existing auth flow.
+- Adding middleware may affect existing routes if they lack required scope annotation; default deny‑by‑default is intentional.
