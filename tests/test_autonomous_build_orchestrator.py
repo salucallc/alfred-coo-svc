@@ -5414,12 +5414,17 @@ async def test_grounding_gap_link_in_escalate_comment_matches_record_event_id(
 
     monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
 
-    # Inject a fake ``linear_add_comment`` spec into BUILTIN_TOOLS for
-    # this test — the real tool isn't registered yet and the helper has
-    # a defensive ``if spec is None: return`` short-circuit. Restore the
-    # original entry on teardown via monkeypatch.setitem so other tests
-    # don't see our stub.
+    # Override the registered ``linear_add_comment`` spec with a spy so
+    # we can capture the body string without making real HTTP calls. The
+    # tool IS registered (since fix/register-linear-add-comment-tool); we
+    # rely on monkeypatch.setitem to restore the live spec on teardown so
+    # other tests in the same session still see the real handler.
     from alfred_coo import tools as _tools
+
+    assert "linear_add_comment" in _tools.BUILTIN_TOOLS, (
+        "linear_add_comment must be registered for this test to assert "
+        "the comment-write call is actually attempted (audit-trail invariant)"
+    )
 
     captured: dict = {}
 

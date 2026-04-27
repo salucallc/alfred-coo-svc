@@ -623,18 +623,24 @@ async def test_current_task_id_isolated_per_task():
 # ── AB-03: slack_ack_poll + linear_* helpers ────────────────────────────────
 
 from alfred_coo.tools import (  # noqa: E402
+    linear_add_comment,
     linear_get_issue_relations,
     linear_list_project_issues,
     linear_update_issue_state,
     slack_ack_poll,
 )
-from alfred_coo.tools import _LINEAR_TEAM_STATES_CACHE  # noqa: E402
+from alfred_coo.tools import (  # noqa: E402
+    _LINEAR_ISSUE_UUID_CACHE,
+    _LINEAR_TEAM_STATES_CACHE,
+)
 
 
 def test_ab03_tools_registered():
     for name in (
         "slack_ack_poll",
         "linear_update_issue_state",
+        "linear_add_label_to_issue",
+        "linear_add_comment",
         "linear_list_project_issues",
         "linear_get_issue_relations",
     ):
@@ -1145,6 +1151,136 @@ async def test_linear_update_issue_state_unknown_state(monkeypatch):
     assert "not found" in result["error"]
     assert "available_states" in result
     assert "backlog" in result["available_states"]
+
+
+# ── linear_add_comment ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_linear_add_comment_missing_key(monkeypatch):
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("ALFRED_OPS_LINEAR_API_KEY", raising=False)
+    result = await linear_add_comment("SAL-2680", "hello")
+    assert "error" in result
+    assert "LINEAR_API_KEY" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_linear_add_comment_resolves_and_creates(monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_fake")
+    _LINEAR_ISSUE_UUID_CACHE.clear()
+    issue_uuid = "issue-uuid-2680"
+    captured = _install_urlopen_queue(monkeypatch, [
+        # 1. issue lookup (UUID resolution)
+        {"data": {"issue": {
+            "id": issue_uuid,
+            "identifier": "SAL-2680",
+        }}},
+        # 2. commentCreate mutation
+        {"data": {"commentCreate": {
+            "success": True,
+            "comment": {
+                "id": "comment-uuid-1",
+                "url": "https://linear.app/saluca/issue/SAL-2680#comment-comment-uuid-1",
+            },
+        }}},
+    ])
+    result = await linear_add_comment("SAL-2680", "## audit\nbody text")
+    assert result["ok"] is True
+    assert result["comment_id"] == "comment-uuid-1"
+    assert result["url"].endswith("comment-uuid-1")
+    assert result["identifier"] == "SAL-2680"
+
+    # Verify the second request was a commentCreate mutation with the
+    # resolved UUID + body in the GraphQL variables.
+    assert len(captured) == 2
+    mutation_payload = json.loads(captured[1].data.decode("utf-8"))
+    assert "commentCreate" in mutation_payload["query"]
+    variables = mutation_payload["variables"]
+    assert variables["input"]["issueId"] == issue_uuid
+    assert variables["input"]["body"] == "## audit\nbody text"
+
+    # Cache populated for both the input form and the resolved identifier.
+    assert _LINEAR_ISSUE_UUID_CACHE.get("SAL-2680") == issue_uuid
+
+
+@pytest.mark.asyncio
+async def test_linear_add_comment_caches_uuid_resolution(monkeypatch):
+    """Second call with the same identifier must NOT re-issue the lookup
+    query. Only the commentCreate mutation should hit the wire on call #2.
+    """
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_fake")
+    _LINEAR_ISSUE_UUID_CACHE.clear()
+    issue_uuid = "issue-uuid-2680"
+
+    # Call 1: lookup + mutation.
+    captured1 = _install_urlopen_queue(monkeypatch, [
+        {"data": {"issue": {
+            "id": issue_uuid,
+            "identifier": "SAL-2680",
+        }}},
+        {"data": {"commentCreate": {
+            "success": True,
+            "comment": {"id": "c1", "url": "u1"},
+        }}},
+    ])
+    r1 = await linear_add_comment("SAL-2680", "first")
+    assert r1["ok"] is True
+    assert len(captured1) == 2
+
+    # Call 2: cache hit — only the mutation is queued. If the function
+    # tried to re-issue the lookup, _install_urlopen_queue would raise
+    # because the queue would underflow on the second pop.
+    captured2 = _install_urlopen_queue(monkeypatch, [
+        {"data": {"commentCreate": {
+            "success": True,
+            "comment": {"id": "c2", "url": "u2"},
+        }}},
+    ])
+    r2 = await linear_add_comment("SAL-2680", "second")
+    assert r2["ok"] is True
+    assert r2["comment_id"] == "c2"
+    # Exactly one HTTP call -> the mutation, not the lookup.
+    assert len(captured2) == 1
+    only_payload = json.loads(captured2[0].data.decode("utf-8"))
+    assert "commentCreate" in only_payload["query"]
+
+
+@pytest.mark.asyncio
+async def test_linear_add_comment_mutation_failure_returns_error(monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_fake")
+    _LINEAR_ISSUE_UUID_CACHE.clear()
+    _install_urlopen_queue(monkeypatch, [
+        {"data": {"issue": {
+            "id": "uuid-x",
+            "identifier": "SAL-2680",
+        }}},
+        # Linear returned success=false (the failure mode the spec calls out).
+        {"data": {"commentCreate": {"success": False, "comment": None}}},
+    ])
+    result = await linear_add_comment("SAL-2680", "body")
+    assert "error" in result
+    assert "success=false" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_linear_add_comment_unknown_issue_returns_error(monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_fake")
+    _LINEAR_ISSUE_UUID_CACHE.clear()
+    _install_urlopen_queue(monkeypatch, [
+        {"data": {"issue": None}},
+    ])
+    result = await linear_add_comment("SAL-NOT-REAL", "body")
+    assert "error" in result
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_linear_add_comment_rejects_empty_body(monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_fake")
+    result = await linear_add_comment("SAL-2680", "")
+    assert "error" in result
+    assert "body" in result["error"]
 
 
 @pytest.mark.asyncio
