@@ -1305,7 +1305,7 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     # replaces the placeholder infisical-cli calls in the existing stub
     # `migrate_state_secrets.sh` with the real implementation. Without a
     # _TARGET_HINTS entry the v7ah no_hint-excusal path skipped it.
-    "OPS-08c": TargetHint(
+    "OPS-08C": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
         paths=("deploy/appliance/infisical/migrate_state_secrets.sh",),
@@ -1411,7 +1411,7 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     # produced by the existing scoped_tokens module (PR #169, currently
     # NotImplementedError-wrapped by PR #170). Without a _TARGET_HINTS
     # entry the v7ah no_hint-excusal path skipped it.
-    "OPS-14c": TargetHint(
+    "OPS-14C": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
         paths=("src/alfred_coo/auth/scoped_tokens.py",),
@@ -1429,7 +1429,7 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     # Validates the 24h TTL on issued tokens — rejects expired tokens with
     # 401 and surfaces a structured error. Without a _TARGET_HINTS entry
     # the v7ah no_hint-excusal path skipped it.
-    "OPS-14d": TargetHint(
+    "OPS-14D": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
         paths=("src/alfred_coo/auth/scoped_tokens.py",),

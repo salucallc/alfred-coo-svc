@@ -1788,8 +1788,29 @@ def test_target_hints_entry_count_unchanged():
     OPS-04/05/16/17/23, SS-03/04/10/11/12, C-26/27/28. Bumped 46 -> 86 to
     catch up to the pre-existing wave-1/2 additions (registry was already at
     83 against the stale 46 baseline) plus the +3 wave-2 decomposition
-    children OPS-08c / OPS-14c / OPS-14d added 2026-04-27."""
+    children OPS-08C / OPS-14C / OPS-14D added 2026-04-27 (uppercase suffix
+    enforced post-PR #174 to match the orchestrator's .upper() lookup
+    pipeline; see test_target_hints_keys_are_uppercase below)."""
     assert len(_TARGET_HINTS) == 86
+
+
+def test_target_hints_keys_are_uppercase():
+    """Regression guard for the lowercase-suffix bug shipped by PR #174 and
+    fixed by PR fix/target-hints-key-casing-uppercase.
+
+    The orchestrator's code-extractor uppercases every ticket code before the
+    hint lookup (`code.upper()` at orchestrator.py L1675/L2811/L6041), so any
+    `_TARGET_HINTS` key that is not already uppercase silently becomes a
+    no_hint miss. This test feeds every key back through the same
+    `.upper()` pipeline and asserts the key is unchanged — catching any
+    future addition that accidentally uses a lowercase letter suffix
+    (e.g. ``OPS-08c``) or a stray lowercase prefix.
+    """
+    offenders = sorted(k for k in _TARGET_HINTS if k != k.upper())
+    assert offenders == [], (
+        "Found _TARGET_HINTS keys that don't survive the .upper() lookup "
+        f"pipeline; lookup will return None for these tickets: {offenders}"
+    )
 
 
 # ── AB-17-a · new result types (HintStatus / PathResult / VerificationResult)
