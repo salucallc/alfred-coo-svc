@@ -5276,3 +5276,166 @@ async def test_grounding_gap_link_in_done_comment_matches_record_event_id(
     assert f"https://linear.app/saluca/issue/{recorded_gap}" in body, (
         f"comment body missing grounding-gap URL: {body!r}"
     )
+
+
+
+# ── AB-17-v · dispatch-side human-assigned skip ────────────────────────────
+
+
+async def test_dispatch_skips_human_assigned_ticket(monkeypatch):
+    """AB-17-v: a ticket carrying the ``human-assigned`` label MUST NOT be
+    passed to ``_dispatch_child``. Wave-gate already excludes such tickets
+    from the green-ratio denominator (``_is_wave_gate_excused``), but the
+    dispatch path historically ran builders against them anyway, producing
+    stub PRs that flipped tickets Done in error (2026-04-27 incident:
+    SAL-2641, SAL-2647, +4 phantom flips).
+
+    Mirrors the existing label predicate in ``_is_wave_gate_excused`` so the
+    two sides agree on what "human-assigned" means. The dispatch-skip path
+    sets ``ticket.status = ESCALATED`` directly so the wave-loop exit
+    condition (all wave_tickets in TERMINAL_STATES) fires cleanly without
+    any external terminalisation.
+    """
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    orch.max_parallel_subs = 4
+
+    # One ticket the orchestrator SHOULD dispatch, one labelled human-assigned
+    # that it MUST skip. Both PENDING, same wave, same epic.
+    auto = _t("ua", "SAL-A", "TIR-01", 0, "tiresias")
+    human = _t(
+        "uh", "SAL-H", "TIR-02", 0, "tiresias",
+        labels=["human-assigned"],
+    )
+    _seed_graph(orch, [auto, human])
+
+    # Stub the surrounding tick machinery.
+    async def _noop(*a, **kw):
+        return None
+
+    async def _noop_list(*a, **kw):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    monkeypatch.setattr(orch, "_check_cancel_signal", _noop)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+
+    # Spy on _dispatch_child. Capture what was dispatched and flip the
+    # auto ticket terminal so the wave-loop exit condition fires.
+    dispatched: list[Ticket] = []
+
+    async def _spy_dispatch(ticket):
+        dispatched.append(ticket)
+        ticket.child_task_id = f"child-{ticket.identifier}"
+        ticket.status = TicketStatus.MERGED_GREEN
+
+    monkeypatch.setattr(orch, "_dispatch_child", _spy_dispatch)
+
+    # Bound the loop in case of a regression.
+    ticks = {"n": 0}
+    real_sleep = asyncio.sleep
+
+    async def counting_sleep(delay):
+        ticks["n"] += 1
+        if ticks["n"] > 10:
+            raise RuntimeError(
+                "dispatch loop did not converge within 10 ticks"
+            )
+        await real_sleep(0)
+
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        counting_sleep,
+    )
+
+    await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    # The auto ticket was dispatched; the human-assigned ticket was NOT.
+    dispatched_idents = [t.identifier for t in dispatched]
+    assert "SAL-A" in dispatched_idents, (
+        f"auto-ticket should have been dispatched; got {dispatched_idents!r}"
+    )
+    assert "SAL-H" not in dispatched_idents, (
+        "human-assigned ticket must NOT be dispatched; "
+        f"got {dispatched_idents!r}"
+    )
+    # The dispatch-skip path must terminalise the human-assigned ticket
+    # itself (status=ESCALATED) so the wave loop's exit condition fires.
+    # Without this, _dispatch_wave hangs forever on any wave that contains
+    # a human-assigned ticket because PENDING is not in TERMINAL_STATES.
+    assert human.status == TicketStatus.ESCALATED, (
+        f"dispatch-skip must set status=ESCALATED for terminal-success "
+        f"accounting; got {human.status!r}"
+    )
+
+
+async def test_dispatch_skips_human_assigned_label_case_insensitive(monkeypatch):
+    """AB-17-v: label match is case-insensitive (mirrors
+    ``_is_wave_gate_excused``). The skip path also sets status=ESCALATED
+    so a wave containing only human-assigned tickets exits cleanly."""
+    orch = _mk_orchestrator()
+    orch.poll_sleep_sec = 0
+    orch.max_parallel_subs = 4
+
+    human = _t(
+        "uh", "SAL-H", "TIR-02", 0, "tiresias",
+        labels=["Human-Assigned"],
+    )
+    _seed_graph(orch, [human])
+
+    async def _noop(*a, **kw):
+        return None
+
+    async def _noop_list(*a, **kw):
+        return []
+
+    monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
+    monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
+    monkeypatch.setattr(orch, "_check_budget", _noop)
+    monkeypatch.setattr(orch, "_status_tick", _noop)
+    monkeypatch.setattr(orch, "_stall_watcher", _noop)
+    monkeypatch.setattr(orch, "_check_cancel_signal", _noop)
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.checkpoint", _noop
+    )
+
+    dispatched: list[Ticket] = []
+
+    async def _spy_dispatch(ticket):
+        dispatched.append(ticket)
+        ticket.status = TicketStatus.MERGED_GREEN
+
+    monkeypatch.setattr(orch, "_dispatch_child", _spy_dispatch)
+
+    ticks = {"n": 0}
+    real_sleep = asyncio.sleep
+
+    async def counting_sleep(delay):
+        ticks["n"] += 1
+        if ticks["n"] > 5:
+            raise RuntimeError("loop did not exit on empty dispatchable set")
+        await real_sleep(0)
+
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep",
+        counting_sleep,
+    )
+
+    await asyncio.wait_for(orch._dispatch_wave(0), timeout=2.0)
+
+    assert dispatched == [], (
+        f"Mixed-case 'Human-Assigned' label must still skip dispatch; "
+        f"got {[t.identifier for t in dispatched]!r}"
+    )
+    assert human.status == TicketStatus.ESCALATED, (
+        f"dispatch-skip must set status=ESCALATED on case-insensitive "
+        f"label match; got {human.status!r}"
+    )
