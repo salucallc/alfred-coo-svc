@@ -1,8 +1,12 @@
-# Network Split for Tireisias Integration
+# Network Split (TIR-10)
 
-This document describes the Docker network topology introduced in SAL-2592 (TIR-10) to enforce internal isolation:
+This document describes the Docker network topology split introduced in TIR-10.
 
-- **mc-internal**: bridge network with `internal: true`. Services attached here cannot reach the internet. It hosts `alfred-coo-svc` and other internal components.
-- **mc-egress**: regular bridge network used for outbound egress through MCP services (e.g., `mcp-github`, `mcp-slack`). Services needing external access attach to this network.
+- **mc-internal**: bridge network for internal services (coo, portal, open-webui, soul) with `internal: true` – no direct internet access.
+- **mc-egress**: bridge network for egress services (caddy, mcp-*, tiresias) that retain outbound connectivity.
 
-The `alfred-coo-svc` service is connected to both networks to allow internal communication while routing external calls via `tiresias-proxy` on `mc-egress`.
+The split enforces that `alfred-coo` cannot directly reach external APIs; all egress is routed through the `tiresias-proxy` container on the `mc-egress` network.
+
+## Implementation notes
+- Updated `docker-compose.yml` to attach services to the appropriate network.
+- Added fallback iptables rule in the init container to reject DNS queries if internal routing fails (see Risk R1).

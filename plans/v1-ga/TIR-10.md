@@ -3,20 +3,13 @@
 ## Target paths
 - deploy/appliance/docker-compose.yml
 - deploy/appliance/tiresias/network_split.md
-- plans/v1-ga/TIR-10.md
 
 ## Acceptance criteria
-- [ ] Implementation matches the plan section for this ticket.
-- [ ] Unit + integration tests added or updated.
-- [ ] `ruff` + `pytest` green in CI.
-- [ ] PR opened via `propose_pr`; orchestrator will dispatch a hawkman-qa-a review on merge-ready.
-- [ ] Structured output envelope includes the PR URL in `summary` or `follow_up_tasks`.
+- APE/V: `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails with DNS/connection refusal; `docker exec mcp-github curl --max-time 5 https://api.github.com` succeeds.
 
 ## Verification approach
-- Run `docker compose up` and verify `docker exec alfred-coo curl --max-time 5 https://api.github.com` fails (no internet).
-- Verify `docker exec mcp-github curl https://api.github.com` succeeds (egress works).
-- CI tests pass; lint passes.
+- Execute the above curl commands inside the respective containers and confirm the expected success/failure outcomes.
+- Run the CI smoke test `docker compose up` and ensure no services report connectivity errors.
 
 ## Risks
-- Misconfiguration could block internal service communication.
-- Fallback iptables rules may be required per TIR-09 if DNS breaks.
+- **R1** (plan A §6): If `internal:true` breaks DNS, the fallback iptables `OUTPUT REJECT` rule in the init container may block legitimate internal traffic.
