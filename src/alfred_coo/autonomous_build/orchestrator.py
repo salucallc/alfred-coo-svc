@@ -133,6 +133,20 @@ ACTIVE_TICKET_STATES: frozenset = frozenset({
     TicketStatus.MERGE_REQUESTED,
 })
 
+# SAL-2870 (phantom-child carve-out, 2026-04-26). Any ``ticket.last_failure_reason``
+# in this set short-circuits the BACKED_OFF cooling window AND skips the
+# retry-count bump. Phantom-class cleanups (AB-17-x phantom-child force-fail,
+# AB-17-y orphan-active force-fail) are bookkeeping nullifications, NOT real
+# build failures: routing them through BACKED_OFF burns 300s + a retry slot
+# per orphan after every daemon restart (observed v7ab/v7ac 2026-04-26 wave-2
+# burning ~5+ min × 4 orphans = ~20 min idle per wave before fresh dispatch).
+# Real failures (model crashes, silent_complete, no_pr_url, hawkman
+# REQUEST_CHANGES x3) keep the existing BACKED_OFF + retry semantics.
+PHANTOM_FAILURE_REASONS: frozenset = frozenset({
+    "phantom_child",     # AB-17-x: child_task_id missing from claimed/completed/failed
+    "no_child_task_id",  # AB-17-y: active state with child_task_id=None (post-restart)
+})
+
 # SAL-2870 (2026-04-25) — retry budget + BACKED_OFF state + deadlock grace.
 #
 # v7o crashed at 18:09:19 UTC with `wave 1 deadlock: 17 tickets non-terminal
@@ -2896,6 +2910,13 @@ class AutonomousBuildOrchestrator:
                 ticket.identifier, ticket.status.value, stuck_for,
             )
             ticket.status = TicketStatus.FAILED
+            # SAL-2870 phantom-child carve-out (2026-04-26): tag the
+            # failure so the retry sweep routes this STRAIGHT to PENDING.
+            # Orphan-active is the daemon-restart hydration-stale class:
+            # ticket has no live child + no real build attempt happened.
+            # Counting this against the retry budget would burn 1 of 2
+            # retries on bookkeeping for every orphan after a restart.
+            ticket.last_failure_reason = "no_child_task_id"
             self.state.record_event(
                 "ticket_failed",
                 identifier=ticket.identifier,
@@ -2983,6 +3004,15 @@ class AutonomousBuildOrchestrator:
             and t.status not in TERMINAL_STATES
         ]
         if not in_flight:
+            # SAL-2870 phantom-child carve-out (2026-04-26): orphan-only
+            # short-circuit must still run the carve-out so a daemon-
+            # restart wave (orphan_failed only, no in_flight) gets the
+            # FAILED -> PENDING immediate re-dispatch instead of waiting
+            # for the next tick to hit the main sweep below. Without this
+            # the carve-out only fires when there's other in-flight work
+            # — a regression from the v7ab/v7ac live-burn scenario where
+            # the whole wave entry IS orphans.
+            self._apply_phantom_carve_out(orphan_failed)
             return list(orphan_failed)
 
         # AB-17-x: fetch all three lifecycle states in one pass so we have
@@ -3078,6 +3108,11 @@ class AutonomousBuildOrchestrator:
                         ticket.status.value, stuck_for,
                     )
                     ticket.status = TicketStatus.FAILED
+                    # SAL-2870 phantom-child carve-out (2026-04-26): tag the
+                    # failure so the retry sweep below routes this STRAIGHT
+                    # to PENDING instead of through BACKED_OFF + retry bump.
+                    # Phantom cleanup is bookkeeping, not a real build fail.
+                    ticket.last_failure_reason = "phantom_child"
                     self.state.record_event(
                         "ticket_failed",
                         identifier=ticket.identifier,
@@ -3247,12 +3282,13 @@ class AutonomousBuildOrchestrator:
         # codepath that wrote ``ticket.status = FAILED`` still works,
         # we just re-route the verdict at the end. This minimizes
         # conflict surface with the parallel SAL-2869 sub.
-        for ticket in list(updated):
-            if ticket.status != TicketStatus.FAILED:
-                continue
-            if ticket.retry_count >= ticket.retry_budget:
-                continue
-            self._back_off_ticket(ticket)
+        #
+        # SAL-2870 phantom-child carve-out (2026-04-26): see
+        # ``_apply_phantom_carve_out`` — phantom_child / no_child_task_id
+        # tickets short-circuit BACKED_OFF + retry-count, going straight
+        # to PENDING for immediate re-dispatch. Same helper is invoked
+        # by the orphan-only short-circuit above.
+        self._apply_phantom_carve_out(updated)
 
         # SAL-2870: also bake in BACKED_OFF wake-ups + dep refreshes as
         # forward-progress markers so the deadlock-grace timer resets
@@ -3353,6 +3389,41 @@ class AutonomousBuildOrchestrator:
                 if not self._deps_satisfied(ticket):
                     ticket.status = TicketStatus.BLOCKED
 
+    def _apply_phantom_carve_out(self, tickets: List[Ticket]) -> None:
+        """SAL-2870 retry-budget sweep + phantom-child carve-out
+        (2026-04-26). For each ticket in ``tickets`` that currently sits
+        in ``FAILED``:
+
+        - If it was tagged ``phantom_child`` (AB-17-x) or
+          ``no_child_task_id`` (AB-17-y) AND retry is enabled
+          (``retry_budget > 0``): short-circuit BACKED_OFF, route
+          straight to PENDING via ``_reset_phantom_failure``. Skips the
+          retry_count bump — phantom cleanup is bookkeeping, not a real
+          build attempt.
+        - Otherwise (real failure with budget remaining): route through
+          BACKED_OFF + retry_count++ via ``_back_off_ticket``.
+        - Otherwise (real failure with budget exhausted, OR phantom
+          with retry disabled): leave terminal FAILED.
+
+        Real failures still carry the old (silent_complete / no_pr_url /
+        mesh-failed / review-changes) BACKED_OFF cooling semantics. The
+        carve-out is gated on ``retry_budget > 0`` so legacy tests +
+        operators that pin ``retry_budget=0`` keep terminal-FAILED.
+        """
+        for ticket in list(tickets):
+            if ticket.status != TicketStatus.FAILED:
+                continue
+            # Phantom carve-out — only when retry is enabled.
+            if (
+                ticket.retry_budget > 0
+                and ticket.last_failure_reason in PHANTOM_FAILURE_REASONS
+            ):
+                self._reset_phantom_failure(ticket)
+                continue
+            if ticket.retry_count >= ticket.retry_budget:
+                continue
+            self._back_off_ticket(ticket)
+
     def _back_off_ticket(self, ticket: Ticket) -> None:
         """SAL-2870 #1: route a FAILED ticket through BACKED_OFF when it
         still has retry budget. Increments ``retry_count``, sets the
@@ -3368,6 +3439,12 @@ class AutonomousBuildOrchestrator:
         # forward across retries (a fix-round dispatch may legitimately
         # update the same PR rather than open a new one).
         ticket.child_task_id = None
+        # SAL-2870 phantom-child carve-out (2026-04-26): ensure the
+        # phantom tag doesn't leak into a real BACKED_OFF cycle. The
+        # carve-out path in the sweep already routes phantom-tagged
+        # failures away from this function, so reaching here means the
+        # tag (if any) is from a stale prior round; clear it.
+        ticket.last_failure_reason = None
         logger.warning(
             "SAL-2870: %s FAILED but retry %d/%d available; "
             "→ BACKED_OFF for %ds",
@@ -3381,6 +3458,57 @@ class AutonomousBuildOrchestrator:
             retry_count=ticket.retry_count,
             retry_budget=ticket.retry_budget,
             backoff_sec=self.retry_backoff_sec,
+        )
+
+    def _reset_phantom_failure(self, ticket: Ticket) -> None:
+        """SAL-2870 phantom-child carve-out (2026-04-26): undo a
+        bookkeeping-only force-fail so the ticket can be re-dispatched
+        on the very next tick with no penalty.
+
+        Called by the retry sweep when ``ticket.last_failure_reason`` is
+        in ``PHANTOM_FAILURE_REASONS`` (currently ``phantom_child`` for
+        AB-17-x and ``no_child_task_id`` for AB-17-y). Differs from
+        ``_back_off_ticket`` in three places:
+
+        - status flips FAILED → PENDING (NOT → BACKED_OFF), so the
+          dispatch loop picks the ticket up on the same tick a sweep
+          would have left it cooling for ``retry_backoff_sec``.
+        - ``retry_count`` is NOT incremented. Phantom cleanup is not a
+          real build attempt; the operator's 2-retry budget should not
+          be burned on hydration-stale state from a daemon restart.
+        - ``last_failure_reason`` is cleared so the carve-out only
+          applies to the failure it was tagged for; a subsequent real
+          failure will route normally through BACKED_OFF.
+
+        ``child_task_id`` is cleared (same as BACKED_OFF) so the next
+        dispatch spawns a fresh sub with a new mesh task id.
+
+        Live evidence (2026-04-26 v7ac wave-2): 4 phantom orphans each
+        burned 300s + dispatch-time ~5+ min idle x 4 = ~20 min before
+        any productive work could resume. With this carve-out the same
+        4 cleanups dispatch immediately on the next tick.
+        """
+        ticket.status = TicketStatus.PENDING
+        ticket.backed_off_at = None
+        # Clear in-flight bookkeeping so the next dispatch creates a fresh
+        # child. Mirrors _back_off_ticket so the dispatch path can't see
+        # a stale id and re-trip phantom detection on the next tick.
+        ticket.child_task_id = None
+        reason = ticket.last_failure_reason
+        ticket.last_failure_reason = None
+        logger.warning(
+            "[SAL-2870] %s phantom-child cleanup (reason=%s); "
+            "skipping BACKED_OFF, dispatching fresh immediately "
+            "(retry %d/%d unchanged)",
+            ticket.identifier, reason,
+            ticket.retry_count, ticket.retry_budget,
+        )
+        self.state.record_event(
+            "ticket_phantom_reset",
+            identifier=ticket.identifier,
+            reason=reason or "",
+            retry_count=ticket.retry_count,
+            retry_budget=ticket.retry_budget,
         )
 
     @staticmethod

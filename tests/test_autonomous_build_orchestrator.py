@@ -1280,6 +1280,11 @@ async def test_poll_children_force_fails_orphan_active_after_threshold(
     t.status = TicketStatus.IN_PROGRESS
     # The defining condition: active state, no child_task_id.
     assert t.child_task_id is None, "fixture invariant"
+    # SAL-2870 phantom-child carve-out: pin retry_budget=0 so this test
+    # asserts the AB-17-y FORCE-FAIL itself (terminal FAILED). Carve-out
+    # behavior (FAILED -> PENDING with retry-count unchanged) has its
+    # own dedicated tests below.
+    t.retry_budget = 0
     _seed_graph(orch, [t])
 
     linear_calls = []
@@ -1395,6 +1400,11 @@ async def test_poll_children_orphan_reconcile_runs_when_no_in_flight(
     t = _t("u-only-orphan", "SAL-2603", "ALT-06", 0, "aletheia",
            size="M", estimate=5)
     t.status = TicketStatus.IN_PROGRESS
+    # SAL-2870 phantom-child carve-out: pin retry_budget=0 so this test
+    # asserts the AB-17-y FORCE-FAIL pre-pass runs (terminal FAILED) even
+    # when the in-flight short-circuit fires. Carve-out path (FAILED ->
+    # PENDING) has its own dedicated tests below.
+    t.retry_budget = 0
     _seed_graph(orch, [t])
 
     async def _fake_update(ticket, state_name):
@@ -4537,6 +4547,318 @@ async def test_retry_budget_sweep_skips_escalated(monkeypatch):
     assert not any(
         e["kind"] == "ticket_backed_off" for e in orch.state.events
     ), "ESCALATED must not emit a ticket_backed_off event"
+
+
+# ── SAL-2870 phantom-child carve-out (2026-04-26) ─────────────────────────
+#
+# Composition bug between AB-17-x/AB-17-y phantom force-fails and the
+# SAL-2870 retry sweep: phantom cleanup is bookkeeping (no real build
+# attempt happened), but the sweep was routing every phantom-FAILED
+# through BACKED_OFF + retry_count++. Today's v7ab/v7ac live runs (post-
+# daemon-restart, 2026-04-26) burned ~5+ min × 4 orphans = ~20 min idle
+# per wave on the cooling window before fresh dispatch — and burned a
+# retry slot on each.
+#
+# Fix: `last_failure_reason` tag set by phantom branches; sweep checks
+# the tag, calls `_reset_phantom_failure` (FAILED -> PENDING, no
+# retry_count bump, child_task_id cleared), skips BACKED_OFF entirely.
+# Real failures (model crashes, silent_complete, no_pr_url, hawkman 3x
+# REQUEST_CHANGES) still go through BACKED_OFF as before.
+
+
+async def test_phantom_child_skips_backed_off_and_dispatches_immediately(
+    monkeypatch,
+):
+    """SAL-2870 phantom carve-out: a ticket force-failed by AB-17-x's
+    phantom-child reconciler (child_task_id missing from claimed/
+    completed/failed) must short-circuit BACKED_OFF and land in PENDING
+    so the next dispatch tick re-attaches a fresh child immediately.
+    Retry counter must NOT be incremented — phantom cleanup is not a
+    real build attempt and shouldn't burn the operator's retry budget.
+    """
+    import time as _time
+
+    from alfred_coo.autonomous_build.orchestrator import (
+        STUCK_CHILD_FORCE_FAIL_SEC,
+    )
+
+    mesh = _FakeMesh()  # no completed/failed/claimed records
+    orch = _mk_orchestrator(mesh=mesh)
+    # Default retry_budget=2 (phantom carve-out only kicks in when retry
+    # is enabled; budget=0 keeps legacy terminal-FAILED for AB-17-x's
+    # detection-focused tests).
+    assert orch.retry_budget == 2
+
+    t = _t("u1", "SAL-2870-p", "TIR-01", 0, "tiresias", size="S",
+           estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-phantom-zzz"
+    t.retry_count = 0
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    # Spy on _back_off_ticket — must NOT be called for phantom failure.
+    back_off_calls: list[str] = []
+    real_back_off = orch._back_off_ticket
+    def _spy_back_off(ticket):
+        back_off_calls.append(ticket.identifier)
+        return real_back_off(ticket)
+    monkeypatch.setattr(orch, "_back_off_ticket", _spy_back_off)
+
+    # Trip the AB-17-x phantom-child threshold.
+    orch._ticket_transition_ts[t.id] = _time.time() - (
+        STUCK_CHILD_FORCE_FAIL_SEC + 60
+    )
+
+    updated = await orch._poll_children()
+
+    # Carve-out outcome: PENDING (NOT BACKED_OFF, NOT terminal FAILED).
+    assert t.status == TicketStatus.PENDING, (
+        f"phantom-child cleanup must short-circuit to PENDING for "
+        f"immediate re-dispatch, got {t.status}"
+    )
+    # Retry counter NOT incremented — bookkeeping isn't a real attempt.
+    assert t.retry_count == 0, (
+        f"phantom cleanup must not consume retry budget, got "
+        f"retry_count={t.retry_count}"
+    )
+    # Cooling timer is unset (we're not BACKED_OFF).
+    assert t.backed_off_at is None, (
+        f"phantom cleanup must not set backed_off_at, got "
+        f"{t.backed_off_at}"
+    )
+    # Stale child id cleared so next dispatch creates a fresh child
+    # (otherwise phantom detection re-trips on the same id).
+    assert t.child_task_id is None, (
+        f"phantom cleanup must clear child_task_id; got "
+        f"{t.child_task_id}"
+    )
+    # Tag cleared so a future REAL failure routes correctly through
+    # BACKED_OFF without the phantom skip mis-firing.
+    assert t.last_failure_reason is None, (
+        f"phantom tag must be cleared post-reset; got "
+        f"{t.last_failure_reason}"
+    )
+    # _back_off_ticket was NEVER called for this ticket.
+    assert back_off_calls == [], (
+        f"_back_off_ticket must not run for phantom cleanup; spy "
+        f"saw: {back_off_calls}"
+    )
+    # No ticket_backed_off event recorded.
+    assert not any(
+        e["kind"] == "ticket_backed_off" for e in orch.state.events
+    ), (
+        f"phantom cleanup must not emit ticket_backed_off; events: "
+        f"{orch.state.events}"
+    )
+    # The phantom-fail event AND the phantom-reset event ARE recorded
+    # so operations can grep both signals.
+    assert any(
+        e["kind"] == "ticket_failed"
+        and "phantom_child" in str(e.get("note", ""))
+        for e in orch.state.events
+    ), f"expected ticket_failed (phantom_child) event; got {orch.state.events}"
+    reset_evts = [
+        e for e in orch.state.events if e["kind"] == "ticket_phantom_reset"
+    ]
+    assert len(reset_evts) == 1, (
+        f"expected exactly one ticket_phantom_reset event; got {reset_evts}"
+    )
+    assert reset_evts[0]["reason"] == "phantom_child"
+    assert reset_evts[0]["retry_count"] == 0, (
+        f"reset event must mirror unchanged retry_count=0; got "
+        f"{reset_evts[0]}"
+    )
+    assert t in updated
+
+
+async def test_orphan_active_skips_backed_off_and_dispatches_immediately(
+    monkeypatch,
+):
+    """SAL-2870 phantom carve-out: AB-17-y orphan-active force-fail
+    (active state with no child_task_id, the daemon-restart hydration
+    case) must also short-circuit BACKED_OFF and dispatch fresh. This is
+    the live v7ab/v7ac signature: post-restart, every wave entry has
+    dozens of orphans, each previously eating 300s of cooling.
+    """
+    import time as _time
+
+    from alfred_coo.autonomous_build.orchestrator import (
+        STUCK_CHILD_FORCE_FAIL_SEC,
+    )
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    assert orch.retry_budget == 2  # carve-out only applies when retry on
+
+    t = _t("u-orphan", "SAL-2603", "ALT-06", 0, "aletheia", size="M",
+           estimate=5)
+    t.status = TicketStatus.IN_PROGRESS
+    # Defining condition for AB-17-y: active state, no child_task_id.
+    assert t.child_task_id is None, "fixture invariant"
+    t.retry_count = 0
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    back_off_calls: list[str] = []
+    real_back_off = orch._back_off_ticket
+    def _spy_back_off(ticket):
+        back_off_calls.append(ticket.identifier)
+        return real_back_off(ticket)
+    monkeypatch.setattr(orch, "_back_off_ticket", _spy_back_off)
+
+    # Stuck past the AB-17-y orphan threshold.
+    orch._ticket_transition_ts[t.id] = _time.time() - (
+        STUCK_CHILD_FORCE_FAIL_SEC + 120
+    )
+
+    updated = await orch._poll_children()
+
+    # Carve-out outcome: PENDING with retry_count untouched.
+    assert t.status == TicketStatus.PENDING, (
+        f"orphan-active cleanup must short-circuit to PENDING; got "
+        f"{t.status}"
+    )
+    assert t.retry_count == 0, (
+        f"orphan-active cleanup must not burn retry budget; got "
+        f"retry_count={t.retry_count}"
+    )
+    assert t.backed_off_at is None
+    assert t.child_task_id is None
+    assert t.last_failure_reason is None  # cleared post-reset
+    assert back_off_calls == [], (
+        f"_back_off_ticket must not run for orphan-active cleanup; "
+        f"spy saw: {back_off_calls}"
+    )
+    # The orphan-fail event AND the phantom-reset event ARE both recorded.
+    assert any(
+        e["kind"] == "ticket_failed"
+        and "no_child_task_id" in str(e.get("note", ""))
+        for e in orch.state.events
+    ), (
+        f"expected ticket_failed (no_child_task_id) event; got "
+        f"{orch.state.events}"
+    )
+    reset_evts = [
+        e for e in orch.state.events if e["kind"] == "ticket_phantom_reset"
+    ]
+    assert len(reset_evts) == 1
+    assert reset_evts[0]["reason"] == "no_child_task_id"
+    assert t in updated
+
+
+async def test_real_failure_still_routes_through_backed_off(monkeypatch):
+    """SAL-2870 phantom carve-out: a REAL failure (silent_complete /
+    no_pr_url / mesh-failed / review REQUEST_CHANGES) MUST still go
+    through BACKED_OFF + retry_count bump. Phantom carve-out is
+    surgically scoped to phantom_child + no_child_task_id only.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    assert orch.retry_budget == 2
+
+    t = _t("u1", "SAL-2870-real", "TIR-01", 0, "tiresias", size="S",
+           estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-real-fail-1"
+    t.retry_count = 0
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    back_off_calls: list[str] = []
+    real_back_off = orch._back_off_ticket
+    def _spy_back_off(ticket):
+        back_off_calls.append(ticket.identifier)
+        return real_back_off(ticket)
+    monkeypatch.setattr(orch, "_back_off_ticket", _spy_back_off)
+
+    # Real failure path: child completed without a PR URL (no_pr_url
+    # branch). last_failure_reason must NOT be tagged phantom_*.
+    mesh.completed_tasks.append({
+        "id": "child-real-fail-1",
+        "status": "completed",
+        "result": {"summary": "did some stuff but no PR opened"},
+    })
+
+    await orch._poll_children()
+
+    # Real failure outcome: BACKED_OFF + retry_count++ (legacy SAL-2870).
+    assert t.status == TicketStatus.BACKED_OFF, (
+        f"real failure must still go through BACKED_OFF; got "
+        f"{t.status}"
+    )
+    assert t.retry_count == 1, (
+        f"real failure must increment retry_count; got "
+        f"{t.retry_count}"
+    )
+    assert t.backed_off_at is not None and t.backed_off_at > 0
+    assert back_off_calls == [t.identifier], (
+        f"_back_off_ticket must run exactly once for real failure; "
+        f"spy saw: {back_off_calls}"
+    )
+    # ticket_backed_off event recorded; no phantom-reset event.
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "ticket_backed_off" in kinds
+    assert "ticket_phantom_reset" not in kinds, (
+        f"real failure must NOT emit ticket_phantom_reset; events: "
+        f"{orch.state.events}"
+    )
+
+
+async def test_phantom_carve_out_disabled_when_retry_budget_zero(monkeypatch):
+    """SAL-2870 phantom carve-out is gated on retry_budget > 0. With
+    retry_budget=0 the operator explicitly disabled retry semantics
+    entirely (legacy / tests pinning terminal-FAILED): phantom failures
+    must land terminal FAILED in that mode, not PENDING. Carve-out is
+    an optimization of the retry path, not a parallel one.
+    """
+    import time as _time
+
+    from alfred_coo.autonomous_build.orchestrator import (
+        STUCK_CHILD_FORCE_FAIL_SEC,
+    )
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u1", "SAL-2870-zero", "TIR-01", 0, "tiresias", size="S",
+           estimate=1)
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-phantom-zero"
+    t.retry_budget = 0  # phantom carve-out gated off
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    orch._ticket_transition_ts[t.id] = _time.time() - (
+        STUCK_CHILD_FORCE_FAIL_SEC + 60
+    )
+
+    await orch._poll_children()
+
+    # With retry off, phantom cleanup falls through to terminal FAILED.
+    assert t.status == TicketStatus.FAILED, (
+        f"retry_budget=0 must keep phantom cleanup terminal-FAILED; "
+        f"got {t.status}"
+    )
+    # No phantom-reset event.
+    assert not any(
+        e["kind"] == "ticket_phantom_reset" for e in orch.state.events
+    ), (
+        f"retry_budget=0 must not emit ticket_phantom_reset; events: "
+        f"{orch.state.events}"
+    )
 
 
 def test_wave_gate_excuses_escalated():
