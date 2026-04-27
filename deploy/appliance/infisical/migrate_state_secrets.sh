@@ -4,6 +4,20 @@
 
 set -euo pipefail
 
+# OPS-08 placeholder guard.
+# This script was merged as scaffolding only (PR #166). The Infisical CLI
+# integration, secret-push loop, and verification steps are NOT wired.
+# Refuse to execute so accidental runs can't half-migrate state or chmod 000
+# the originals before they're actually copied anywhere.
+#
+# The structure below (STATE_DIR / TARGET_DIR / loop / chmod) is preserved
+# as a design artifact for the OPS-08c child ticket to replace.
+echo "OPS-08 placeholder -- Infisical client not wired. See SAL-2641 and child OPS-08c. Refusing to run." >&2
+exit 1
+
+# --- Scaffolding below this line is intentionally unreachable. ---
+# It documents the intended shape of the real migration for OPS-08c.
+
 STATE_DIR="./state/secrets"
 TARGET_DIR="/app/infisical/secrets"
 
