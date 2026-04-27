@@ -1,0 +1,11 @@
+groups:
+  - name: budget_alerts
+    rules:
+      - alert: BudgetAlert
+        expr: sum(mc_cost_usd_total) > 15
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Budget exceeded"
+          description: "Cost exceeded $15 threshold, alerting #batcave"
