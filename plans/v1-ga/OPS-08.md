@@ -1,18 +1,21 @@
 # OPS-08: Migrate state secrets to Infisical
 
 ## Target paths
-- `deploy/appliance/docker-compose.yml`
-- `deploy/appliance/infisical/migrate_state_secrets.sh`
-- `deploy/appliance/infisical/MIGRATION.md`
-- `plans/v1-ga/OPS-08.md`
+- deploy/appliance/docker-compose.yml
+- deploy/appliance/infisical/migrate_state_secrets.sh
+- deploy/appliance/infisical/MIGRATION.md
+- plans/v1-ga/OPS-08.md
 
 ## Acceptance criteria
-- Delete state dir, restart -> all services healthy; secrets visible in infisical UI; on-disk files chmod 000
+Delete state dir, restart -> all services healthy; secrets visible in Infisical UI; on-disk files chmod 000
 
 ## Verification approach
-Manual verification: after deployment, delete `./state/secrets/`, restart services, verify health checks pass, confirm secrets visible in Infisical UI, and check file permissions are `000`.
+- Run the init container to import secrets.
+- Delete `./state/secrets` and restart services.
+- Confirm services start healthy and secrets appear in Infisical UI.
+- Verify the on‑disk files have mode `000`.
 
 ## Risks
-- Potential service downtime during secret import.
-- Incorrect permission setting could lock out legitimate access.
-- Dependency on OPS-06 and OPS-07 for Infisical integration.
+- Potential temporary unavailability during migration.
+- Incorrect permissions could expose secrets.
+- Script failures may leave services in inconsistent state.
