@@ -2188,6 +2188,145 @@ async def linear_update_issue_state(
     }
 
 
+# ── linear_add_label_to_issue ──────────────────────────────────────────────
+
+# Module-level cache: team_id -> {label_name_lower: label_id}. Linear team
+# label IDs are stable; one lookup per team per process is plenty. Mirrors
+# ``_LINEAR_TEAM_STATES_CACHE`` shape and lifetime so a cold daemon does
+# one extra GraphQL hit per team and never thinks about it again.
+_LINEAR_TEAM_LABELS_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+async def _linear_load_team_labels(
+    team_id: str, key: str,
+) -> tuple[Dict[str, str], Optional[str]]:
+    """Fetch + cache all labels for a Linear team. Returns (map, err).
+
+    Pages through ``team.labels(after: $cursor)`` because a team can have
+    50+ labels (SAL has the wave-N / size-S/M/L / epic / status families).
+    """
+    cached = _LINEAR_TEAM_LABELS_CACHE.get(team_id)
+    if cached is not None:
+        return cached, None
+
+    state_map: Dict[str, str] = {}
+    cursor: Optional[str] = None
+    # Paged fetch. 100 labels/page is well under Linear's complexity cap
+    # for this lightweight payload (id + name only).
+    while True:
+        query = (
+            "query TeamLabels($teamId: String!, $after: String) { "
+            "team(id: $teamId) { id labels(first: 100, after: $after) "
+            "{ nodes { id name } pageInfo { hasNextPage endCursor } } } }"
+        )
+        variables: Dict[str, Any] = {"teamId": team_id}
+        if cursor:
+            variables["after"] = cursor
+        body, err = await _linear_graphql(query, variables, key)
+        if err is not None:
+            return {}, err
+        data = (body or {}).get("data") or {}
+        team = data.get("team") or {}
+        labels = (team.get("labels") or {})
+        nodes = labels.get("nodes") or []
+        for n in nodes:
+            name = n.get("name")
+            lid = n.get("id")
+            if name and lid:
+                state_map[name.lower()] = lid
+        page_info = labels.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            break
+    _LINEAR_TEAM_LABELS_CACHE[team_id] = state_map
+    return state_map, None
+
+
+async def linear_add_label_to_issue(
+    issue_id: str,
+    label_name: str,
+) -> Dict[str, Any]:
+    """Attach a named label to a Linear issue (scoped to its team).
+
+    Mirrors ``linear_update_issue_state``: looks up the issue's team,
+    resolves ``label_name`` against that team's labels (NOT global —
+    Linear label IDs are per-team), then issues ``issueAddLabel``.
+
+    ``issue_id`` may be either the UUID or the human identifier (e.g.
+    ``"SAL-2680"``). Idempotent on the Linear side: re-adding a label
+    already on the issue is a no-op success per Linear's API contract,
+    so the orchestrator does not need to pre-check.
+
+    Returns ``{ok, identifier, label}`` on success, ``{error, ...}`` on
+    failure. Failure is non-fatal at the orchestrator layer — the helper
+    that calls this swallows errors after logging, same as
+    ``_update_linear_state``.
+    """
+    key = os.environ.get("LINEAR_API_KEY") or os.environ.get(
+        "ALFRED_OPS_LINEAR_API_KEY"
+    )
+    if not key:
+        return {"error": "LINEAR_API_KEY not configured"}
+    if not issue_id or not isinstance(issue_id, str):
+        return {"error": "issue_id must be a non-empty string"}
+    if not label_name or not isinstance(label_name, str):
+        return {"error": "label_name must be a non-empty string"}
+
+    # 1. Resolve issue -> {id, team.id, identifier}.
+    issue_query = (
+        "query IssueLookup($id: String!) { "
+        "issue(id: $id) { id identifier team { id } } }"
+    )
+    body, err = await _linear_graphql(issue_query, {"id": issue_id}, key)
+    if err is not None:
+        return {"error": err}
+    issue = ((body or {}).get("data") or {}).get("issue") or {}
+    if not issue.get("id"):
+        return {"error": f"linear issue {issue_id!r} not found"}
+    uuid = issue["id"]
+    identifier = issue.get("identifier")
+    team_id = (issue.get("team") or {}).get("id")
+    if not team_id:
+        return {"error": "linear issue missing team id"}
+
+    # 2. Resolve label name -> label id (cached per team).
+    label_map, err = await _linear_load_team_labels(team_id, key)
+    if err is not None:
+        return {"error": err}
+    label_id = label_map.get(label_name.lower())
+    if not label_id:
+        available = sorted(label_map.keys())
+        return {
+            "error": f"label {label_name!r} not found on team {team_id}",
+            "available_labels": available,
+        }
+
+    # 3. Issue the mutation. ``issueAddLabel`` is idempotent server-side.
+    mutation = (
+        "mutation IssueAddLabel($id: String!, $labelId: String!) { "
+        "issueAddLabel(id: $id, labelId: $labelId) "
+        "{ success issue { identifier labels { nodes { name } } } } }"
+    )
+    body, err = await _linear_graphql(
+        mutation,
+        {"id": uuid, "labelId": label_id},
+        key,
+    )
+    if err is not None:
+        return {"error": err}
+    result = ((body or {}).get("data") or {}).get("issueAddLabel") or {}
+    if not result.get("success"):
+        return {"error": "linear issueAddLabel returned success=false", "raw": body}
+    out_issue = result.get("issue") or {}
+    return {
+        "ok": True,
+        "identifier": out_issue.get("identifier") or identifier,
+        "label": label_name,
+    }
+
+
 # ── linear_list_project_issues ──────────────────────────────────────────────
 
 LINEAR_LIST_PAGE_SIZE = 25  # Linear complexity cap ~10000 hit at page=100 with labels+state+relations (observed 12081 on SAL project, 2026-04-23)
@@ -2811,6 +2950,33 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=linear_update_issue_state,
+    ),
+    "linear_add_label_to_issue": ToolSpec(
+        name="linear_add_label_to_issue",
+        description=(
+            "Attach a named label to a Linear issue (scoped to the issue's "
+            "team). Looks up the issue's team, resolves the label name "
+            "against that team's labels, then issues the `issueAddLabel` "
+            "mutation. Idempotent server-side: re-adding an existing label "
+            "is a no-op success. `issue_id` accepts either the UUID or the "
+            "human identifier (e.g. 'SAL-2680')."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "Linear issue UUID or identifier (e.g. 'SAL-2680').",
+                },
+                "label_name": {
+                    "type": "string",
+                    "description": "Target label name (case-insensitive).",
+                },
+            },
+            "required": ["issue_id", "label_name"],
+            "additionalProperties": False,
+        },
+        handler=linear_add_label_to_issue,
     ),
     "linear_list_project_issues": ToolSpec(
         name="linear_list_project_issues",

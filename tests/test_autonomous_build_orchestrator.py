@@ -4474,11 +4474,13 @@ async def test_sal_2870_state_round_trip_carries_retry_fields():
 async def test_poll_children_grounding_gap_envelope_marks_escalated(
     monkeypatch,
 ):
-    """SAL-2886 happy-path: a child completion whose tool_calls show the
-    documented escalate-path emit (linear_create_issue returning a
-    grounding-gap issue) must transition the ticket to ESCALATED — not
-    FAILED — and must NOT roll Linear back to Backlog. Mirrors the v7p
-    envelope shape captured in
+    """SAL-2886 + 2026-04-27 follow-up happy-path: a child completion
+    whose tool_calls show the documented escalate-path emit
+    (linear_create_issue returning a grounding-gap issue) must transition
+    the ticket to ESCALATED — not FAILED — and must move Linear to
+    Backlog (NOT Done; the original SAL-2893 fix wrote Done, which falsely
+    claimed completion on tickets that never shipped a PR). Mirrors the
+    v7p envelope shape captured in
     Z:/_evidence/v7p_child_envelopes_2026-04-25.json.
     """
     mesh = _FakeMesh()
@@ -4495,6 +4497,15 @@ async def test_poll_children_grounding_gap_envelope_marks_escalated(
         linear_calls.append((ticket.identifier, state_name))
 
     monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # 2026-04-27 follow-up: ESCALATED branch also calls _apply_linear_label
+    # to mark the ticket human-assigned. Stub it so we don't hit Linear.
+    label_calls: list[tuple[str, str]] = []
+
+    async def _fake_label(ticket, label_name):
+        label_calls.append((ticket.identifier, label_name))
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
 
     # v7p envelope shape (verbatim from spec): single linear_create_issue
     # tool call whose result has a grounding-gap title + identifier.
@@ -4532,9 +4543,24 @@ async def test_poll_children_grounding_gap_envelope_marks_escalated(
     assert escalated_events[0]["identifier"] == "SAL-2886-x"
     assert escalated_events[0]["grounding_gap"] == "SAL-2999"
 
-    # No Linear -> Backlog transition: operator inspects the gap issue.
-    assert ("SAL-2886-x", "Backlog") not in linear_calls, (
-        f"escalate path must NOT roll Linear back to Backlog: {linear_calls}"
+    # Linear receives a Backlog transition (post-2026-04-27 behavior). The
+    # original SAL-2893 fix wrote Done here; that was reverted because it
+    # falsely claimed shipped status on grounding-gap tickets.
+    assert ("SAL-2886-x", "Backlog") in linear_calls, (
+        f"escalate path must roll Linear to Backlog (post-2026-04-27 fix); "
+        f"got {linear_calls}"
+    )
+    # And NOT Done — the false-completion shape.
+    assert ("SAL-2886-x", "Done") not in linear_calls, (
+        f"escalate path must NOT mark Linear Done (false completion); "
+        f"got {linear_calls}"
+    )
+
+    # human-assigned label applied so the dispatch-gate
+    # (fix/dispatch-gate-human-assigned-AB-17-v) excuses this ticket on
+    # the next kickoff.
+    assert ("SAL-2886-x", "human-assigned") in label_calls, (
+        f"escalate path must apply human-assigned label; got {label_calls}"
     )
 
 
@@ -4615,6 +4641,13 @@ async def test_retry_budget_sweep_skips_escalated(monkeypatch):
         return None
 
     monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    # 2026-04-27 follow-up: ESCALATED branch also calls _apply_linear_label
+    # to mark the ticket human-assigned. Stub it so we don't hit Linear.
+    async def _noop_label(ticket, label_name):
+        return None
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _noop_label)
 
     # Spy on _back_off_ticket — must NOT be called for the ESCALATED ticket.
     back_off_calls: list[str] = []
@@ -5032,26 +5065,45 @@ def test_envelope_helper_does_not_misclassify_propose_pr_with_side_linear_call()
     ), "non-grounding-gap linear_create_issue must not match the escalate discriminator"
 
 
-# ── SAL-2893: ESCALATED transitions Linear to Done ───────────────────────────
+# ── SAL-2893: ESCALATED escapes orphan-active without faking completion ─────
 #
 # PR #91 (SAL-2886) deliberately left Linear untouched on ESCALATED so the
 # operator could inspect the spawned grounding-gap issue. That created a
 # downstream stall: every subsequent kickoff's ``build_ticket_graph`` reads
 # Linear, sees "In Progress", maps it to ``in_progress``, and AB-17-y catches
 # it as an orphan-active 30 min later. Each kickoff burned 30 min on the same
-# stale ticket. SAL-2893 fix: transition Linear -> "Done" with a comment
-# linking the grounding-gap issue, so the next kickoff sees a terminal state
-# and the ticket leaves the active loop entirely. The grounding-gap link in
-# the comment carries the audit trail forward without spelunking soul memory.
+# stale ticket.
+#
+# Original SAL-2893 fix transitioned Linear -> "Done" with a comment linking
+# the grounding-gap issue. That escaped the orphan-active sweep, but on
+# 2026-04-27 four MC v1 GA tickets (SAL-2597, SAL-2627, SAL-2668, SAL-2677)
+# were marked Done without a merged PR because they hit this branch — a
+# false-completion claim that broke ratio metrics + lied to humans reviewing
+# the project board.
+#
+# 2026-04-27 follow-up (this branch): transition Linear -> "Backlog" instead.
+# Backlog also escapes the orphan-active sweep (which only scans In Progress,
+# see ``_sweep_orphan_active`` in orchestrator.py), but does not claim the
+# ticket shipped. We additionally apply the ``human-assigned`` label so the
+# dispatch-gate fix (fix/dispatch-gate-human-assigned-AB-17-v) excuses the
+# ticket on subsequent kickoffs until a human resolves the grounding gap —
+# preventing a re-dispatch loop where the same gap surfaces every kickoff.
+# The grounding-gap link in the comment still carries the audit trail forward
+# without spelunking soul memory.
 
 
-async def test_escalated_transitions_linear_to_done_with_grounding_gap_link(
+async def test_escalated_transitions_linear_to_backlog_with_grounding_gap_link(
     monkeypatch,
 ):
-    """SAL-2893 happy-path: when ``_poll_children`` classifies an envelope
-    as the SAL-2886 escalate emit, it MUST transition Linear to "Done"
-    AND post a comment whose body contains the grounding-gap issue's
-    identifier so the operator can navigate to it from the parent ticket.
+    """SAL-2893 + 2026-04-27 follow-up: when ``_poll_children`` classifies
+    an envelope as the SAL-2886 escalate emit, it MUST transition Linear
+    to "Backlog" (NOT "Done" — the original SAL-2893 fix wrote Done, which
+    on 2026-04-27 falsely claimed completion on four MC v1 GA tickets that
+    never shipped a PR), apply the ``human-assigned`` label so the
+    dispatch-gate (fix/dispatch-gate-human-assigned-AB-17-v) excuses the
+    ticket on subsequent kickoffs, AND post a comment whose body contains
+    the grounding-gap issue's identifier so the operator can navigate to
+    it from the parent ticket.
     """
     mesh = _FakeMesh()
     orch = _mk_orchestrator(mesh=mesh)
@@ -5068,6 +5120,13 @@ async def test_escalated_transitions_linear_to_done_with_grounding_gap_link(
         linear_calls.append((ticket.identifier, state_name))
 
     monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    label_calls: list[tuple[str, str]] = []
+
+    async def _fake_label(ticket, label_name):
+        label_calls.append((ticket.identifier, label_name))
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
 
     comment_calls: list[tuple[str, str]] = []
 
@@ -5100,13 +5159,21 @@ async def test_escalated_transitions_linear_to_done_with_grounding_gap_link(
     assert t.status == TicketStatus.ESCALATED, (
         f"sanity: discriminator must classify as ESCALATED, got {t.status}"
     )
-    # Linear MUST receive a Done transition (the SAL-2893 fix).
-    assert ("SAL-2893-x", "Done") in linear_calls, (
-        f"SAL-2893: ESCALATED must transition Linear to Done; got {linear_calls}"
+    # Linear MUST receive a Backlog transition (post-2026-04-27 follow-up).
+    # Backlog escapes the orphan-active sweep (which only scans In Progress)
+    # without falsely claiming the ticket shipped.
+    assert ("SAL-2893-x", "Backlog") in linear_calls, (
+        f"SAL-2893 follow-up: ESCALATED must transition Linear to Backlog; "
+        f"got {linear_calls}"
     )
-    # And NOT Backlog — the SAL-2886 negative invariant still holds.
-    assert ("SAL-2893-x", "Backlog") not in linear_calls, (
-        f"escalate path must NOT roll Linear back to Backlog: {linear_calls}"
+    # And NOT Done — the false-completion shape this fix overturns.
+    assert ("SAL-2893-x", "Done") not in linear_calls, (
+        f"escalate path must NOT mark Linear Done (false completion); "
+        f"got {linear_calls}"
+    )
+    # human-assigned label applied so dispatch-gate excuses the ticket.
+    assert ("SAL-2893-x", "human-assigned") in label_calls, (
+        f"escalate path must apply human-assigned label; got {label_calls}"
     )
     # Comment helper invoked exactly once with the grounding-gap identifier.
     assert comment_calls == [("SAL-2893-x", "SAL-2999")], (
@@ -5114,18 +5181,23 @@ async def test_escalated_transitions_linear_to_done_with_grounding_gap_link(
     )
     # ticket.linear_state was updated locally to mirror the Linear write so
     # the next tick / restore sees the new state without a Linear re-read.
-    assert t.linear_state == "Done", (
-        f"ticket.linear_state must be updated to Done locally: {t.linear_state}"
+    assert t.linear_state == "Backlog", (
+        f"ticket.linear_state must be updated to Backlog locally: "
+        f"{t.linear_state}"
     )
 
 
 async def test_escalated_does_not_transition_if_already_done(monkeypatch):
-    """SAL-2893 idempotency guard: if Linear is already "Done" on entry to
-    the ESCALATED branch (e.g. operator manually closed it, or this is a
-    re-entry from rehydrated state), the orchestrator must NOT call
-    ``_update_linear_state`` again and must NOT post a duplicate comment.
-    The ticket still transitions to ``TicketStatus.ESCALATED`` and still
-    records the ``ticket_escalated`` event.
+    """SAL-2893 idempotency guard: if Linear is already in a terminal /
+    non-active state on entry to the ESCALATED branch (e.g. operator
+    manually closed it, this is a re-entry from rehydrated state, or this
+    is a historical mis-Done ticket from the pre-2026-04-27 codepath), the
+    orchestrator must NOT call ``_update_linear_state`` again, must NOT
+    apply the ``human-assigned`` label, and must NOT post a duplicate
+    comment. The ticket still transitions to ``TicketStatus.ESCALATED``
+    and still records the ``ticket_escalated`` event. "Done" stays in the
+    guard list specifically so historical mis-Done tickets are not
+    re-touched on every poll tick.
     """
     mesh = _FakeMesh()
     orch = _mk_orchestrator(mesh=mesh)
@@ -5142,6 +5214,13 @@ async def test_escalated_does_not_transition_if_already_done(monkeypatch):
         linear_calls.append((ticket.identifier, state_name))
 
     monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    label_calls: list[tuple[str, str]] = []
+
+    async def _fake_label(ticket, label_name):
+        label_calls.append((ticket.identifier, label_name))
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
 
     comment_calls: list[tuple[str, str]] = []
 
@@ -5177,22 +5256,135 @@ async def test_escalated_does_not_transition_if_already_done(monkeypatch):
     ]
     assert len(escalated_events) == 1
     assert escalated_events[0]["grounding_gap"] == "SAL-3000"
-    # Idempotency: no Linear write, no comment.
+    # Idempotency: no Linear write, no label apply, no comment.
     assert linear_calls == [], (
         f"idempotency violated: Linear must not be re-written when already "
-        f"Done; got {linear_calls}"
+        f"in a terminal / non-active state; got {linear_calls}"
+    )
+    assert label_calls == [], (
+        f"idempotency violated: human-assigned label must not be re-applied "
+        f"when Linear is already in a terminal / non-active state; "
+        f"got {label_calls}"
     )
     assert comment_calls == [], (
         f"idempotency violated: comment must not be re-posted when already "
-        f"Done; got {comment_calls}"
+        f"in a terminal / non-active state; got {comment_calls}"
     )
 
 
-async def test_grounding_gap_link_in_done_comment_matches_record_event_id(
+# ── SAL-2893 follow-up · 2026-04-27 phantom-Done bug regression ─────────────
+#
+# Pinned regression test for the bug: ``_poll_children`` previously flipped
+# Linear to "Done" on a grounding-gap envelope. On 2026-04-27 four MC v1 GA
+# tickets (SAL-2597, SAL-2627, SAL-2668, SAL-2677) were silently marked Done
+# with no merged PR. This test asserts the four-part invariant that closes
+# the bug: Backlog (not Done), human-assigned label applied, ESCALATED
+# status, ticket.linear_state mirrored to Backlog. Drift on any of the four
+# is a regression of the phantom-Done flip.
+
+
+async def test_escalated_grounding_gap_phantom_done_regression(monkeypatch):
+    """Pin the four-part invariant of the 2026-04-27 follow-up to SAL-2893.
+
+    On a grounding-gap envelope the orchestrator MUST:
+      1. call ``_update_linear_state(ticket, "Backlog")`` (NOT "Done"),
+      2. call ``_apply_linear_label(ticket, "human-assigned")``,
+      3. set ``ticket.status == TicketStatus.ESCALATED``,
+      4. set ``ticket.linear_state == "Backlog"``.
+
+    Drift on any of these four is a regression of the phantom-Done flip
+    that mis-marked SAL-2597, SAL-2627, SAL-2668, SAL-2677 as Done with
+    no merged PR.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t(
+        "u-pdr", "SAL-PDR", "TIR-01", 0, "tiresias", size="S", estimate=1,
+    )
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-phantom-done-regression"
+    t.linear_state = "In Progress"  # the realistic pre-escalate state
+    _seed_graph(orch, [t])
+
+    state_calls: list[tuple[str, str]] = []
+
+    async def _capture_state(ticket, state_name):
+        state_calls.append((ticket.identifier, state_name))
+
+    monkeypatch.setattr(orch, "_update_linear_state", _capture_state)
+
+    label_calls: list[tuple[str, str]] = []
+
+    async def _capture_label(ticket, label_name):
+        label_calls.append((ticket.identifier, label_name))
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _capture_label)
+
+    # Stub the comment helper to avoid hitting BUILTIN_TOOLS.
+    async def _noop_comment(ticket, grounding_gap_ident):
+        return None
+
+    monkeypatch.setattr(
+        orch, "_post_escalated_linear_comment", _noop_comment
+    )
+
+    mesh.completed_tasks.append({
+        "id": "child-phantom-done-regression",
+        "title": "[persona:alfred-coo-a] [wave-0] [tiresias] SAL-PDR ...",
+        "status": "completed",
+        "result": {
+            "tool_calls": [{
+                "name": "linear_create_issue",
+                "result": {
+                    "identifier": "SAL-9999",
+                    "title": "grounding gap: SAL-PDR target merged in prior wave",
+                    "url": "https://linear.app/saluca/issue/SAL-9999",
+                },
+            }],
+            "summary": "Escalated due to PATH_CONFLICT on already-merged target",
+        },
+    })
+
+    await orch._poll_children()
+
+    # (3) ESCALATED status set.
+    assert t.status == TicketStatus.ESCALATED, (
+        f"grounding-gap envelope must set ticket.status to ESCALATED; "
+        f"got {t.status}"
+    )
+
+    # (1) Linear state -> Backlog, not Done.
+    assert ("SAL-PDR", "Backlog") in state_calls, (
+        f"phantom-Done regression: ESCALATED must transition Linear to "
+        f"Backlog (not Done); got {state_calls}"
+    )
+    assert ("SAL-PDR", "Done") not in state_calls, (
+        f"phantom-Done regression: ESCALATED MUST NOT mark Linear Done "
+        f"(false completion claim); got {state_calls}"
+    )
+
+    # (2) human-assigned label applied so the dispatch-gate
+    # (fix/dispatch-gate-human-assigned-AB-17-v) excuses this ticket on
+    # the next kickoff.
+    assert ("SAL-PDR", "human-assigned") in label_calls, (
+        f"phantom-Done regression: ESCALATED must apply human-assigned "
+        f"label so dispatch-gate excuses the ticket; got {label_calls}"
+    )
+
+    # (4) ticket.linear_state mirrors the Linear write so the next tick /
+    # rehydrated restore agrees with Linear without a re-read.
+    assert t.linear_state == "Backlog", (
+        f"phantom-Done regression: ticket.linear_state must mirror the "
+        f"Backlog write; got {t.linear_state!r}"
+    )
+
+
+async def test_grounding_gap_link_in_escalate_comment_matches_record_event_id(
     monkeypatch,
 ):
     """SAL-2893 audit-trail invariant: the grounding-gap identifier
-    embedded in the Linear "Done" comment body MUST be byte-identical to
+    embedded in the Linear escalate-comment body MUST be byte-identical to
     the ``grounding_gap`` value recorded in the ``ticket_escalated`` soul
     event for the same tick. This is what lets a human follow the
     operator-readable Linear comment back to the soul-memory event log
@@ -5215,6 +5407,12 @@ async def test_grounding_gap_link_in_done_comment_matches_record_event_id(
         return None
 
     monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    # 2026-04-27 follow-up: ESCALATED branch also calls _apply_linear_label.
+    async def _fake_label(ticket, label_name):
+        return None
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
 
     # Inject a fake ``linear_add_comment`` spec into BUILTIN_TOOLS for
     # this test — the real tool isn't registered yet and the helper has

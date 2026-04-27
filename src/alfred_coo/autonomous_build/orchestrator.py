@@ -3304,24 +3304,45 @@ class AutonomousBuildOrchestrator:
                     identifier=ticket.identifier,
                     grounding_gap=grounding_gap_ident,
                 )
-                # SAL-2893: transition Linear to "Done" with a grounding-gap
-                # link. PR #91 left Linear untouched on ESCALATED, so each
-                # subsequent kickoff's ``build_ticket_graph`` re-read it as
-                # ``in_progress`` and AB-17-y burned 30 min on the orphan-
-                # active sweep. Moving Linear to "Done" here makes the next
-                # kickoff see a terminal state and skip the ticket entirely.
-                # Idempotency guard: skip the write + comment if Linear is
-                # already in a "done"-equivalent state (operator closed it
-                # manually, or this is re-entry from rehydrated state).
-                already_done = (ticket.linear_state or "").strip().lower() in (
+                # SAL-2893 (original): transitioned Linear to "Done" with a
+                # grounding-gap link so ``build_ticket_graph`` would not
+                # re-read it as ``in_progress`` and AB-17-y would not catch
+                # it on the orphan-active sweep next kickoff. PR #91 had left
+                # Linear untouched on ESCALATED, which burned 30 min per
+                # kickoff on the same stale ticket.
+                #
+                # 2026-04-27 follow-up (this fix): "Done" was the wrong
+                # target. It falsely claimed the ticket had shipped — on
+                # 2026-04-27 four tickets in the MC v1 GA project (SAL-2597,
+                # SAL-2627, SAL-2668, SAL-2677) were marked Done with no
+                # merged PR because they hit this branch. Backlog also
+                # escapes the orphan-active sweep (which only scans In
+                # Progress, see ``_sweep_orphan_active``), without
+                # misrepresenting the ticket as shipped. We additionally
+                # apply the ``human-assigned`` label so the dispatch-gate
+                # fix (fix/dispatch-gate-human-assigned-AB-17-v) excuses
+                # the ticket on the next kickoff until a human resolves
+                # the grounding gap — preventing a re-dispatch loop where
+                # the same gap surfaces every kickoff.
+                #
+                # Idempotency guard: skip the write + comment + label if
+                # Linear is already in a non-active state (operator already
+                # closed it manually, or this is re-entry from rehydrated
+                # state). "Done" stays in the guard list because historical
+                # mis-Done tickets — produced by the pre-fix branch — must
+                # not be re-touched and re-commented on every poll tick.
+                already_terminal = (ticket.linear_state or "").strip().lower() in (
+                    "backlog",
                     "done", "merged", "released", "completed",
+                    "canceled", "cancelled", "duplicate",
                 )
-                if not already_done:
-                    await self._update_linear_state(ticket, "Done")
+                if not already_terminal:
+                    await self._update_linear_state(ticket, "Backlog")
+                    await self._apply_linear_label(ticket, "human-assigned")
                     await self._post_escalated_linear_comment(
                         ticket, grounding_gap_ident
                     )
-                    ticket.linear_state = "Done"
+                    ticket.linear_state = "Backlog"
                 updated.append(ticket)
                 continue
             if pr_url:
@@ -4438,7 +4459,7 @@ class AutonomousBuildOrchestrator:
                 "**Grounding gap:** identifier unavailable in child envelope"
             )
         body_lines = [
-            "## SAL-2886 escalate-path fired (SAL-2893)",
+            "## SAL-2886 escalate-path fired (SAL-2893, 2026-04-27 follow-up)",
             "",
             link_line,
             "",
@@ -4446,11 +4467,19 @@ class AutonomousBuildOrchestrator:
                 "The alfred-coo-a builder emitted a `linear_create_issue` "
                 "tool call resolving to a grounding-gap issue rather than "
                 "opening a PR. The orchestrator transitioned this parent "
-                "ticket to `Done` to prevent stale orphan-active across "
-                "subsequent kickoffs (PR #91 left Linear untouched, which "
-                "blocked 30 min on AB-17-y every kickoff). Operator: "
-                "inspect the linked grounding-gap issue, resolve the gap, "
-                "then re-open or re-file this ticket as needed."
+                "ticket to `Backlog` and applied the `human-assigned` "
+                "label. Backlog escapes AB-17-y's orphan-active sweep "
+                "(which only scans `In Progress`) without falsely "
+                "claiming the work shipped — the original SAL-2893 fix "
+                "wrote `Done` here, which on 2026-04-27 marked four "
+                "tickets in MC v1 GA done with no PR merged. The "
+                "`human-assigned` label gates the dispatch-gate "
+                "(fix/dispatch-gate-human-assigned-AB-17-v) so next "
+                "kickoff excuses this ticket until a human resolves the "
+                "grounding gap. Operator: inspect the linked grounding-gap "
+                "issue, resolve the gap, then remove the `human-assigned` "
+                "label (or re-file the ticket) to let the daemon pick it "
+                "back up."
             ),
         ]
         body = "\n".join(body_lines)
@@ -5478,6 +5507,43 @@ class AutonomousBuildOrchestrator:
             logger.exception(
                 "linear_update_issue_state raised for %s -> %s",
                 ticket.identifier, state_name,
+            )
+
+    async def _apply_linear_label(self, ticket: Ticket, label_name: str) -> None:
+        """Attach a Linear label to a ticket via AB-03's ``linear_add_label_to_issue``.
+
+        Mirrors ``_update_linear_state`` exactly: import + spec lookup +
+        defensive try/except. Failure is logged and swallowed — our graph
+        stays source of truth, and the worst case is the dispatch-gate
+        skip-on-``human-assigned`` doesn't fire on the next kickoff
+        (orphan-active still won't trip because Linear was just moved
+        out of "In Progress").
+
+        Used by the ESCALATED branch in ``_poll_children`` to mark
+        grounding-gap tickets as ``human-assigned`` so the dispatch-gate
+        fix (fix/dispatch-gate-human-assigned-AB-17-v) excuses them on
+        subsequent kickoffs until a human resolves the gap. Idempotent
+        server-side per Linear's API contract.
+        """
+        try:
+            from alfred_coo.tools import BUILTIN_TOOLS
+        except Exception:
+            logger.debug("tools not importable; skipping Linear label apply")
+            return
+        spec = BUILTIN_TOOLS.get("linear_add_label_to_issue")
+        if spec is None:
+            return
+        try:
+            resp = await spec.handler(issue_id=ticket.id, label_name=label_name)
+            if isinstance(resp, dict) and resp.get("error"):
+                logger.warning(
+                    "linear_add_label_to_issue(%s, %s) returned error: %s",
+                    ticket.identifier, label_name, resp["error"],
+                )
+        except Exception:
+            logger.exception(
+                "linear_add_label_to_issue raised for %s -> %s",
+                ticket.identifier, label_name,
             )
 
     # ── Wave-iteration optimizations (Fix A + Fix B) ───────────────────────
