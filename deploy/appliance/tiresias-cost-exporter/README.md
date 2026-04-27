@@ -1,8 +1,16 @@
-# tiresias-cost-exporter
+# Tiresias Cost Exporter
 
-A lightweight Prometheus exporter written in Go that scrapes the `tiresias_audit_log` (not implemented in this stub) and exposes two metrics:
+A small Go exporter that scrapes the `tiresias_audit_log` table every 60 seconds and exposes two Prometheus counters:
 
-- `mc_tokens_total{tenant_id, persona_id, model, provider}` – total token count.
-- `mc_cost_usd_total{tenant_id, persona_id, model, provider}` – total cost in USD.
+- `mc_tokens_total{tenant_id,persona_id,model,provider}` – total tokens processed.
+- `mc_cost_usd_total{tenant_id,persona_id,model,provider}` – total cost in USD.
 
-The service listens on port **9100** and serves metrics at `/metrics`. It is intended to run as part of the `alfred-coo-svc` appliance compose.
+The exporter runs as a Docker container on the appliance and is reachable at `http://tiresias-cost-exporter:9090/metrics`.
+
+## Building
+```sh
+docker build -t tiresias-cost-exporter ./deploy/appliance/tiresias-cost-exporter
+```
+
+## Running (in docker‑compose)
+Add a service entry referencing the built image and expose port 9090.
