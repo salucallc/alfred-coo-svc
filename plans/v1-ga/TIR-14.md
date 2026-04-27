@@ -17,3 +17,4 @@
 - Reliance on Docker container names (`alfred-coo`) may change.
 - Direct network failure detection may be flaky in CI environments.
 - Placeholder implementations need real service endpoints for full verification.
+
