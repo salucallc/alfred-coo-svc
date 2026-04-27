@@ -22,3 +22,5 @@ def get_token(scopes: List[str]) -> str:
     # resp = httpx.post(AUTHELIA_TOKEN_URL, data=data, headers=headers, timeout=10.0)
     # resp.raise_for_status()
     # return resp.json()["access_token"]
+
+from .ttl_validator import validate_ttl  # noqa: F401
