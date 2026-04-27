@@ -28,6 +28,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 logger = logging.getLogger("alfred_coo.autonomous_build.ss08_gate")
 
 
+# Default for the new SAL-2890 relaxed-matching path. Flipped on by default
+# going forward; pin to False in tests / dry-run if strict-only behaviour
+# is needed for regression checks against the AB-03 contract.
+RELAXED_ACK_MATCHING: bool = True
+
+
 # Hardcoded per 2026-04-23 decision — bot lacks `users:read.email` scope.
 # See reference_cristian_slack_user_id.md.
 CRISTIAN_SLACK_USER_ID = "U0AH88KHZ4H"
@@ -80,6 +86,11 @@ async def run_ss08_gate(
     timeout_seconds: int = GATE_TIMEOUT_SECONDS,
     poll_interval_seconds: int = GATE_POLL_INTERVAL_SECONDS,
     author_user_id: str = CRISTIAN_SLACK_USER_ID,
+    on_ack_detected: Optional[
+        Callable[[Dict[str, Any]], Awaitable[None]]
+    ] = None,
+    relaxed: bool = RELAXED_ACK_MATCHING,
+    single_pending: bool = True,
 ) -> bool:
     """Post the SS-08 JWS claims schema to #batcave and wait for ACK.
 
@@ -96,6 +107,23 @@ async def run_ss08_gate(
             tests.
         author_user_id: Slack user id of the approver. Defaults to the
             hardcoded Cristian id; exposed as a kwarg for tests.
+        on_ack_detected: Optional async callback fired with the ACK
+            metadata BEFORE the cadence ack-confirmation post. The
+            orchestrator uses this to persist the ACK to soul memory so a
+            subsequent daemon restart can short-circuit the gate. The
+            payload includes ``ack_message_ts``, ``ack_message_text``,
+            ``acked_by_user_id``, ``acked_at`` (ISO-8601 UTC), and
+            ``matched_keyword``. Failures inside the callback are logged
+            but do not abort the gate — the in-process state still flips
+            to acked.
+        relaxed: Pass ``relaxed=True`` to the underlying poll so threaded
+            replies and short-form ACKs (``approved``/``lgtm``/``👍``)
+            count. Default ``RELAXED_ACK_MATCHING`` (True). Strict regex
+            still applies in addition.
+        single_pending: Forwarded to the poll's ``single_pending`` flag.
+            Default True because SS-08 is the only gate the orchestrator
+            currently posts; flip to False if the orchestrator is ever
+            extended to interleave gates.
 
     Returns:
         True if an ACK was detected before timeout; False on timeout.
@@ -107,10 +135,13 @@ async def run_ss08_gate(
     """
     log = logger_ or logger
 
-    # 1. Post the schema. `cadence.post` wraps the real `slack_post` tool.
+    # 1. Post the schema. `cadence.post` wraps the real `slack_post` tool
+    #    and returns the Slack response dict including ``ts`` (the gate
+    #    post's own timestamp). We capture that ts to enable
+    #    ``conversations.replies`` lookups for threaded ACKs (Fix E).
     schema_msg = f"GATE: SS-08 JWS claims schema\n\n{JWS_CLAIMS_SCHEMA_YAML}"
     try:
-        await cadence.post(schema_msg)
+        post_resp = await cadence.post(schema_msg)
     except Exception:
         log.exception("failed to post SS-08 gate schema; aborting gate")
         # Can't run the gate without even posting the schema — the
@@ -118,24 +149,49 @@ async def run_ss08_gate(
         # silently dispatch SS-08 without approval.
         return False
 
-    # 2. Anchor the gate at the current wall-clock time. We don't have
-    #    access to the Slack-assigned ts of the schema post without
-    #    upgrading `cadence.post` to return its payload, and the
-    #    `after_ts` filter in `slack_ack_poll` is a `conversations.history`
-    #    `oldest` parameter that takes a unix float. Using our local clock
-    #    is a safe approximation — the worst case is we pick up a reply
+    gate_post_ts_str: Optional[str] = None
+    if isinstance(post_resp, dict):
+        ts_val = post_resp.get("ts")
+        if isinstance(ts_val, str) and ts_val:
+            gate_post_ts_str = ts_val
+        elif isinstance(ts_val, (int, float)):
+            gate_post_ts_str = f"{float(ts_val):.6f}"
+
+    # 2. Anchor the gate at the current wall-clock time. The
+    #    ``after_ts`` filter in ``slack_ack_poll`` is a
+    #    ``conversations.history`` ``oldest`` parameter that takes a unix
+    #    float as string. Using our local clock is a safe approximation
+    #    of the gate post time — the worst case is we pick up a reply
     #    that predates the post by a few seconds, which is fine (Cristian
-    #    isn't typing an ACK before the post exists).
-    gate_post_ts = time.time()
-    after_ts_str = f"{gate_post_ts:.6f}"
+    #    isn't typing an ACK before the post exists). The Slack-assigned
+    #    ``ts`` (when available) is used separately as the thread anchor.
+    gate_post_clock = time.time()
+    after_ts_str = f"{gate_post_clock:.6f}"
     log.info(
-        "SS-08 gate posted; polling #%s for ACK from %s (timeout=%ds, interval=%ds)",
-        cadence.channel, author_user_id, timeout_seconds, poll_interval_seconds,
+        "SS-08 gate posted (slack_ts=%s); polling #%s for ACK from %s "
+        "(timeout=%ds, interval=%ds, relaxed=%s, single_pending=%s)",
+        gate_post_ts_str or "(unknown)", cadence.channel, author_user_id,
+        timeout_seconds, poll_interval_seconds, relaxed, single_pending,
     )
+
+    # Build the poll kwargs once. The relaxed-matcher flags are
+    # default-on; tests can disable via the ``relaxed=False`` kwarg.
+    poll_kwargs: Dict[str, Any] = {
+        "channel": cadence.channel,
+        "after_ts": after_ts_str,
+        "author_user_id": author_user_id,
+        "keywords": ACK_KEYWORDS,
+    }
+    if gate_post_ts_str:
+        poll_kwargs["gate_post_ts"] = gate_post_ts_str
+    if relaxed:
+        poll_kwargs["relaxed"] = True
+    if single_pending:
+        poll_kwargs["single_pending"] = True
 
     # 3. Poll loop.
     while True:
-        elapsed = time.time() - gate_post_ts
+        elapsed = time.time() - gate_post_clock
         if elapsed > timeout_seconds:
             # Timeout branch (D2: defer to v1.1).
             timeout_msg = (
@@ -153,12 +209,27 @@ async def run_ss08_gate(
             return False
 
         try:
-            resp = await slack_ack_poll_fn(
-                channel=cadence.channel,
-                after_ts=after_ts_str,
-                author_user_id=author_user_id,
-                keywords=ACK_KEYWORDS,
-            )
+            resp = await slack_ack_poll_fn(**poll_kwargs)
+        except TypeError:
+            # Backwards compatibility: a stub poll fn that hasn't been
+            # updated to accept the new kwargs. Drop them and retry once
+            # before falling through to the transient-error branch.
+            legacy_kwargs = {
+                "channel": cadence.channel,
+                "after_ts": after_ts_str,
+                "author_user_id": author_user_id,
+                "keywords": ACK_KEYWORDS,
+            }
+            try:
+                resp = await slack_ack_poll_fn(**legacy_kwargs)
+            except Exception as e:
+                log.warning(
+                    "slack_ack_poll raised on legacy fallback (%s: %s); "
+                    "retrying after %ds",
+                    type(e).__name__, e, poll_interval_seconds,
+                )
+                await asyncio.sleep(poll_interval_seconds)
+                continue
         except Exception as e:
             # Transient (network, 5xx). Log + sleep + retry on next tick.
             log.warning(
@@ -180,10 +251,34 @@ async def run_ss08_gate(
         if isinstance(resp, dict) and resp.get("matched"):
             matched_kw = resp.get("matched_keyword") or "(unknown)"
             message_ts = resp.get("message_ts") or "(unknown)"
+            via = resp.get("via") or "strict"
             log.info(
-                "SS-08 gate ACKED by %s (keyword=%r, ts=%s) after %ds",
-                author_user_id, matched_kw, message_ts, int(elapsed),
+                "SS-08 gate ACKED by %s (keyword=%r, ts=%s, via=%s) after %ds",
+                author_user_id, matched_kw, message_ts, via, int(elapsed),
             )
+
+            # Fire the persistence callback BEFORE posting the ack
+            # confirmation. The callback's failure must not block the
+            # gate — the in-process flip is still the source of truth
+            # for the running orchestrator.
+            if on_ack_detected is not None:
+                ack_payload = {
+                    "ack_message_ts": resp.get("message_ts"),
+                    "ack_message_text": resp.get("text"),
+                    "acked_by_user_id": author_user_id,
+                    "acked_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                    ),
+                    "matched_keyword": matched_kw,
+                    "via": via,
+                }
+                try:
+                    await on_ack_detected(ack_payload)
+                except Exception:
+                    log.exception(
+                        "on_ack_detected callback raised; proceeding anyway"
+                    )
+
             ack_msg = (
                 "✅ SS-08 gate acknowledged — "
                 "proceeding with PQ receipt endpoint build."

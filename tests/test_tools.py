@@ -714,6 +714,279 @@ async def test_slack_ack_poll_paginates_on_cursor(monkeypatch):
     assert "dXNlcjpVMDYxTkZUVDI" in captured[1].full_url
 
 
+# ── SAL-2890 Fix E: relaxed matcher (threaded + single-pending) ───────────
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_strict_still_matches_with_ss08_token(monkeypatch):
+    """Non-threaded message with body=`approve SS-08` → still matches via
+    the original AB-03 strict regex. No regression.
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    _install_urlopen_queue(monkeypatch, [{
+        "ok": True,
+        "has_more": False,
+        "messages": [
+            {"ts": "150.0", "user": "U1", "text": "approve SS-08"},
+        ],
+    }])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="100.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],
+        # Default relaxed=False — strict-only should still hit.
+    )
+    assert result["matched"] is True
+    assert result.get("via") == "strict"
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_threaded_relaxed_matches_approved(monkeypatch):
+    """Threaded reply (`thread_ts == gate_post_ts`) with body=`approved` →
+    matches under relaxed mode despite missing the SS-08 token.
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    # First call: conversations.replies (thread fetch). Returns the gate
+    # parent + a threaded reply with bare `approved`.
+    # Second call: conversations.history (channel scan). No matches.
+    _install_urlopen_queue(monkeypatch, [
+        {
+            "ok": True,
+            "has_more": False,
+            "messages": [
+                # Parent (gate post itself) — must be skipped.
+                {"ts": "1000.0", "user": "Ubot", "text": "GATE: SS-08 schema..."},
+                # Threaded reply from Cristian.
+                {"ts": "1100.0", "user": "U1", "text": "approved",
+                 "thread_ts": "1000.0"},
+            ],
+        },
+        {
+            "ok": True,
+            "has_more": False,
+            "messages": [],
+        },
+    ])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="999.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],  # strict won't match
+        gate_post_ts="1000.0",
+        relaxed=True,
+        single_pending=False,
+    )
+    assert result["matched"] is True
+    assert result["message_ts"] == "1100.0"
+    assert result.get("via") == "thread"
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_threaded_relaxed_matches_thumbsup(monkeypatch):
+    """Threaded reply with body=`👍` → matches under relaxed mode."""
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    _install_urlopen_queue(monkeypatch, [
+        {
+            "ok": True,
+            "has_more": False,
+            "messages": [
+                {"ts": "1000.0", "user": "Ubot", "text": "GATE: SS-08 schema"},
+                {"ts": "1100.0", "user": "U1", "text": "👍",
+                 "thread_ts": "1000.0"},
+            ],
+        },
+        {"ok": True, "has_more": False, "messages": []},
+    ])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="999.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],
+        gate_post_ts="1000.0",
+        relaxed=True,
+    )
+    assert result["matched"] is True
+    assert result["message_ts"] == "1100.0"
+    assert result.get("via") == "thread"
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_relaxed_off_rejects_threaded_short_form(
+    monkeypatch,
+):
+    """Default `relaxed=False`: a threaded `approved` does NOT match.
+    The strict regex is the only authority.
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    _install_urlopen_queue(monkeypatch, [{
+        "ok": True,
+        "has_more": False,
+        "messages": [
+            {"ts": "1100.0", "user": "U1", "text": "approved",
+             "thread_ts": "1000.0"},
+        ],
+    }])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="999.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],  # requires SS-08 token
+        # No gate_post_ts, no relaxed → no thread fetch, strict-only.
+    )
+    assert result == {"matched": False}
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_single_pending_matches_non_threaded_approved(
+    monkeypatch,
+):
+    """`single_pending=True` + `relaxed=True` → bare "approved" in the
+    main channel (not threaded) matches because we know the ACK target
+    is unambiguous.
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    _install_urlopen_queue(monkeypatch, [{
+        "ok": True,
+        "has_more": False,
+        "messages": [
+            {"ts": "150.0", "user": "U1", "text": "approved"},
+        ],
+    }])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="100.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],  # strict won't match
+        relaxed=True,
+        single_pending=True,
+    )
+    assert result["matched"] is True
+    assert result.get("via") == "single_pending"
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_relaxed_without_guards_rejects_short_form(
+    monkeypatch,
+):
+    """Spec acceptance: non-threaded message with body=`approved` and 2
+    gates pending (i.e. `single_pending=False`) → does NOT match. The
+    single-gate-inference safety must hold.
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    _install_urlopen_queue(monkeypatch, [{
+        "ok": True,
+        "has_more": False,
+        "messages": [
+            {"ts": "150.0", "user": "U1", "text": "approved"},
+        ],
+    }])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="100.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],
+        relaxed=True,
+        single_pending=False,  # multi-gate world
+        # No gate_post_ts → no thread context either.
+    )
+    assert result == {"matched": False}
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_thread_call_uses_replies_endpoint(monkeypatch):
+    """When `gate_post_ts` is supplied, the FIRST HTTP call must hit
+    `conversations.replies` (not `conversations.history`).
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    captured = _install_urlopen_queue(monkeypatch, [
+        # Replies fetch — empty, so we fall through to history.
+        {"ok": True, "has_more": False, "messages": []},
+        # History scan — also empty.
+        {"ok": True, "has_more": False, "messages": []},
+    ])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="999.0",
+        author_user_id="U1",
+        keywords=[r"ack"],
+        gate_post_ts="1000.0",
+        relaxed=True,
+    )
+    assert result == {"matched": False}
+    assert len(captured) == 2
+    assert "conversations.replies" in captured[0].full_url
+    assert "ts=1000.0" in captured[0].full_url
+    assert "conversations.history" in captured[1].full_url
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_strict_still_wins_over_relaxed(monkeypatch):
+    """When the strict regex matches, the result reports `via="strict"`
+    even with relaxed=True. Strict is the canonical path.
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    _install_urlopen_queue(monkeypatch, [{
+        "ok": True,
+        "has_more": False,
+        "messages": [
+            {"ts": "150.0", "user": "U1", "text": "ACK SS-08 go"},
+        ],
+    }])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="100.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],
+        relaxed=True,
+        single_pending=True,
+    )
+    assert result["matched"] is True
+    assert result.get("via") == "strict"
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_thread_skips_parent_message(monkeypatch):
+    """The gate parent post (msg.ts == gate_post_ts) MUST NOT be matched
+    even if its text contains "approved" — replies only.
+    """
+    monkeypatch.setenv("SLACK_BOT_TOKEN_ALFRED", "xoxb-fake")
+    _install_urlopen_queue(monkeypatch, [
+        {
+            "ok": True,
+            "has_more": False,
+            "messages": [
+                # Parent (text would relaxed-match if not skipped).
+                {"ts": "1000.0", "user": "U1",
+                 "text": "GATE: SS-08 — approved schema attached"},
+            ],
+        },
+        {"ok": True, "has_more": False, "messages": []},
+    ])
+    result = await slack_ack_poll(
+        channel="C0ASAKFTR1C",
+        after_ts="999.0",
+        author_user_id="U1",
+        keywords=[r"(ack|approve(d)?)\s*ss[-_\s]?08"],  # strict won't match
+        gate_post_ts="1000.0",
+        relaxed=True,
+        single_pending=False,
+    )
+    assert result == {"matched": False}
+
+
+@pytest.mark.asyncio
+async def test_slack_ack_poll_schema_includes_relaxed_fields():
+    """The new optional fields must surface in the OpenAI tool schema."""
+    schema = openai_tool_schema(BUILTIN_TOOLS["slack_ack_poll"])
+    props = schema["function"]["parameters"]["properties"]
+    for key in ("gate_post_ts", "relaxed", "single_pending"):
+        assert key in props, f"missing optional schema property {key!r}"
+    # Original required set unchanged.
+    required = schema["function"]["parameters"]["required"]
+    assert set(required) == {"channel", "after_ts", "author_user_id", "keywords"}
+
+
 @pytest.mark.asyncio
 async def test_linear_update_issue_state_missing_key(monkeypatch):
     monkeypatch.delenv("LINEAR_API_KEY", raising=False)

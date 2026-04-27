@@ -418,3 +418,345 @@ def test_gate_timeout_constant_is_four_hours():
 
 def test_gate_poll_interval_constant_is_two_minutes():
     assert gate_mod.GATE_POLL_INTERVAL_SECONDS == 2 * 60
+
+
+# ── SAL-2890 Fix D: ACK persistence + pre-ACK skip ────────────────────────
+
+
+async def test_orchestrator_skips_poll_when_prior_ack_in_soul(monkeypatch):
+    """A fresh persisted gate-ACK record short-circuits the poll: no
+    Slack traffic, ``state.ss08_acked`` flips True, ``ss08_gate_preacked``
+    event recorded.
+    """
+    import time as _time
+    from alfred_coo.autonomous_build.state import (
+        gate_ack_topic_for,
+    )
+
+    # Pre-seed soul memory with a fresh (today) ACK for project P.
+    project_id = "proj-pre-acked"
+    fresh_acked_at = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    seeded = _FakeSoul()
+    seeded.writes.append({
+        "content": (
+            '{"linear_project_id": "%s", "gate_name": "SS-08", '
+            '"acked_at": "%s", "acked_by_user_id": "U0AH88KHZ4H", '
+            '"ack_message_ts": "1234.56", "ack_message_text": "approved"}'
+            % (project_id, fresh_acked_at)
+        ),
+        "topics": [gate_ack_topic_for(project_id, "SS-08")],
+    })
+
+    # Wire `_FakeSoul.recent_memories` to actually return the seeded write.
+    async def _recent(limit=5, topics=None):
+        if not topics:
+            return list(seeded.writes)
+        out = []
+        for w in seeded.writes:
+            if any(t in (w.get("topics") or []) for t in topics):
+                out.append(w)
+        return out[:limit]
+
+    seeded.recent_memories = _recent  # type: ignore[assignment]
+
+    orch = _mk_orchestrator(soul=seeded)
+    orch.linear_project_id = project_id
+    ticket = _mk_ss08_ticket(is_critical_path=False)
+
+    # Guard: if we ever reach run_ss08_gate, fail loudly.
+    import alfred_coo.autonomous_build.ss08_gate as gm
+
+    async def _boom(*a, **kw):
+        raise AssertionError(
+            "run_ss08_gate must not be invoked when a fresh persisted "
+            "ACK exists in soul memory"
+        )
+
+    monkeypatch.setattr(gm, "run_ss08_gate", _boom)
+
+    allowed = await orch._maybe_ss08_gate(ticket)
+
+    assert allowed is True
+    assert orch.state.ss08_acked is True
+    event_kinds = [e.get("kind") for e in orch.state.events]
+    assert "ss08_gate_preacked" in event_kinds
+
+
+async def test_orchestrator_polls_when_no_prior_ack(monkeypatch):
+    """Empty soul memory → falls through to the live gate. No
+    pre-ack short-circuit, no AssertionError.
+    """
+    soul = _FakeSoul()
+    orch = _mk_orchestrator(soul=soul)
+    orch.linear_project_id = "proj-fresh"
+    ticket = _mk_ss08_ticket(is_critical_path=False)
+
+    import alfred_coo.autonomous_build.ss08_gate as gm
+    polled = {"n": 0}
+
+    async def _gate(**kwargs):
+        polled["n"] += 1
+        # The orchestrator must hand us an on_ack_detected callback now.
+        assert "on_ack_detected" in kwargs
+        return True
+
+    monkeypatch.setattr(gm, "run_ss08_gate", _gate)
+    orch._resolve_slack_ack_poll = lambda: (lambda **_kw: None)  # noqa: E731
+
+    allowed = await orch._maybe_ss08_gate(ticket)
+
+    assert allowed is True
+    assert polled["n"] == 1
+    assert orch.state.ss08_acked is True
+
+
+async def test_orchestrator_persists_ack_via_callback(monkeypatch):
+    """When the gate fires the on_ack_detected callback, a soul-memory
+    write must land under the canonical gate-ack topic so a daemon
+    restart can pick it back up.
+    """
+    soul = _FakeSoul()
+    orch = _mk_orchestrator(soul=soul)
+    orch.linear_project_id = "proj-persist"
+    ticket = _mk_ss08_ticket(is_critical_path=False)
+
+    captured: List[Dict[str, Any]] = []
+
+    import alfred_coo.autonomous_build.ss08_gate as gm
+
+    async def _gate(*, cadence, slack_ack_poll_fn, logger_=None,
+                    on_ack_detected=None, **_kw):
+        # Simulate a successful ACK: invoke the orchestrator-supplied
+        # callback with a representative payload, then return True.
+        if on_ack_detected is not None:
+            payload = {
+                "ack_message_ts": "1777242958.524919",
+                "ack_message_text": "approved SS-08",
+                "acked_by_user_id": "U0AH88KHZ4H",
+                "acked_at": "2026-04-27T00:48:00Z",
+                "matched_keyword": r"ack\s*ss[-_\s]?08",
+                "via": "strict",
+            }
+            captured.append(payload)
+            await on_ack_detected(payload)
+        return True
+
+    monkeypatch.setattr(gm, "run_ss08_gate", _gate)
+    orch._resolve_slack_ack_poll = lambda: (lambda **_kw: None)  # noqa: E731
+
+    allowed = await orch._maybe_ss08_gate(ticket)
+
+    assert allowed is True
+    assert orch.state.ss08_acked is True
+    assert len(captured) == 1
+
+    # A persistence write must appear under the gate-ack topic.
+    from alfred_coo.autonomous_build.state import gate_ack_topic_for
+    expected_topic = gate_ack_topic_for("proj-persist", "SS-08")
+    matching = [
+        w for w in soul.writes
+        if expected_topic in (w.get("topics") or [])
+    ]
+    assert len(matching) >= 1, (
+        f"expected at least one soul write under {expected_topic!r}; "
+        f"got: {[w.get('topics') for w in soul.writes]}"
+    )
+    # Payload sanity: contains the spec'd fields.
+    blob = matching[0]["content"]
+    assert "proj-persist" in blob
+    assert "SS-08" in blob
+    assert "U0AH88KHZ4H" in blob
+    assert "1777242958.524919" in blob
+
+
+async def test_orchestrator_pre_ack_skip_uses_thirty_day_window(monkeypatch):
+    """An ACK written 31 days ago must NOT short-circuit the gate."""
+    import time as _time
+    from alfred_coo.autonomous_build.state import gate_ack_topic_for
+
+    project_id = "proj-stale"
+    seeded = _FakeSoul()
+    # 31 days ago in ISO-8601 UTC.
+    stale_struct = _time.gmtime(_time.time() - 31 * 24 * 60 * 60)
+    stale_acked_at = _time.strftime("%Y-%m-%dT%H:%M:%SZ", stale_struct)
+    seeded.writes.append({
+        "content": (
+            '{"linear_project_id": "%s", "gate_name": "SS-08", '
+            '"acked_at": "%s", "acked_by_user_id": "U0AH88KHZ4H"}'
+            % (project_id, stale_acked_at)
+        ),
+        "topics": [gate_ack_topic_for(project_id, "SS-08")],
+    })
+
+    async def _recent(limit=5, topics=None):
+        out = []
+        for w in seeded.writes:
+            if not topics or any(
+                t in (w.get("topics") or []) for t in topics
+            ):
+                out.append(w)
+        return out[:limit]
+
+    seeded.recent_memories = _recent  # type: ignore[assignment]
+
+    orch = _mk_orchestrator(soul=seeded)
+    orch.linear_project_id = project_id
+    ticket = _mk_ss08_ticket(is_critical_path=False)
+
+    polled = {"n": 0}
+    import alfred_coo.autonomous_build.ss08_gate as gm
+
+    async def _gate(**kwargs):
+        polled["n"] += 1
+        return True
+
+    monkeypatch.setattr(gm, "run_ss08_gate", _gate)
+    orch._resolve_slack_ack_poll = lambda: (lambda **_kw: None)  # noqa: E731
+
+    allowed = await orch._maybe_ss08_gate(ticket)
+
+    assert allowed is True
+    # Must have polled (stale ACK does NOT short-circuit).
+    assert polled["n"] == 1
+
+
+# ── SAL-2890 Fix E: run_ss08_gate forwards relaxed flags ─────────────────
+
+
+async def test_run_ss08_gate_forwards_relaxed_flags_to_poll(_no_sleep_time):
+    """The gate must pass `gate_post_ts` (from the schema-post Slack ts),
+    `relaxed=True`, and `single_pending=True` through to the poll fn.
+    """
+    cadence = _SpyCadence()
+    poll_kwargs_seen: List[Dict[str, Any]] = []
+
+    async def fake_poll(**kwargs):
+        poll_kwargs_seen.append(kwargs)
+        return {"matched": True, "matched_keyword": "approved", "via": "thread",
+                "message_ts": "9999.0", "text": "approved"}
+
+    # Override cadence.post to return a known Slack ts so the gate
+    # captures it.
+    async def _post(message: str) -> Dict[str, Any]:
+        cadence.posts.append(message)
+        return {"ok": True, "ts": "1777242950.000100", "channel": cadence.channel}
+
+    cadence.post = _post  # type: ignore[assignment]
+
+    result = await run_ss08_gate(
+        cadence=cadence,
+        slack_ack_poll_fn=fake_poll,
+    )
+
+    assert result is True
+    assert poll_kwargs_seen, "poll fn was never called"
+    last = poll_kwargs_seen[-1]
+    assert last.get("gate_post_ts") == "1777242950.000100"
+    assert last.get("relaxed") is True
+    assert last.get("single_pending") is True
+
+
+async def test_run_ss08_gate_invokes_on_ack_callback(_no_sleep_time):
+    """`on_ack_detected` callback must fire BEFORE the ack confirmation
+    post and receive the full payload.
+    """
+    cadence = _SpyCadence()
+    captured: List[Dict[str, Any]] = []
+
+    async def fake_poll(**_kwargs):
+        return {
+            "matched": True,
+            "matched_keyword": r"ack\s*ss[-_\s]?08",
+            "via": "strict",
+            "message_ts": "1777.42",
+            "text": "ACK SS-08 go",
+        }
+
+    async def _on_ack(payload):
+        # Confirmation post must NOT have happened yet.
+        assert all("acknowledged" not in p for p in cadence.posts), (
+            "on_ack_detected fired AFTER the confirmation post; "
+            "expected callback BEFORE the confirmation"
+        )
+        captured.append(payload)
+
+    result = await run_ss08_gate(
+        cadence=cadence,
+        slack_ack_poll_fn=fake_poll,
+        on_ack_detected=_on_ack,
+    )
+    assert result is True
+    assert len(captured) == 1
+    payload = captured[0]
+    for k in (
+        "ack_message_ts", "ack_message_text",
+        "acked_by_user_id", "acked_at", "matched_keyword", "via",
+    ):
+        assert k in payload, f"payload missing {k!r}: {payload}"
+    assert payload["ack_message_ts"] == "1777.42"
+    assert payload["acked_by_user_id"] == CRISTIAN_SLACK_USER_ID
+
+
+async def test_run_ss08_gate_callback_failure_does_not_break_gate(
+    _no_sleep_time,
+):
+    """A raising on_ack_detected must not abort the gate — the in-process
+    flip is the source of truth for the running session.
+    """
+    cadence = _SpyCadence()
+
+    async def fake_poll(**_kwargs):
+        return {
+            "matched": True,
+            "matched_keyword": "approved",
+            "via": "single_pending",
+            "message_ts": "1.0",
+            "text": "approved",
+        }
+
+    async def _bad_callback(_payload):
+        raise RuntimeError("simulated soul outage")
+
+    result = await run_ss08_gate(
+        cadence=cadence,
+        slack_ack_poll_fn=fake_poll,
+        on_ack_detected=_bad_callback,
+    )
+    assert result is True
+    # Ack confirmation still posted.
+    assert any("acknowledged" in p for p in cadence.posts)
+
+
+async def test_run_ss08_gate_handles_legacy_poll_fn_signature(_no_sleep_time):
+    """A poll fn that hasn't been updated to accept gate_post_ts /
+    relaxed / single_pending must still work — the gate retries with
+    the legacy 4-kwarg shape on the first TypeError.
+    """
+    cadence = _SpyCadence()
+    legacy_calls: List[Dict[str, Any]] = []
+
+    async def legacy_poll(channel, after_ts, author_user_id, keywords):
+        legacy_calls.append({
+            "channel": channel,
+            "after_ts": after_ts,
+            "author_user_id": author_user_id,
+            "keywords": keywords,
+        })
+        return {
+            "matched": True,
+            "matched_keyword": "ack ss-08",
+            "message_ts": "1.0",
+            "text": "ACK SS-08",
+        }
+
+    result = await run_ss08_gate(
+        cadence=cadence,
+        slack_ack_poll_fn=legacy_poll,
+    )
+    assert result is True
+    assert legacy_calls, "legacy poll fn was never called"
+    # The legacy fallback should have been invoked with exactly the four
+    # original kwargs and no extras.
+    assert set(legacy_calls[0].keys()) == {
+        "channel", "after_ts", "author_user_id", "keywords",
+    }
