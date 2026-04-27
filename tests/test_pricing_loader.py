@@ -1,14 +1,12 @@
-"""Tests for the pricing loader.
-"""
-
 import pytest
-from src.alfred_coo import pricing
+from alfred_coo.pricing import load_pricing
 
-
-def test_pricing_load_contains_free_tier():
-    data = pricing.load()
-    assert "openrouter" in data
-    free = data["openrouter"].get("free")
-    assert free is not None
-    assert free["input_per_1k"] == 0.0
-    assert free["output_per_1k"] == 0.0
+def test_pricing_loader():
+    pricing = load_pricing()
+    # Verify free tier exists and values are zero
+    assert "free" in pricing, "free tier missing"
+    free = pricing["free"]
+    assert free.get("input_per_1k") == 0.0
+    assert free.get("output_per_1k") == 0.0
+    # Verify a paid provider example exists
+    assert "openrouter" in pricing, "openrouter provider missing"

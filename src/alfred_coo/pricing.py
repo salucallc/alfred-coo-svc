@@ -1,24 +1,16 @@
-"""Pricing loader for model costs.
-
-Loads the YAML file at `configs/model_pricing.yaml` and returns a
-dictionary mapping providers to their pricing details.
-"""
-
-import os
 import yaml
 from pathlib import Path
+from typing import Dict, Any
 
-CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "model_pricing.yaml"
+def load_pricing() -> Dict[str, Any]:
+    """Load the model pricing configuration from ``configs/model_pricing.yaml``.
 
-
-def load() -> dict:
-    """Load the model pricing YAML file.
-
-    Returns:
-        dict: The pricing configuration.
+    Returns a dictionary mapping provider names to their pricing details.
     """
-    if not CONFIG_PATH.is_file():
-        raise FileNotFoundError(f"Pricing config not found at {CONFIG_PATH}")
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "model_pricing.yaml"
+    with config_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    return data or {}
+    return data
+
+# expose default instance for convenience
+pricing = load_pricing()

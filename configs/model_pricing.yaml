@@ -1,9 +1,19 @@
-ollama:
-  flat_monthly_usd: 100
+# Model pricing configuration
+# Ollama Max (flat monthly amortized)
+ollama_max:
+  cost_per_month_usd: 100
+
+# Free tier
+free:
+  input_per_1k: 0.0
+  output_per_1k: 0.0
+  cost_per_1k_usd: 0.0
+
+# Paid providers (example OpenRouter)
 openrouter:
-  free:
-    input_per_1k: 0.0
-    output_per_1k: 0.0
-  paid:
-    input_per_1k: 0.01
-    output_per_1k: 0.02
+  provider: openrouter
+  models:
+    example-model:
+      input_per_1k: 0.02
+      output_per_1k: 0.03
+      cost_per_1k_usd: 0.025
