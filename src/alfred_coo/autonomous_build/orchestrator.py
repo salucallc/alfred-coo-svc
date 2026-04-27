@@ -1299,6 +1299,25 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="plan D §3.5 + SAL-2641; init container reads ./state/secrets/* on first boot, pushes into infisical, then chmod 000 (disabled-but-recoverable). APE/V: delete state/secrets dir, restart → all services healthy, secrets visible in infisical UI. Depends on OPS-06 + OPS-07",
     ),
 
+    # OPS-08c (SAL-3036): wave-2 decomposition child of OPS-08 (SAL-2641).
+    # Parent was reverted to Backlog with `human-assigned` retained on
+    # 2026-04-27 after PR #170 stub-wrapped the migration script. This child
+    # replaces the placeholder infisical-cli calls in the existing stub
+    # `migrate_state_secrets.sh` with the real implementation. Without a
+    # _TARGET_HINTS entry the v7ah no_hint-excusal path skipped it.
+    "OPS-08c": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/infisical/migrate_state_secrets.sh",),
+        new_paths=(
+            "plans/v1-ga/OPS-08c.md",
+            "tests/scripts/test_migrate_secrets.sh",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-08c-migrate-secrets-impl",
+        notes="wave 2 decomposition child of OPS-08 (SAL-2641) → SAL-3036; replace placeholder infisical-cli calls in the PR #170 stub with real implementation; APE/V: tests/scripts/test_migrate_secrets.sh exercises happy + failure paths against a fake infisical endpoint and exits 0. Depends on OPS-08 stub.",
+    ),
+
     "OPS-09": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
@@ -1385,6 +1404,43 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         base_branch="main",
         branch_hint="feature/ops-14-scoped-oauth2-tokens",
         notes="plan D §3.3 + SAL-2647; OAuth2 client_credentials flow, scopes soul:memory:read/write, tiresias:audit:read, tiresias:cost:read, mcp:tools:invoke, vault:read/write; 24h TTL; portal rotation. APE/V: soul:memory:read scope → 200 on search but 403 on write. Depends on OPS-13",
+    ),
+
+    # OPS-14c (SAL-3037): wave-2 decomposition child of OPS-14 (SAL-2647).
+    # Adds the scope-enforcement middleware that consumes the scoped tokens
+    # produced by the existing scoped_tokens module (PR #169, currently
+    # NotImplementedError-wrapped by PR #170). Without a _TARGET_HINTS
+    # entry the v7ah no_hint-excusal path skipped it.
+    "OPS-14c": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/auth/scoped_tokens.py",),
+        new_paths=(
+            "plans/v1-ga/OPS-14c.md",
+            "src/alfred_coo/auth/scope_middleware.py",
+            "tests/auth/test_scope_middleware.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-14c-scope-middleware",
+        notes="wave 2 decomposition child of OPS-14 (SAL-2647) → SAL-3037; FastAPI/ASGI middleware that parses the OAuth2 access token, extracts scopes, and 403s requests whose required scope is not granted. APE/V: soul:memory:read scope → 200 on search but 403 on write. Depends on OPS-14 scaffolding.",
+    ),
+
+    # OPS-14d (SAL-3038): wave-2 decomposition child of OPS-14 (SAL-2647).
+    # Validates the 24h TTL on issued tokens — rejects expired tokens with
+    # 401 and surfaces a structured error. Without a _TARGET_HINTS entry
+    # the v7ah no_hint-excusal path skipped it.
+    "OPS-14d": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/auth/scoped_tokens.py",),
+        new_paths=(
+            "plans/v1-ga/OPS-14d.md",
+            "src/alfred_coo/auth/ttl_validator.py",
+            "tests/auth/test_ttl_validation.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-14d-ttl-validation",
+        notes="wave 2 decomposition child of OPS-14 (SAL-2647) → SAL-3038; enforces the 24h TTL constraint on scoped OAuth2 tokens; rejects expired tokens with 401 + structured error. APE/V: token issued > 24h ago → 401 with token_expired error code. Depends on OPS-14 scaffolding.",
     ),
 
     "OPS-15": TargetHint(
