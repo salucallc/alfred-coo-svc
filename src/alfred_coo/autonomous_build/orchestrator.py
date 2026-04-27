@@ -48,7 +48,14 @@ from .graph import (
     TicketStatus,
     build_ticket_graph,
 )
-from .state import OrchestratorState, checkpoint, restore
+from .state import (
+    OrchestratorState,
+    checkpoint,
+    is_wave_pass_fresh,
+    lookup_wave_pass,
+    record_wave_pass,
+    restore,
+)
 
 
 # Pre-compiled so `_extract_pr_url` doesn't rebuild it every child poll.
@@ -1932,11 +1939,47 @@ class AutonomousBuildOrchestrator:
         # re-dispatch tickets we already closed last run.
         self._apply_restored_status()
 
+        # Fix B (stale In Progress sweeper): on startup, sweep Linear for
+        # tickets stuck in "In Progress" whose PR was already merged. Eats
+        # up wave-1 deadlock-grace cycles otherwise (e.g. SAL-2656 OPS-23
+        # observed in v7ab/v7ac/v7ad). Best-effort, bounded to the active
+        # project, idempotent — never raises into the wave loop.
+        try:
+            await self._sweep_stale_in_progress(self.linear_project_id)
+        except Exception:
+            logger.exception(
+                "_sweep_stale_in_progress crashed during startup; continuing"
+            )
+
         # 4. Main wave loop.
         for wave in self.wave_order:
             self.state.current_wave = wave
             logger.info("entering wave %d", wave)
             self.state.record_event("wave_enter", wave=wave)
+            # Fix A (wave-skip cache): if this wave passed at ratio=1.00
+            # within the freshness window AND no Linear ticket has moved
+            # backward since, short-circuit the wave entirely. Saves one
+            # full hint-verify + dispatch + gate cycle per still-green
+            # wave on each kickoff/restart. Best-effort — any soul lookup
+            # hiccup falls back to normal evaluation.
+            try:
+                if await self._should_skip_wave(wave):
+                    logger.info(
+                        "[wave-skip] wave=%d pre-passed at 1.00 in last run; "
+                        "skipping re-evaluation", wave,
+                    )
+                    self.state.record_event(
+                        "wave_skipped_pre_passed",
+                        wave=wave,
+                        reason="prior_pass_ratio_1.00_within_freshness_window",
+                    )
+                    await checkpoint(self.state, self.soul, self.task_id)
+                    continue
+            except Exception:
+                logger.exception(
+                    "_should_skip_wave crashed for wave %d; falling through "
+                    "to full evaluation", wave,
+                )
             # AB-17-b · Plan I §1: verify every ticket's TargetHint against
             # live GitHub state BEFORE dispatch so the rendered ## Target
             # block in the child task body can carry an `observed:` row.
@@ -4743,6 +4786,26 @@ class AutonomousBuildOrchestrator:
             wave=wave_n,
             excused_count=len(excused),
         )
+        # Fix A: persist the pass record so a subsequent kickoff/restart
+        # can short-circuit this wave via ``_should_skip_wave``. Only
+        # written on the *true* all-green branch (ratio == 1.00). The
+        # all-excused branch above explicitly does NOT cache: a 0/0 pass
+        # would let a future genuine wave skip with no real basis.
+        try:
+            await record_wave_pass(
+                self.soul,
+                linear_project_id=self.linear_project_id,
+                wave_n=wave_n,
+                ratio=green_ratio,
+                denominator=denominator,
+                green_count=len(green),
+                ticket_codes_seen=[t.identifier for t in scored],
+            )
+        except Exception:
+            logger.exception(
+                "record_wave_pass failed for wave %d; cache will miss next "
+                "run but pass itself stands", wave_n,
+            )
 
     def _is_wave_gate_excused(self, ticket: "Ticket") -> bool:
         """AB-17-w: True iff `ticket` should be excluded from the wave-gate
@@ -4855,6 +4918,18 @@ class AutonomousBuildOrchestrator:
             )
         except Exception:
             logger.exception("SlackCadence.tick failed; continuing")
+
+        # Fix B: piggy-back the stale "In Progress" sweep on the cadence
+        # tick (every ``status_cadence_min`` minutes by default). Cheap
+        # when nothing is stale (one Linear list + zero GitHub calls);
+        # bounded to the active project so a single missed cadence tick
+        # is at most a few API hits.
+        try:
+            await self._sweep_stale_in_progress(self.linear_project_id)
+        except Exception:
+            logger.exception(
+                "_sweep_stale_in_progress raised during cadence tick; continuing"
+            )
 
     async def _check_budget(self) -> None:
         """AB-05: aggregate token spend from the last poll batch, update
@@ -5117,6 +5192,332 @@ class AutonomousBuildOrchestrator:
                 "linear_update_issue_state raised for %s -> %s",
                 ticket.identifier, state_name,
             )
+
+    # ── Wave-iteration optimizations (Fix A + Fix B) ───────────────────────
+    #
+    # Fix A · Wave-skip cache. When a wave previously passed at ratio=1.00
+    # within the freshness window (default 24h), short-circuit re-entry
+    # rather than burning a full hint-verify + dispatch + gate cycle.
+    # The cache invalidates if:
+    #   - prior pass was below 1.00 (soft-greens are never cached),
+    #   - the freshness window has elapsed,
+    #   - any ticket in the wave has moved BACKWARD since the pass
+    #     (e.g. Done -> Backlog), OR
+    #   - the cached ticket-code set disagrees with the current graph
+    #     (tickets added/removed between runs).
+    # Fix B · Stale "In Progress" sweeper. Cleans up tickets whose PR
+    # merged but Linear state never flipped (observed: SAL-2656 OPS-23 in
+    # v7ab/v7ac/v7ad — PR merged but state stuck, eating wave-1 deadlock-
+    # grace cycles on every kickoff). Sweep runs at startup and on each
+    # cadence tick, bounded to the active project.
+
+    # Default freshness for the wave-skip cache. Overridable per-test via
+    # ``self._wave_pass_freshness_sec`` (set in __init__ below). 24h
+    # matches the daily kickoff cadence — anything older should be re-
+    # evaluated to catch overnight drift in Linear/GitHub state.
+    _WAVE_PASS_FRESHNESS_SEC: int = 24 * 60 * 60
+
+    # GitHub PR-search lookback for the stale-sweep helper. 7 days is
+    # generous: a ticket that's been "In Progress" for >7 days with no
+    # merged PR is more likely a genuine in-flight build (or a Linear
+    # workflow oddity) than a missed state-flip. Override via
+    # ``self._stale_sweep_pr_lookback_sec``.
+    _STALE_SWEEP_PR_LOOKBACK_SEC: int = 7 * 24 * 60 * 60
+
+    # Bound on how many candidate "In Progress" tickets the sweep examines
+    # per call. Prevents an oversized project from blowing the cadence
+    # tick. 50 covers every observed wave + a comfortable buffer.
+    _STALE_SWEEP_MAX_CANDIDATES: int = 50
+
+    async def _should_skip_wave(self, wave_n: int) -> bool:
+        """Return True iff this wave previously passed at ratio=1.00 in a
+        recent run AND the wave's ticket set has not regressed since.
+
+        Best-effort. Soul-svc miss / parse error / project-id missing all
+        return False (the safe fallback — re-evaluate as normal). The
+        caller logs the skip + records a ``wave_skipped_pre_passed`` event.
+        """
+        if not self.linear_project_id:
+            return False
+        record = await lookup_wave_pass(
+            self.soul,
+            linear_project_id=self.linear_project_id,
+            wave_n=wave_n,
+        )
+        if record is None:
+            return False
+        # Soft-greens are never cached, but defend anyway.
+        if record.ratio < 1.0:
+            return False
+        freshness = getattr(
+            self, "_wave_pass_freshness_sec", self._WAVE_PASS_FRESHNESS_SEC,
+        )
+        if not is_wave_pass_fresh(record, max_age_sec=int(freshness)):
+            logger.debug(
+                "[wave-skip] wave=%d cache stale (passed_at=%s); re-evaluating",
+                wave_n, record.passed_at,
+            )
+            return False
+        # Reconcile against the live graph: every cached ticket must still
+        # exist AND every wave-N ticket must currently be terminal-green
+        # in our local graph (i.e. MERGED_GREEN). If any ticket regressed
+        # to a non-green state since the cache was written — Done -> Backlog
+        # is the prime example — invalidate.
+        wave_tickets = self.graph.tickets_in_wave(wave_n)
+        live_idents = {t.identifier for t in wave_tickets}
+        cached_idents = set(record.ticket_codes_seen or [])
+        # New tickets added since the pass → re-evaluate so the new ones
+        # get dispatched. Removed tickets are tolerable (ticket may have
+        # been cancelled/duplicated; cached pass still applies to the
+        # rest), but added tickets MUST flush the cache.
+        added = live_idents - cached_idents
+        if added:
+            logger.info(
+                "[wave-skip] wave=%d cache invalidated: %d new ticket(s) "
+                "added since pass (%s); re-evaluating",
+                wave_n, len(added), sorted(added)[:5],
+            )
+            return False
+        # Backward transitions: any ticket NOT currently MERGED_GREEN
+        # invalidates the cache. The orchestrator's restore path already
+        # mirrors Linear state into local TicketStatus via
+        # ``_apply_restored_status``, so a Done -> Backlog flip in Linear
+        # surfaces here as ``status != MERGED_GREEN``.
+        regressed = [
+            t for t in wave_tickets
+            if t.status != TicketStatus.MERGED_GREEN
+        ]
+        if regressed:
+            logger.info(
+                "[wave-skip] wave=%d cache invalidated: %d ticket(s) "
+                "regressed since pass (%s); re-evaluating",
+                wave_n, len(regressed),
+                [t.identifier for t in regressed[:5]],
+            )
+            return False
+        return True
+
+    async def _sweep_stale_in_progress(self, project_id: str) -> int:
+        """Find Linear tickets in ``project_id`` stuck in "In Progress" with
+        a merged PR, and flip them to Done.
+
+        Returns the number of tickets flipped (mostly for tests + logging).
+        Best-effort: any failure inside the sweep is logged and swallowed
+        — never raises into the caller. Idempotent: a ticket already in
+        Done is silently skipped on subsequent calls.
+
+        Heuristic for "merged PR exists":
+          - GitHub Search API ``q=org:salucallc is:pr is:merged
+            in:title,body <ticket_identifier>`` (e.g. ``SAL-2656``)
+          - Filter to PRs merged within the last
+            ``_STALE_SWEEP_PR_LOOKBACK_SEC`` (7d default).
+          - Any single hit is enough — the orchestrator's local state
+            tracks individual PRs separately; here we only need a signal
+            that *some* recent merged PR cited the ticket code.
+        """
+        if not project_id:
+            return 0
+        try:
+            from alfred_coo.tools import BUILTIN_TOOLS
+        except Exception:
+            logger.debug(
+                "tools not importable; skipping stale-sweep for %s", project_id,
+            )
+            return 0
+        list_spec = BUILTIN_TOOLS.get("linear_list_project_issues")
+        if list_spec is None:
+            logger.debug(
+                "linear_list_project_issues missing; skipping stale-sweep",
+            )
+            return 0
+        try:
+            resp = await list_spec.handler(project_id=project_id)
+        except Exception:
+            logger.exception(
+                "linear_list_project_issues raised during stale-sweep "
+                "(project=%s)", project_id,
+            )
+            return 0
+        if not isinstance(resp, dict) or resp.get("error"):
+            logger.debug(
+                "stale-sweep skipped: linear_list_project_issues returned %r",
+                resp if not isinstance(resp, dict) else resp.get("error"),
+            )
+            return 0
+        issues = resp.get("issues") or []
+        candidates = [
+            iss for iss in issues
+            if (((iss.get("state") or {}).get("name") or "").strip().lower()
+                == "in progress")
+        ]
+        if not candidates:
+            logger.debug(
+                "[stale-sweep] project=%s no In Progress tickets", project_id,
+            )
+            return 0
+        if len(candidates) > self._STALE_SWEEP_MAX_CANDIDATES:
+            logger.warning(
+                "[stale-sweep] project=%s has %d In Progress tickets; "
+                "sweeping the first %d only",
+                project_id, len(candidates), self._STALE_SWEEP_MAX_CANDIDATES,
+            )
+            candidates = candidates[: self._STALE_SWEEP_MAX_CANDIDATES]
+
+        update_spec = BUILTIN_TOOLS.get("linear_update_issue_state")
+        comment_spec = BUILTIN_TOOLS.get("linear_add_comment")
+        flipped = 0
+        for iss in candidates:
+            ident = iss.get("identifier") or ""
+            iss_id = iss.get("id") or ""
+            if not ident or not iss_id:
+                continue
+            try:
+                merged_pr = await self._find_recent_merged_pr_for(ident)
+            except Exception:
+                logger.exception(
+                    "[stale-sweep] PR search raised for %s; leaving as is",
+                    ident,
+                )
+                continue
+            if not merged_pr:
+                logger.debug(
+                    "[stale-sweep] %s in In Progress, no recent merged PR; "
+                    "leaving alone (genuine in-flight)", ident,
+                )
+                continue
+            logger.info(
+                "[stale-sweep] auto-flipping %s In Progress -> Done "
+                "(merged PR: %s)", ident, merged_pr,
+            )
+            self.state.record_event(
+                "ticket_auto_flipped_stale",
+                identifier=ident,
+                pr_url=merged_pr,
+            )
+            if update_spec is not None:
+                try:
+                    upd = await update_spec.handler(
+                        issue_id=iss_id, state_name="Done",
+                    )
+                    if isinstance(upd, dict) and upd.get("error"):
+                        logger.warning(
+                            "[stale-sweep] linear_update_issue_state(%s, "
+                            "Done) returned error: %s",
+                            ident, upd["error"],
+                        )
+                        continue
+                except Exception:
+                    logger.exception(
+                        "[stale-sweep] linear_update_issue_state raised "
+                        "for %s; skipping comment + counter",
+                        ident,
+                    )
+                    continue
+            flipped += 1
+            # Best-effort audit comment. Mirrors the pattern in
+            # ``_post_destructive_guardrail_linear_comment`` /
+            # ``_post_escalated_linear_comment`` — silently skip if
+            # ``linear_add_comment`` is not installed in this deploy.
+            if comment_spec is not None:
+                body = (
+                    f"auto-flipped by orchestrator: stale In Progress + "
+                    f"merged PR found ({merged_pr}). The Linear state was "
+                    "out of sync with the merge-commit signal; flipping "
+                    "to Done so wave gates stop re-dispatching this "
+                    "ticket. (See "
+                    "`feat/wave-skip-and-stale-state-sweeper` PR notes.)"
+                )
+                try:
+                    await comment_spec.handler(issue_id=iss_id, body=body)
+                except Exception:
+                    logger.exception(
+                        "[stale-sweep] linear_add_comment raised for %s; "
+                        "flip already applied", ident,
+                    )
+        if flipped:
+            logger.info(
+                "[stale-sweep] project=%s flipped %d stale In Progress "
+                "ticket(s) to Done", project_id, flipped,
+            )
+        return flipped
+
+    async def _find_recent_merged_pr_for(self, ticket_ident: str) -> Optional[str]:
+        """Search ``salucallc/*`` for a merged PR citing ``ticket_ident``
+        in title or body within the last ``_STALE_SWEEP_PR_LOOKBACK_SEC``.
+
+        Returns the first matching PR URL (or None). Uses the GitHub
+        Search API directly — no gh CLI dependency, matches the rest of
+        ``alfred_coo.tools`` (systemd ``ProtectHome=true``).
+
+        Tests stub this via ``self._gh_pr_search_fn`` to avoid live HTTP.
+        """
+        if not ticket_ident:
+            return None
+        # Test hook: bypass HTTP entirely.
+        stub = getattr(self, "_gh_pr_search_fn", None)
+        if stub is not None:
+            try:
+                return await stub(ticket_ident)
+            except Exception:
+                logger.exception(
+                    "[stale-sweep] _gh_pr_search_fn stub raised for %s",
+                    ticket_ident,
+                )
+                return None
+        # Live path — guarded by env presence; missing token returns None
+        # so the sweep degrades to a no-op rather than erroring out.
+        token = os.environ.get("GITHUB_TOKEN") or ""
+        if not token:
+            logger.debug(
+                "[stale-sweep] GITHUB_TOKEN unset; skipping PR search for %s",
+                ticket_ident,
+            )
+            return None
+        # GitHub Search API. Ref:
+        #   https://docs.github.com/en/rest/search/search#search-issues-and-pull-requests
+        # We look for PRs in the salucallc org, merged, that mention the
+        # ticket identifier anywhere in title or body. Date filter narrows
+        # the lookback so an old PR doesn't trigger a stale-flip.
+        cutoff_struct = time.gmtime(
+            time.time() - self._STALE_SWEEP_PR_LOOKBACK_SEC
+        )
+        cutoff = time.strftime("%Y-%m-%d", cutoff_struct)
+        q = (
+            f"org:salucallc is:pr is:merged in:title,body "
+            f"{ticket_ident} merged:>={cutoff}"
+        )
+        params = {"q": q, "per_page": "5"}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    "https://api.github.com/search/issues",
+                    params=params,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "User-Agent": "saluca-alfred/1.0",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                if r.status_code != 200:
+                    logger.warning(
+                        "[stale-sweep] GitHub search returned %d for %s "
+                        "(body=%r)",
+                        r.status_code, ticket_ident, r.text[:300],
+                    )
+                    return None
+                payload = r.json()
+        except Exception:
+            logger.exception(
+                "[stale-sweep] GitHub search raised for %s", ticket_ident,
+            )
+            return None
+        items = (payload or {}).get("items") or []
+        for item in items:
+            url = item.get("html_url") or ""
+            if "/pull/" in url:
+                return url
+        return None
 
     # ── kickoff termination ─────────────────────────────────────────────────
 

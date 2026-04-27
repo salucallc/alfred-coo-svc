@@ -7,6 +7,19 @@ ticket status map, cumulative spend, and flags like `ss08_acked`.
 
 Plan F §1 R2: state lives in soul memory, not a bespoke Supabase table.
 Topic convention: `autonomous_build:<kickoff_task_id>:state`.
+
+In addition to per-kickoff state snapshots, this module also persists
+*wave-pass* records keyed by ``(linear_project_id, wave_n)``. These are
+read on wave entry by ``AutonomousBuildOrchestrator`` to short-circuit
+re-evaluation of waves that already landed at ratio=1.00 in a recent run
+(see Fix A in PR ``feat/wave-skip-and-stale-state-sweeper``).
+
+Wave-pass topic convention:
+    ``autonomous_build:wave_pass:<linear_project_id>:wave_<n>``
+
+Schema is JSON-serialised into the memory ``content`` field (per soul-svc
+v2.0.0 ``/v1/memory/write``). Reads use ``/v1/memory/recent?topics=...``
+and pick the freshest record (soul-svc returns reverse-chronological).
 """
 
 from __future__ import annotations
@@ -25,9 +38,69 @@ logger = logging.getLogger("alfred_coo.autonomous_build.state")
 STATE_TOPIC_PREFIX = "autonomous_build"
 STATE_TOPIC_SUFFIX = "state"
 
+# Wave-pass topic suffix. Distinct from the per-kickoff state topic so a
+# `recent_memories(topics=[wave_pass_topic_for(...)])` lookup never has to
+# scan through state snapshots.
+WAVE_PASS_TOPIC_INFIX = "wave_pass"
+
+# Default freshness window for a persisted 1.00 wave-pass to count as
+# "recent enough to skip" on re-entry. 24h matches the daily kickoff
+# cadence — anything older should be re-evaluated to catch overnight
+# drift in Linear or GitHub state.
+WAVE_PASS_FRESHNESS_SEC = 24 * 60 * 60
+
 
 def state_topic_for(kickoff_task_id: str) -> str:
     return f"{STATE_TOPIC_PREFIX}:{kickoff_task_id}:{STATE_TOPIC_SUFFIX}"
+
+
+def wave_pass_topic_for(linear_project_id: str, wave_n: int) -> str:
+    """Topic key for a wave-pass record.
+
+    Keyed by ``(linear_project_id, wave_n)`` rather than ``kickoff_task_id``
+    so the cache survives kickoff-task churn — a fresh kickoff for the same
+    project should still benefit from yesterday's pass record. Wave index
+    is appended verbatim so each wave gets its own record.
+    """
+    return (
+        f"{STATE_TOPIC_PREFIX}:{WAVE_PASS_TOPIC_INFIX}:"
+        f"{linear_project_id}:wave_{wave_n}"
+    )
+
+
+@dataclass
+class WavePassRecord:
+    """Persisted result of a wave-gate pass.
+
+    Written by the orchestrator after a successful wave gate (ratio=1.00
+    only — soft-greens are NOT cached because they imply at least one
+    failure that should be re-checked next run). Read on wave entry by
+    ``_should_skip_wave`` to decide whether to bypass dispatch+gate.
+
+    ``ticket_codes_seen`` snapshots the wave's ticket identifier set at
+    pass time. On re-entry the orchestrator compares it against the
+    current Linear graph; if any ticket has been removed or moved
+    backward (e.g. Done -> Backlog), the cache is invalidated.
+    """
+
+    linear_project_id: str
+    wave_n: int
+    ratio: float
+    passed_at: str  # ISO-8601 UTC, "Z"-suffixed
+    denominator: int
+    green_count: int
+    ticket_codes_seen: List[str] = field(default_factory=list)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True)
+
+    @classmethod
+    def from_json(cls, blob: str) -> "WavePassRecord":
+        data = json.loads(blob)
+        # Forward-compat: drop unknown keys rather than erroring.
+        known = {f for f in cls.__dataclass_fields__}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
 
 
 @dataclass
@@ -175,3 +248,150 @@ async def restore(
             continue
         return state
     return None
+
+
+# ── Wave-pass cache (Fix A) ────────────────────────────────────────────────
+#
+# The orchestrator currently re-evaluates every wave from scratch on each
+# kickoff/restart. For waves that previously landed at ratio=1.00 with no
+# new Linear churn, this is pure waste: hint verification + dispatch loop
+# burn cycles only to re-confirm the existing all-green state.
+#
+# These two helpers persist the pass result keyed by
+# ``(linear_project_id, wave_n)`` so a re-entered orchestrator can short-
+# circuit the wave when the prior pass is still valid. See
+# ``AutonomousBuildOrchestrator._should_skip_wave`` for the consumer side.
+
+
+async def record_wave_pass(
+    soul_client,
+    *,
+    linear_project_id: str,
+    wave_n: int,
+    ratio: float,
+    denominator: int,
+    green_count: int,
+    ticket_codes_seen: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Persist a wave-pass record under the canonical wave-pass topic.
+
+    Only call this on a TRUE all-green pass (ratio == 1.00) — soft-greens
+    are deliberately NOT cached because they carry at least one failure
+    that should be re-evaluated next run.
+
+    Failures are logged + swallowed; cache miss is the safe fallback (the
+    orchestrator will simply re-evaluate the wave next time).
+    """
+    if soul_client is None:
+        logger.debug("record_wave_pass skipped: soul_client is None (dry-run?)")
+        return None
+    if not linear_project_id:
+        logger.debug("record_wave_pass skipped: empty linear_project_id")
+        return None
+    record = WavePassRecord(
+        linear_project_id=linear_project_id,
+        wave_n=int(wave_n),
+        ratio=float(ratio),
+        passed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        denominator=int(denominator),
+        green_count=int(green_count),
+        ticket_codes_seen=sorted(ticket_codes_seen or []),
+    )
+    topic = wave_pass_topic_for(linear_project_id, wave_n)
+    try:
+        blob = record.to_json()
+    except (TypeError, ValueError):
+        logger.exception("failed to serialise wave-pass record")
+        return None
+    try:
+        return await soul_client.write_memory(
+            blob,
+            topics=[topic, STATE_TOPIC_PREFIX, WAVE_PASS_TOPIC_INFIX],
+        )
+    except Exception:
+        logger.exception(
+            "soul write_memory failed during record_wave_pass "
+            "(project=%s wave=%d)", linear_project_id, wave_n,
+        )
+        return None
+
+
+async def lookup_wave_pass(
+    soul_client,
+    *,
+    linear_project_id: str,
+    wave_n: int,
+) -> Optional[WavePassRecord]:
+    """Fetch the most recent wave-pass record for ``(project, wave)``.
+
+    Returns ``None`` if no record exists, the record is malformed, or the
+    soul lookup fails. Returns the parsed ``WavePassRecord`` otherwise —
+    the *caller* is responsible for checking ``passed_at`` freshness and
+    reconciling ``ticket_codes_seen`` against the live graph.
+    """
+    if soul_client is None or not linear_project_id:
+        return None
+    topic = wave_pass_topic_for(linear_project_id, wave_n)
+    try:
+        recent = await soul_client.recent_memories(limit=5, topics=[topic])
+    except Exception:
+        logger.exception(
+            "soul recent_memories failed during lookup_wave_pass "
+            "(project=%s wave=%d)", linear_project_id, wave_n,
+        )
+        return None
+    if isinstance(recent, dict):
+        recent = recent.get("memories") or []
+    if not isinstance(recent, list) or not recent:
+        return None
+    for mem in recent:
+        content = (mem or {}).get("content") if isinstance(mem, dict) else None
+        if not content:
+            continue
+        try:
+            record = WavePassRecord.from_json(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning(
+                "skipping malformed wave-pass record (project=%s wave=%d)",
+                linear_project_id, wave_n,
+            )
+            continue
+        # Belt-and-braces: a topic collision shouldn't happen, but reject
+        # records whose embedded keys disagree with our query.
+        if record.linear_project_id and record.linear_project_id != linear_project_id:
+            logger.warning(
+                "ignored wave-pass record with mismatched project id %s "
+                "(wanted %s)", record.linear_project_id, linear_project_id,
+            )
+            continue
+        if int(record.wave_n) != int(wave_n):
+            continue
+        return record
+    return None
+
+
+def is_wave_pass_fresh(record: WavePassRecord, *, now: Optional[float] = None,
+                       max_age_sec: int = WAVE_PASS_FRESHNESS_SEC) -> bool:
+    """True iff ``record.passed_at`` is within ``max_age_sec`` of ``now``.
+
+    Tolerant of unparseable timestamps — returns False rather than raising
+    so callers can treat a malformed record as "stale, re-evaluate".
+    """
+    if not record or not record.passed_at:
+        return False
+    if now is None:
+        now = time.time()
+    try:
+        passed_struct = time.strptime(record.passed_at, "%Y-%m-%dT%H:%M:%SZ")
+        passed_epoch = float(_calendar_timegm(passed_struct))
+    except (ValueError, TypeError):
+        return False
+    return (now - passed_epoch) <= max_age_sec
+
+
+def _calendar_timegm(struct) -> int:
+    """Inverse of ``time.gmtime``. Avoids the ``calendar`` import at module
+    top so the rest of the module's surface stays unchanged.
+    """
+    import calendar
+    return calendar.timegm(struct)
