@@ -1790,8 +1790,13 @@ def test_target_hints_entry_count_unchanged():
     83 against the stale 46 baseline) plus the +3 wave-2 decomposition
     children OPS-08C / OPS-14C / OPS-14D added 2026-04-27 (uppercase suffix
     enforced post-PR #174 to match the orchestrator's .upper() lookup
-    pipeline; see test_target_hints_keys_are_uppercase below)."""
-    assert len(_TARGET_HINTS) == 86
+    pipeline; see test_target_hints_keys_are_uppercase below). Bumped
+    86 -> 94 by the Phase-B decomposition pass 2026-04-27 evening: +8
+    children TIR-15A / TIR-15B / F19A / F19B / SS-07A / SS-07B / C-29A
+    / C-29B (Linear SAL-3068..3075) covering the four remaining
+    human-assigned MC parents SAL-2597 / 2627 / 2668 / 2677 per
+    Z:/_planning/journey/decomposition_2026-04-27_phase_b.md."""
+    assert len(_TARGET_HINTS) == 94
 
 
 def test_target_hints_keys_are_uppercase():

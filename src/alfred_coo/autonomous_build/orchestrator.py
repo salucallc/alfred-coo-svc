@@ -1225,6 +1225,52 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="plan C §5 F19 + SAL-2627; mcctl push-policy / push-persona uploads bundle, hub creates version row, endpoint heartbeat shows persona_version match within 60s. Extends policy.py from F14 + new persona.py. Depends on F12 + F13",
     ),
 
+    # F19A (SAL-3070): Phase-B decomposition child of F19 (SAL-2627).
+    # Authors the shared `_upload_bundle` helper (consumed by F19B) plus
+    # the push-policy CLI subcommand + hub handler + db row + tests.
+    # Without a _TARGET_HINTS entry the v7aj no_hint-excusal path skips
+    # it.
+    "F19A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/mcctl/commands/policy.py",
+        ),
+        new_paths=(
+            "src/mcctl/commands/_upload_bundle.py",
+            "src/alfred_coo/fleet_hub/policy_bundles.py",
+            "tests/test_mcctl_push_policy.py",
+            "tests/test_fleet_policy_bundles_endpoint.py",
+            "plans/v1-ga/F19a.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f19a-mcctl-push-policy",
+        notes="Phase-B decomposition child of F19 (SAL-2627) → SAL-3070; `mcctl push-policy` CLI subcommand + shared `_upload_bundle` helper (reused by F19B) + `POST /v1/fleet/policy-bundles` hub handler + `fleet_policy_versions` row insertion + tests. APE/V: pytest tests/test_mcctl_push_policy.py + tests/test_fleet_policy_bundles_endpoint.py green; uploaded bundle creates a version row with sha256 + uploaded_at. Sibling: F19B (push-persona reuses _upload_bundle). Depends on F12 + F13 + F14.",
+    ),
+
+    # F19B (SAL-3071): Phase-B decomposition child of F19 (SAL-2627).
+    # Reuses F19A's `_upload_bundle` helper for the push-persona path +
+    # adds the heartbeat persona_version reconciliation E2E (the parent's
+    # headline 60s assertion). Without a _TARGET_HINTS entry the v7aj
+    # no_hint-excusal path skips it.
+    "F19B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/mcctl/commands/_upload_bundle.py",
+        ),
+        new_paths=(
+            "src/mcctl/commands/persona.py",
+            "src/alfred_coo/fleet_hub/persona_bundles.py",
+            "tests/test_mcctl_push_persona.py",
+            "tests/test_fleet_persona_version_e2e.py",
+            "plans/v1-ga/F19b.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f19b-mcctl-push-persona",
+        notes="Phase-B decomposition child of F19 (SAL-2627) → SAL-3071; `mcctl push-persona` CLI subcommand reusing F19A's `_upload_bundle` helper + hub handler + heartbeat `persona_version` reconciliation E2E (the parent's headline assertion: endpoint heartbeat shows persona_version match within 60s of push). APE/V: pytest tests/test_mcctl_push_persona.py + tests/test_fleet_persona_version_e2e.py green; E2E asserts heartbeat persona_version converges to pushed version <60s. Sibling: F19A (authors _upload_bundle). Depends on F19A.",
+    ),
+
     "F20": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
@@ -1566,6 +1612,46 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="plan C §5 C-29 + SAL-2677; extends F21 1-hub-3-endpoints suite — one endpoint hosts two tenants (acme-corp + beta-industries); 3 assertion classes: (1) memory isolation, (2) cross-tenant policy leakage, (3) blackout recovery preserves per-tenant global_seq independence. APE/V: pytest tests/fleet/e2e/test_multitenant.py green; jq '.tenant_id' e2e_audit.jsonl | sort -u | wc -l == 2; entire F21 suite runs <15min. Depends on C-26 + C-27 + C-28 + F21",
     ),
 
+    # C-29A (SAL-3074): Phase-B decomposition child of C-29 (SAL-2677).
+    # Authors the new tests/fleet/e2e/test_multitenant.py with assertion
+    # classes 1+2 (memory isolation, cross-tenant policy leakage). C-29B
+    # extends the same file with class 3 + audit jq + monotonicity, so
+    # ordering is C-29A creates → C-29B extends. Without a _TARGET_HINTS
+    # entry the v7aj no_hint-excusal path skips it.
+    "C-29A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "tests/fleet/e2e/__init__.py",
+        ),
+        new_paths=(
+            "tests/fleet/e2e/test_multitenant.py",
+            "plans/v1-ga/C-29a.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/c29a-multitenant-isolation",
+        notes="Phase-B decomposition child of C-29 (SAL-2677) → SAL-3074; creates `tests/fleet/e2e/test_multitenant.py` with assertion class 1 (memory isolation: writes from tenant acme are not readable by tenant beta on the same endpoint) + class 2 (cross-tenant policy leakage: a policy bundle pushed for acme is not enforced against beta requests). APE/V: pytest tests/fleet/e2e/test_multitenant.py::test_memory_isolation + ::test_policy_leakage green. Sibling: C-29B (extends with blackout + jq + monotonicity). Depends on F21 fixtures + C-26/27/28.",
+    ),
+
+    # C-29B (SAL-3075): Phase-B decomposition child of C-29 (SAL-2677).
+    # Extends the test_multitenant.py file authored by C-29A with the
+    # third assertion class + audit jsonl jq check + per-tenant local_seq
+    # monotonicity. Without a _TARGET_HINTS entry the v7aj
+    # no_hint-excusal path skips it.
+    "C-29B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "tests/fleet/e2e/test_multitenant.py",
+        ),
+        new_paths=(
+            "plans/v1-ga/C-29b.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/c29b-blackout-recovery-monotonicity",
+        notes="Phase-B decomposition child of C-29 (SAL-2677) → SAL-3075; extends C-29A's test_multitenant.py with assertion class 3 (blackout recovery preserves per-tenant global_seq independence — 10min hub blackout, 200 local writes per tenant, reconcile <60s with no cross-tenant bleed) + audit jsonl jq check (`jq '.tenant_id' e2e_audit.jsonl | sort -u | wc -l == 2`) + per-tenant `local_seq` monotonicity assertion + 15-min wall-clock CI budget. APE/V: pytest tests/fleet/e2e/test_multitenant.py::test_blackout_recovery green; entire F21 suite runs <15min. Sibling: C-29A (creates the file). Depends on C-29A.",
+    ),
+
     # ── Wave-3 expansion (2026-04-26 evening operator hotfix, follow-on to PR #109/#120) ────────────
     # 4 entries derived from Z:/_planning/v1-ga/{A,C,E}_*.md.
     # Resolves the residual wave-3 no_hint gap observed in v7ab autonomous run
@@ -1592,6 +1678,49 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         base_branch="main",
         branch_hint="feature/ss07-readme-v2-surface",
         notes="plan E §5.1 S-07 + SAL-2668; README lists every router in serve.py; /v1/admin/keys documented as tenant-key-minting path; ARCH.md diagram updated; PRODUCTION_GAP.md deleted or replaced; DATABASE_URL documented as canonical backend config with Supabase tips moved to a separate section. APE/V: CI job `docs-lint` verifies every `@router.post/get` decorator referenced in README; `pytest scripts/docs_lint.py` green; grep `PRODUCTION_GAP.md` returns 0 references. Depends on S-01..S-04 + S-09..S-12.",
+    ),
+
+    # SS-07A (SAL-3072): Phase-B decomposition child of SS-07 (SAL-2668).
+    # Targets `salucallc/soul-svc` (production), per the soul-svc-repos
+    # disambiguation memory note — distinct from the Z:/soul-svc paper
+    # variant. PR `soul-svc#48` shipped the docs-lint workflow scaffolding
+    # but left README/ARCH.md content updates open; SS-07A authors the
+    # README "Endpoint Surface" + /v1/admin/keys subsection half. Without
+    # a _TARGET_HINTS entry the v7aj no_hint-excusal path skips it.
+    "SS-07A": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "README.md",
+        ),
+        new_paths=(
+            "plans/v1-ga/SS-07a.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss07a-readme-endpoint-surface",
+        notes="Phase-B decomposition child of SS-07 (SAL-2668) → SAL-3072; README \"Endpoint Surface\" enumeration of every `@router.<method>` decorator in serve.py + dedicated `/v1/admin/keys` tenant-key-minting subsection. APE/V: every router decorator in serve.py appears under \"Endpoint Surface\"; `/v1/admin/keys` has its own subsection with a curl example. Sibling: SS-07B (ARCH refresh + docs-lint coverage). Depends on SS-07 docs-lint scaffolding (PR soul-svc#48).",
+    ),
+
+    # SS-07B (SAL-3073): Phase-B decomposition child of SS-07 (SAL-2668).
+    # Targets `salucallc/soul-svc` (production). Authors the ARCH.md
+    # mermaid refresh + PRODUCTION_GAP.md tombstone + the actual docs-lint
+    # coverage assertion that the PR #48 scaffolding deferred. Without a
+    # _TARGET_HINTS entry the v7aj no_hint-excusal path skips it.
+    "SS-07B": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "ARCH.md",
+            "PRODUCTION_GAP.md",
+            ".github/workflows/docs-lint.yml",
+        ),
+        new_paths=(
+            "tests/test_docs_router_coverage.py",
+            "plans/v1-ga/SS-07b.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss07b-arch-refresh-docs-lint",
+        notes="Phase-B decomposition child of SS-07 (SAL-2668) → SAL-3073; ARCH.md mermaid diagram refresh (purges dead `/v1/session/{close,capture-jsonl,cot/flush}`) + PRODUCTION_GAP.md tombstone (delete or replace with redirect note) + docs-lint workflow wired to fail on missing routes + `tests/test_docs_router_coverage.py` asserting every @router decorator is referenced in README. APE/V: pytest tests/test_docs_router_coverage.py green; docs-lint workflow fails when a new @router decorator lands without a README mention; grep `PRODUCTION_GAP.md` returns 0 references. Sibling: SS-07A (README Endpoint Surface). Depends on SS-07A README updates.",
     ),
 
     # ── Epic C · Fleet Wave 6 — F21 E2E integration (multi-endpoint) ─────
@@ -1643,6 +1772,48 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         base_branch="main",
         branch_hint="feature/tir-15-qa-and-docs",
         notes="plan A §4 Wave 4 + SAL-2597; hawkman-qa-a constrained review on all TIR-09..14 PRs; appliance Tiresias docs lint clean — README + PRINCIPLES.md (12 constitutional principles) + RUNBOOK.md (operator playbook for sovereignty smoke fail, key rotation, audit-chain inspection). APE/V: hawkman-qa-a verdict APPROVED on every TIR-* PR; markdownlint green on all 3 docs; PRINCIPLES.md asserts `.principles | length == 12` matches TIR-02 registry. Depends on TIR-14.",
+    ),
+
+    # TIR-15A (SAL-3068): Phase-B decomposition child of TIR-15 (SAL-2597).
+    # Parent reverted to Backlog 2026-04-27 retaining `human-assigned`; on
+    # inspection the markdown-lint stream is mechanical and splits cleanly
+    # from the QA-review stream (TIR-15B). Without a _TARGET_HINTS entry
+    # the v7aj no_hint-excusal path skips it.
+    "TIR-15A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "deploy/appliance/tiresias/README.md",
+            "deploy/appliance/tiresias/PRINCIPLES.md",
+            "deploy/appliance/tiresias/RUNBOOK.md",
+        ),
+        new_paths=(
+            ".github/workflows/markdown-lint.yml",
+            ".markdownlint.json",
+            "plans/v1-ga/TIR-15a.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-15a-markdown-lint-ci",
+        notes="Phase-B decomposition child of TIR-15 (SAL-2597) → SAL-3068; markdown-lint CI workflow + .markdownlint.json + lint cleanup of README.md / PRINCIPLES.md / runbook(s); workflow runs on PR + push to main. APE/V: markdownlint green on all 3 appliance Tiresias docs; CI workflow `markdown-lint` green on PR. Sibling: TIR-15B (review pass).",
+    ),
+
+    # TIR-15B (SAL-3069): Phase-B decomposition child of TIR-15 (SAL-2597).
+    # The QA-review stream — constrained-prompt model pass per the
+    # 2026-04-26 "constrained QA prompt beats strict" feedback note — is
+    # auto-runnable when the deliverable is a structured report committed
+    # to docs/qa-reviews/. Without a _TARGET_HINTS entry the v7aj
+    # no_hint-excusal path skips it.
+    "TIR-15B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "docs/qa-reviews/tir-phase-b-review.md",
+            "plans/v1-ga/TIR-15b.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/tir-15b-hawkman-qa-review",
+        notes="Phase-B decomposition child of TIR-15 (SAL-2597) → SAL-3069; hawkman-qa-a (`hf:openai/gpt-oss-120b:fastest`) constrained review pass on every TIR-09..14 PR; aggregated report committed to `docs/qa-reviews/tir-phase-b-review.md`. APE/V: every TIR-* PR has a verdict line in the report; APPROVED required for green. Sibling: TIR-15A (markdown-lint).",
     ),
 }
 
