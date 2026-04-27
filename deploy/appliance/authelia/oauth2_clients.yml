@@ -1,0 +1,12 @@
+clients:
+  - id: scoped-oauth2
+    description: Scoped OAuth2 client for internal services
+    secret: "{{GENERATED_SECRET}}"
+    scopes:
+      - soul:memory:read
+      - tiresias:audit:read
+      - tiresias:cost:read
+      - mcp:tools:invoke
+      - vault:read/write
+    token_ttl: 86400  # 24 hours in seconds
+    rotation: portal
