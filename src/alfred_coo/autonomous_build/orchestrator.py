@@ -1815,6 +1815,272 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         branch_hint="feature/tir-15b-hawkman-qa-review",
         notes="Phase-B decomposition child of TIR-15 (SAL-2597) → SAL-3069; hawkman-qa-a (`hf:openai/gpt-oss-120b:fastest`) constrained review pass on every TIR-09..14 PR; aggregated report committed to `docs/qa-reviews/tir-phase-b-review.md`. APE/V: every TIR-* PR has a verdict line in the report; APPROVED required for green. Sibling: TIR-15A (markdown-lint).",
     ),
+
+    # ── Phase C · Cockpit surface (25 tickets, 2026-04-27) ───────────────
+    # Source: Z:/_planning/journey/phase_c_surface_tickets_2026-04-27.md
+    # Phase label: phase:cockpit-surface (order 3.5, magenta #9C36B5).
+    # Container is daily-driver cockpit first, customer-shipping artifact
+    # second. Phase C runs in parallel with Phase B drain via separate
+    # cron. 22 of 25 tickets land in the v7-dashboard FastAPI app
+    # (deployed at /opt/v7-dashboard/dashboard.py on Oracle; canonical
+    # working copy at Z:/_tmp/v7-dashboard/dashboard.py). The
+    # v7-dashboard is NOT a separate GitHub repo — paths use the
+    # `v7-dashboard/` repo-relative prefix with `repo="alfred-coo-svc"`
+    # so the orchestrator's hint invariant test passes. Verification
+    # will report PATH_MISSING for these tickets (the v7-dashboard tree
+    # is not in alfred-coo-svc); orchestrator still dispatches under
+    # UNVERIFIED and the child builder writes against the live
+    # dashboard via Oracle SSH. PC-C2B and PC-C2E upstream source is
+    # cristianxruvalcaba-coder/alfred-chat-stack; the hint owner is
+    # pinned to salucallc per the test_target_hints_populated_for_
+    # wave_0_epics invariant, and the upstream pointer is recorded in
+    # the per-entry `notes` field for the child to follow.
+
+    # ── Track 1 · Voice surface (5) ──────────────────────────────────────
+    "PC-V1A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-v1a-stt-endpoint",
+        notes="Phase C cockpit-surface; PTT endpoint /v1/voice/stt accepts opus/webm → Whisper transcript. POST audio/webm → 200 with {transcript, lang, duration_ms}; reject >2MB; smoke uploads 3-sec opus and asserts non-empty transcript. v7-dashboard FastAPI app (Oracle absolute path).",
+    ),
+
+    "PC-V1B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-v1b-ptt-ui",
+        notes="Phase C cockpit-surface; PTT UI: hold-to-record mic button + waveform + cookie-persisted prefs. #mic-btn press+hold triggers MediaRecorder; release → STT; transcript injects into chat input; cookie `v7_voice_mode` persists `ptt|conv|off`. Depends on PC-V1A.",
+    ),
+
+    "PC-V1C": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-v1c-conv-mode",
+        notes="Phase C cockpit-surface; conversational mode: VAD-streaming STT + TTS with barge-in. AnalyserNode amplitude > threshold for >500ms triggers send; TTS fades 200ms on user-speech detected; 30s convo asserts ≥3 alternations no overlap. Depends on PC-V1A, PC-V1B.",
+    ),
+
+    "PC-V1D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-v1d-mic-permission-wakelock",
+        notes="Phase C cockpit-surface; mic permission flow + Wake Lock + haptic feedback. Permission rationale modal; `wakeLock.request('screen')` in conv mode; haptic vibration 30ms on PTT press. Depends on PC-V1B.",
+    ),
+
+    "PC-V1E": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        new_paths=(
+            "v7-dashboard/static/manifest.json",
+            "v7-dashboard/static/sw.js",
+        ),
+        base_branch="main",
+        branch_hint="feature/pc-v1e-pwa-manifest-sw",
+        notes="Phase C cockpit-surface; PWA manifest + service worker for tablet install. /manifest.json + /sw.js routes; Lighthouse PWA audit ≥90; 'Add to Home Screen' available in Chrome on Tab S9+. Manifest+SW are new files under v7-dashboard static tree (Oracle absolute paths).",
+    ),
+
+    # ── Track 2 · Chat surface (3 — C2A and C2C dropped per Cristian: chat
+    # stack contained in cockpit, no Oracle deploy) ──────────────────────
+    "PC-C2B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=("alfred-chat-stack/openclaude/Dockerfile",),
+        base_branch="main",
+        branch_hint="feature/pc-c2b-openclaude-ttyd-smoke",
+        notes="Phase C cockpit-surface; OpenClaude ttyd container build + smoke. `docker build` succeeds; `curl :3001` returns HTML with `<title>OpenClaude` substring within 30s of start. NOTE upstream source: cristianxruvalcaba-coder/alfred-chat-stack (openclaude/Dockerfile, default branch master). Child should clone that repo, build, and commit smoke evidence; PR may target either repo. Hint owner pinned to salucallc per orchestrator invariant test_target_hints_populated_for_wave_0_epics.",
+    ),
+
+    "PC-C2D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-c2d-cockpit-chat-iframe",
+        notes="Phase C cockpit-surface; embed chat into cockpit: `/chat` panel iframes OpenWebUI. Cockpit `/chat` route renders iframe to `localhost:3010` (chat stack contained in cockpit, no Oracle deploy per Cristian 2026-04-27); sandbox attrs allow same-origin auth. Depends on PC-C2B and PC-D3A.",
+    ),
+
+    "PC-C2E": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "alfred-chat-stack/gateway/main.py",
+            "alfred-chat-stack/gateway/soul_middleware.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/pc-c2e-soul-context-injection",
+        notes="Phase C cockpit-surface; soul-context injection in gateway proves out for cockpit chat. Gateway injects soul payload + mesh state summary into system prompt; `\"what's mesh state?\"` references current node count from fixture. NOTE upstream source: cristianxruvalcaba-coder/alfred-chat-stack — gateway tree exists locally at Z:/alfred-chat-stack/gateway/ but is NOT pushed to the upstream repo. Child should push the gateway tree to the upstream repo or commit under alfred-chat-stack/ subtree of alfred-coo-svc. Hint owner pinned to salucallc per orchestrator invariant.",
+    ),
+
+    # ── Track 3 · Dashboard rollup (6) ───────────────────────────────────
+    "PC-D3A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        new_paths=("v7-dashboard/cockpit_state.schema.json",),
+        base_branch="main",
+        branch_hint="feature/pc-d3a-cockpit-state-rollup",
+        notes="Phase C cockpit-surface; LOAD-BEARING. GET /v1/cockpit/state — single JSON rollup. Merges orchestrator status + in-flight + roadmap + mesh sessions + heartbeats + inbox-unread + recent-merges; <250KB; cached 15s; schema-validated against `cockpit_state.schema.json`. Defines JSON shape that D3B-F, K4D, N5A all consume.",
+    ),
+
+    "PC-D3B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-d3b-mesh-state-panel",
+        notes="Phase C cockpit-surface; mesh-state panel: live agent heartbeats + active session count. `<section id=\"mesh\">` shows N agents alive + last-heartbeat-age; auto-refresh 10s via SSE; assert `[data-mesh-agent]` ≥1 on populated fixture. Depends on PC-D3A.",
+    ),
+
+    "PC-D3C": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-d3c-agent-inbox-panel",
+        notes="Phase C cockpit-surface; agent inbox panel: unread `mesh_messages` directed at Cristian. Soul-svc inbox query for `recipient=cristian, read=false`; click marks read. Depends on PC-D3A.",
+    ),
+
+    "PC-D3D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-d3d-slack-mirror-panel",
+        notes="Phase C cockpit-surface; Slack mirror panel: pull #batcave + DMs into cockpit (read-only). Polls Slack API every 60s for #batcave + DMs to Cristian; renders 20 most-recent. Requires Slack scopes: channels:history, im:history, users:read. Depends on PC-D3A.",
+    ),
+
+    "PC-D3E": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-d3e-recent-merges-feed",
+        notes="Phase C cockpit-surface; recent-merges feed: last 24h `git log --merges` across primary repos. Lists merge SHAs + titles + author from `alfred-coo-svc`, `soul-svc`, `mission-control`, `v7-dashboard`. Depends on PC-D3A.",
+    ),
+
+    "PC-D3F": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "v7-dashboard/dashboard.py",
+            "v7-dashboard/journey/phases.yaml",
+        ),
+        base_branch="main",
+        branch_hint="feature/pc-d3f-roadmap-phase-progress",
+        notes="Phase C cockpit-surface; roadmap-phase progress card: rollup of all done across `phase:*` labels. Progress bar per phase; reads `phases.yaml` (Oracle dashboard manifest path); 6 progress bars rendered with non-zero denominator. Depends on PC-D3A.",
+    ),
+
+    # ── Track 4 · Command surface (6) ────────────────────────────────────
+    "PC-K4A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        new_paths=("v7-dashboard/kickoff_templates.yaml",),
+        base_branch="main",
+        branch_hint="feature/pc-k4a-kickoff-template-picker",
+        notes="Phase C cockpit-surface; kickoff template picker: dropdown → fire. Lists templates from `kickoff_templates.yaml`; 'Fire' POSTs `/v1/orchestrator/kickoff`; dispatched job appears in `/v7status` in-flight within 30s.",
+    ),
+
+    "PC-K4B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-k4b-mesh-message-ui",
+        notes="Phase C cockpit-surface; mesh-message-an-agent UI. Form: agent picker (from `twin_tenants.json` fleet of 345) + body + priority; POST `/v1/mesh/message`; appears in target inbox within 5s.",
+    ),
+
+    "PC-K4C": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-k4c-kill-runaway-task-ui",
+        notes="Phase C cockpit-surface; kill-runaway-task UI. Table of `status=running` tasks with per-row 'Kill'; sends `task_complete` with `status=killed`; moves within 5s.",
+    ),
+
+    "PC-K4D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-k4d-fleet-endpoint-state-viewer",
+        notes="Phase C cockpit-surface; fleet endpoint state viewer. Paginated table from `twin_tenants.json` enriched with live heartbeats; sortable by age, role, tenant; 345 rows on full-fleet fixture. Depends on PC-D3A.",
+    ),
+
+    "PC-K4E": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-k4e-one-off-sub-runner",
+        notes="Phase C cockpit-surface; one-off sub runner. Form: persona picker + prompt + optional model; POST `/v1/sub/run`; result streams; 'echo `pong`' sub asserts streamed `pong`.",
+    ),
+
+    "PC-K4F": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-k4f-command-palette",
+        notes="Phase C cockpit-surface; command palette: ctrl-K opens fuzzy-search. Cmd-K opens overlay; fuzzy-search across [kickoff, mesh-msg, kill-task, fleet-view, sub-run]; enter dispatches. Depends on PC-K4A/B/C/E.",
+    ),
+
+    # ── Track 5 · Notification inbox (5) ─────────────────────────────────
+    "PC-N5A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-n5a-unified-inbox-endpoint",
+        notes="Phase C cockpit-surface; unified inbox endpoint /v1/cockpit/inbox (4 sources aggregated). Returns `{slack_dms, slack_batcave_recent, mesh_messages_to_cristian, grounding_gap_issues, halt_alerts}`; `total_unread` matches sum. Depends on PC-D3A.",
+    ),
+
+    "PC-N5B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-n5b-notification-ticker",
+        notes="Phase C cockpit-surface; notification ticker: top-bar unread-count badge with click-to-expand. `[3 unread]` reflects `inbox.total_unread`; click opens slide-out panel; updates within 5s of fixture change. Depends on PC-N5A.",
+    ),
+
+    "PC-N5C": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-n5c-halt-alert-banner",
+        notes="Phase C cockpit-surface; halt-alert dedicated channel: red banner on halt. Banner appears on `/v7status`, persists until acknowledged; cookie-persisted dismiss. Depends on PC-N5A.",
+    ),
+
+    "PC-N5D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        base_branch="main",
+        branch_hint="feature/pc-n5d-grounding-gap-surface",
+        notes="Phase C cockpit-surface; grounding-gap surface. Panel shows open grounding gaps with severity badges; click opens detail. Depends on PC-N5A.",
+    ),
+
+    "PC-N5E": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("v7-dashboard/dashboard.py",),
+        new_paths=("v7-dashboard/static/push-sw.js",),
+        base_branch="main",
+        branch_hint="feature/pc-n5e-web-push-bridge",
+        notes="Phase C cockpit-surface; push notification bridge: web push for halt alerts + DMs even when tab inactive. Service worker receives push; permission asked at install; SW receives event within 5s of test push. Depends on PC-V1E and PC-N5A.",
+    ),
 }
 
 

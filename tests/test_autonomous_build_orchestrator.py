@@ -1795,8 +1795,15 @@ def test_target_hints_entry_count_unchanged():
     children TIR-15A / TIR-15B / F19A / F19B / SS-07A / SS-07B / C-29A
     / C-29B (Linear SAL-3068..3075) covering the four remaining
     human-assigned MC parents SAL-2597 / 2627 / 2668 / 2677 per
-    Z:/_planning/journey/decomposition_2026-04-27_phase_b.md."""
-    assert len(_TARGET_HINTS) == 94
+    Z:/_planning/journey/decomposition_2026-04-27_phase_b.md.
+    Bumped 94 -> 119 by the Phase C cockpit-surface decomposition
+    2026-04-27 (PR feat/target-hints-phase-c-cockpit-surface): +25
+    tickets PC-V1A..E / PC-C2B / PC-C2D / PC-C2E / PC-D3A..F /
+    PC-K4A..F / PC-N5A..E covering the 5-track cockpit surface plan
+    at Z:/_planning/journey/phase_c_surface_tickets_2026-04-27.md
+    (C2A and C2C dropped per Cristian: chat stack contained in
+    cockpit, no Oracle deploy)."""
+    assert len(_TARGET_HINTS) == 119
 
 
 def test_target_hints_keys_are_uppercase():
