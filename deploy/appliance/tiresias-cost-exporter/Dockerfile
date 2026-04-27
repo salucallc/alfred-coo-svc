@@ -3,8 +3,7 @@ WORKDIR /app
 COPY . .
 RUN go build -o exporter .
 
-FROM alpine:3.18
-WORKDIR /app
-COPY --from=builder /app/exporter .
+FROM alpine:3.20
+COPY --from=builder /app/exporter /exporter
 EXPOSE 8080
-ENTRYPOINT ["./exporter"]
+ENTRYPOINT ["/exporter"]
