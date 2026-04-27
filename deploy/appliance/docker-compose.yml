@@ -208,3 +208,16 @@ networks:
     internal: true
   mc-egress:
     driver: bridge
+
+  # State migration container (one‑off init)
+  state-migrator:
+    image: alpine:3.20
+    command: ["sh", "/migrate/migrate_state_secrets.sh"]
+    volumes:
+      - ./state/secrets:/state/secrets:ro
+      - ./deploy/appliance/infisical/migrate_state_secrets.sh:/migrate/migrate_state_secrets.sh:ro
+    depends_on:
+      - infisical
+    restart: "no"
+    networks:
+      - appliance
