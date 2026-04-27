@@ -1785,8 +1785,11 @@ def test_target_hints_s04_uses_serve_py():
 def test_target_hints_entry_count_unchanged():
     """Hint count baseline. Bumped 22 -> 46 by PR #73 (hint-coverage 2026-04-25)
     which added 24 wave-1 entries: TIR-03..06, ALT-02/03/04/06, F04/F05/F12,
-    OPS-04/05/16/17/23, SS-03/04/10/11/12, C-26/27/28."""
-    assert len(_TARGET_HINTS) == 46
+    OPS-04/05/16/17/23, SS-03/04/10/11/12, C-26/27/28. Bumped 46 -> 86 to
+    catch up to the pre-existing wave-1/2 additions (registry was already at
+    83 against the stale 46 baseline) plus the +3 wave-2 decomposition
+    children OPS-08c / OPS-14c / OPS-14d added 2026-04-27."""
+    assert len(_TARGET_HINTS) == 86
 
 
 # ── AB-17-a · new result types (HintStatus / PathResult / VerificationResult)
