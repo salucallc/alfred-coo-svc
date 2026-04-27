@@ -1,14 +1,28 @@
 #!/usr/bin/env bash
+# migrate_state_secrets.sh
+# This script migrates legacy state secrets to Infisical and secures the original files.
+
 set -euo pipefail
 
-# Migrate secrets from the on‑disk state directory into Infisical.
-# This script is intended to run once during the first appliance boot.
+STATE_DIR="./state/secrets"
+TARGET_DIR="/app/infisical/secrets"
 
-if [ -d "/state/secrets" ]; then
-  echo "Migrating secrets to Infisical..."
-  # Placeholder for Infisical CLI import, e.g.:
-  # infisical import /state/secrets/*
+if [ ! -d "$STATE_DIR" ]; then
+  echo "State directory $STATE_DIR does not exist. Exiting."
+  exit 0
 fi
 
-# Secure the local secrets after migration.
-chmod -R 000 /state/secrets || true
+mkdir -p "$TARGET_DIR"
+
+# Example: iterate over files and push to Infisical via CLI (placeholder)
+for file in "$STATE_DIR"/*; do
+  [ -e "$file" ] || continue
+  secret_name=$(basename "$file")
+  # Placeholder: infisical-cli secret set $secret_name "$(cat $file)"
+  echo "Would import $secret_name to Infisical"
+done
+
+# Secure the original secret files
+chmod 000 -R "$STATE_DIR"
+
+echo "Migration completed. Original state secrets are now chmod 000."

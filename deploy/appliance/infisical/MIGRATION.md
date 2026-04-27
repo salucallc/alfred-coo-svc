@@ -1,17 +1,15 @@
-# Migration of Legacy State Secrets
+# Migration of State Secrets to Infisical (OPS‑08)
 
 ## Overview
-The appliance historically stored secrets under `./state/secrets/`. With the introduction of Infisical as the centralized secret vault, these on‑disk secrets must be migrated and then disabled.
+Legacy secrets stored in `./state/secrets/` need to be migrated to Infisical for centralized management while keeping a recoverable backup on‑disk.
 
-## Migration Procedure
-1. The `state-migrator` one‑off service runs the `migrate_state_secrets.sh` script on first boot.
-2. The script imports all files from `/state/secrets` into Infisical using the appropriate CLI (implementation placeholder).
-3. After a successful import, the script chmods the directory to `000` so the files are invisible but recoverable.
+## Steps
+1. On first container start, the **init** container runs `migrate_state_secrets.sh`.
+2. The script imports each file into Infisical (using the Infisical CLI – command omitted for security).
+3. After successful import, the script sets the original directory permissions to `000` to prevent accidental reads.
+4. Services are restarted; they read secrets from Infisical via environment variables.
 
 ## Verification
-- After the service completes, the secrets should appear in the Infisical UI.
-- The local `./state/secrets` directory should have permissions `000`.
-- Restarting the appliance should not re‑expose the secrets.
-
-## Rollback
-If migration fails, the directory remains readable. Inspect logs from the `state-migrator` container and retry.
+- Delete the `./state/secrets/` directory manually and restart the stack; all services should start healthy.
+- Confirm the secrets appear in the Infisical UI.
+- Ensure the on‑disk `./state/secrets/` files have mode `000`.

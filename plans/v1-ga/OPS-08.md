@@ -7,14 +7,12 @@
 - `plans/v1-ga/OPS-08.md`
 
 ## Acceptance criteria
-- Delete state dir, restart -> all services healthy, secrets visible in infisical UI; on-disk files chmod 000
+- Delete state dir, restart -> all services healthy; secrets visible in infisical UI; on-disk files chmod 000
 
 ## Verification approach
-- Run the one‑off `state-migrator` service, then restart the appliance.
-- Confirm all services report healthy via healthchecks.
-- Verify secrets appear in the Infisical web UI.
-- Check that `./state/secrets` on the host has mode `000`.
+Manual verification: after deployment, delete `./state/secrets/`, restart services, verify health checks pass, confirm secrets visible in Infisical UI, and check file permissions are `000`.
 
 ## Risks
-- If the migration script fails, secrets remain on‑disk; ensure logs are captured.
-- Deleting the state directory prematurely could break services that expect files; migration runs before services start.
+- Potential service downtime during secret import.
+- Incorrect permission setting could lock out legitimate access.
+- Dependency on OPS-06 and OPS-07 for Infisical integration.
