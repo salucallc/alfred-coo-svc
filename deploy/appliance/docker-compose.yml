@@ -90,9 +90,10 @@ services:
       soul-svc:
         condition: service_healthy
     networks:
-      - appliance
+      - mc-internal
+      - mc-egress
 
-  # — MCP Services (curated: github, slack, linear, notion) ————
+  # — MCP Services (curated: github, slack, linear, notion) ———
   mcp-github:
     image: ghcr.io/salucallc/mcp-gateway-node:latest
     restart: unless-stopped
@@ -123,7 +124,7 @@ services:
     memswap_limit: 256m
     environment:
       LINEAR_API_KEY: ${LINEAR_API_KEY:?must set}
-    command: ["--port", "8208", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "npx -y linear-mcp-server"]
+    command: ["--port", "8208", "--outputTransport", "streamableHttp", "--healthEndpoint", "/healthz", "--stdio", "linear-mcp-server"]
     networks:
       - appliance
 
@@ -179,7 +180,7 @@ services:
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 15s
-      timeout: 3s
+      timeout: 5s
       retries: 5
     networks:
       - appliance
@@ -201,4 +202,9 @@ networks:
   appliance:
     driver: bridge
   mc-ops:
+    driver: bridge
+  mc-internal:
+    driver: bridge
+    internal: true
+  mc-egress:
     driver: bridge
