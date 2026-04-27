@@ -1,0 +1,9 @@
+ollama:
+  flat_monthly_usd: 100
+openrouter:
+  free:
+    input_per_1k: 0.0
+    output_per_1k: 0.0
+  paid:
+    input_per_1k: 0.01
+    output_per_1k: 0.02
