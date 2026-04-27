@@ -1,18 +1,26 @@
-import time
+import click
+from mcctl.client import MCClient
 
-def push(immediate: bool = False):
-    """Push a policy. If `immediate` is True, the policy is applied immediately,
-    interrupting the endpoint within a few seconds and requeueing any in‑flight task.
-    Returns a dict describing the action for testing purposes.
+@click.group()
+def policy():
+    """Policy related commands."""
+    pass
+
+@policy.command(name="push")
+@click.option("--immediate", is_flag=True, help="Push policy immediately, interrupting endpoints.")
+def push(immediate: bool):
+    """Push a policy to the fleet.
+
+    If `--immediate` is provided, endpoints will be interrupted within 5 seconds and any in‑flight tasks will be re‑queued with `requeue_reason=policy_immediate`.
     """
-    if immediate:
-        start = time.time()
-        # Simulate minimal processing; in real code this would signal the endpoint.
-        elapsed = time.time() - start
-        return {
-            "interrupted": True,
-            "requeue_reason": "policy_immediate",
-            "elapsed_seconds": elapsed,
-        }
+    client = MCClient()
+    # The internal API expects a JSON payload; for now we forward the flag.
+    payload = {"immediate": immediate}
+    response = client.post_json("/v1/fleet/policy/push", json=payload)
+    if response.status_code == 200:
+        click.echo("Policy push successful.")
     else:
-        return {"interrupted": False}
+        click.echo(f"Policy push failed: {response.text}", err=True)
+
+# Expose the group to the top‑level command registry (if used).
+# In src/mcctl/commands/__init__.py, the group is imported elsewhere.
