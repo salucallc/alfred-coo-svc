@@ -1,4 +1,4 @@
-# OPS-08C: Migrate state secrets to Infisical
+# OPS-08c: Implement real Infisical CLI migration for state secrets
 
 ## Target paths
 - deploy/appliance/infisical/migrate_state_secrets.sh
@@ -18,14 +18,24 @@
    * Asserts exit code 0.
    * Runs again with one fixture file removed and asserts non-zero exit + error message.
 
-## Verification approach
-- Run `bash deploy/appliance/infisical/migrate_state_secrets.sh --dry-run` and ensure it exits 0.
-- Execute `bash tests/scripts/test_migrate_secrets.sh` and ensure it exits 0.
-- Verify that `grep -c "# Placeholder: infisical-cli"` returns `0` and that the count of `infisical-cli secret set` lines matches the number of secrets defined in `MIGRATION.md`.
+**P — Plan:**
 
-## Risks
-- Assumes the secret manifest format; changes require script updates.
-- Dry‑run flag must be kept in sync with real execution path.
+* Read `migrate_state_secrets.sh` and `MIGRATION.md` to enumerate the expected secret keys.
+* Implement `--dry-run` branch first; verify echoed commands match manifest.
+* Replace placeholders with real invocations gated behind a `if [ "$DRY_RUN" != "true" ]` block.
+* Author the test script using `bash -e` and assert via `grep -q` against captured stdout.
 
-## Notes
-- Uses environment variable `EXPECTED_COUNT` to enforce missing‑secret detection in tests.
+**E — Evidence:**
+
+* `git diff` showing every placeholder line replaced.
+* `bash deploy/appliance/infisical/migrate_state_secrets.sh --dry-run` output captured to evidence log; exit code 0.
+* `bash tests/scripts/test_migrate_secrets.sh` output captured; exit code 0.
+* Negative test (one fixture removed): captured stderr containing `ERROR: missing secret`, non-zero exit code.
+
+**V — Verification (machine-checkable):**
+
+1. `grep -c "# Placeholder: infisical-cli" deploy/appliance/infisical/migrate_state_secrets.sh` returns `0`.
+2. `grep -c "infisical-cli secret set" deploy/appliance/infisical/migrate_state_secrets.sh` returns the count of secrets in `MIGRATION.md`.
+3. `bash deploy/appliance/infisical/migrate_state_secrets.sh --dry-run` exits 0.
+4. `bash tests/scripts/test_migrate_secrets.sh` exits 0.
+5. PR includes both files in `git diff --name-only`.

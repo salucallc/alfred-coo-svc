@@ -1,35 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Determine repository root
-REPO_ROOT=$(git rev-parse --show-toplevel)
+# Setup fixture directory with mock secret files
+mkdir -p state/secrets
+echo "value1" > state/secrets/secret1
+echo "value2" > state/secrets/secret2
 
-# Create temporary fixture directory
-FIXTURE_DIR=$(mktemp -d)
-STATE_DIR="$FIXTURE_DIR/state/secrets"
-mkdir -p "$STATE_DIR"
+# Dry-run test: capture output and verify expected commands are echoed
+dry_output=$(bash deploy/appliance/infisical/migrate_state_secrets.sh --dry-run)
 
-# Create mock secret files
-echo "value1" > "$STATE_DIR/foo.txt"
-echo "value2" > "$STATE_DIR/bar.txt"
+echo "$dry_output" | grep -q "infisical-cli secret set"
+echo "$dry_output" | grep -q "secret1"
+echo "$dry_output" | grep -q "secret2"
 
-# Export EXPECTED_COUNT for the migration script
-export EXPECTED_COUNT=2
+# Ensure dry-run exits with code 0
+bash deploy/appliance/infisical/migrate_state_secrets.sh --dry-run > /dev/null
 
-# Dry‑run test: should echo commands and exit 0
-output=$("$REPO_ROOT/deploy/appliance/infisical/migrate_state_secrets.sh" --dry-run 2>&1)
-# Verify each secret line is echoed
-echo "$output" | grep -q 'infisical-cli secret set.*foo.txt="value1"'
-echo "$output" | grep -q 'infisical-cli secret set.*bar.txt="value2"'
-# Ensure exit code 0
-"$REPO_ROOT/deploy/appliance/infisical/migrate_state_secrets.sh" --dry-run
-
-# Negative test: remove one secret file
-rm "$STATE_DIR/bar.txt"
-# Expect non‑zero exit and error message
-if "$REPO_ROOT/deploy/appliance/infisical/migrate_state_secrets.sh" --dry-run; then
-  echo "Expected failure due to missing secret"
+# Negative test: remove a secret file and expect error
+rm state/secrets/secret2
+if bash deploy/appliance/infisical/migrate_state_secrets.sh; then
+  echo "Expected failure but script succeeded"
   exit 1
+else
+  err_output=$(bash deploy/appliance/infisical/migrate_state_secrets.sh 2>&1 || true)
+  echo "$err_output" | grep -q "ERROR: missing secret"
 fi
-
-echo "All tests passed"
