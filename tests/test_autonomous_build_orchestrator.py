@@ -5291,10 +5291,10 @@ async def test_dispatch_skips_human_assigned_ticket(monkeypatch):
     SAL-2641, SAL-2647, +4 phantom flips).
 
     Mirrors the existing label predicate in ``_is_wave_gate_excused`` so the
-    two sides agree on what "human-assigned" means. We drive one full tick
-    of ``_dispatch_wave`` by terminalising the human-assigned ticket via
-    the ``_poll_children`` spy after dispatch is checked, so the wave
-    loop's exit condition fires on tick 2.
+    two sides agree on what "human-assigned" means. The dispatch-skip path
+    sets ``ticket.status = ESCALATED`` directly so the wave-loop exit
+    condition (all wave_tickets in TERMINAL_STATES) fires cleanly without
+    any external terminalisation.
     """
     orch = _mk_orchestrator()
     orch.poll_sleep_sec = 0
@@ -5317,6 +5317,7 @@ async def test_dispatch_skips_human_assigned_ticket(monkeypatch):
         return []
 
     monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
     monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
     monkeypatch.setattr(orch, "_check_budget", _noop)
     monkeypatch.setattr(orch, "_status_tick", _noop)
@@ -5327,7 +5328,7 @@ async def test_dispatch_skips_human_assigned_ticket(monkeypatch):
     )
 
     # Spy on _dispatch_child. Capture what was dispatched and flip the
-    # auto ticket terminal so subsequent ticks don't re-dispatch it.
+    # auto ticket terminal so the wave-loop exit condition fires.
     dispatched: list[Ticket] = []
 
     async def _spy_dispatch(ticket):
@@ -5336,23 +5337,6 @@ async def test_dispatch_skips_human_assigned_ticket(monkeypatch):
         ticket.status = TicketStatus.MERGED_GREEN
 
     monkeypatch.setattr(orch, "_dispatch_child", _spy_dispatch)
-
-    # Externally terminalise the human-assigned ticket after dispatch is
-    # checked, so the wave-loop exit condition (all wave_tickets terminal)
-    # fires. This simulates the wave-gate / state-writer mechanism that
-    # production uses to excuse human-assigned work — the test focuses on
-    # the dispatch-side guard, not the terminalisation path.
-    poll_count = {"n": 0}
-
-    async def _poll_terminalises_human():
-        poll_count["n"] += 1
-        # First poll (after first dispatch tick) — flip human to ESCALATED
-        # so the wave loop exits cleanly on tick 2.
-        if human.status not in TERMINAL_STATES:
-            human.status = TicketStatus.ESCALATED
-        return []
-
-    monkeypatch.setattr(orch, "_poll_children", _poll_terminalises_human)
 
     # Bound the loop in case of a regression.
     ticks = {"n": 0}
@@ -5382,11 +5366,20 @@ async def test_dispatch_skips_human_assigned_ticket(monkeypatch):
         "human-assigned ticket must NOT be dispatched; "
         f"got {dispatched_idents!r}"
     )
+    # The dispatch-skip path must terminalise the human-assigned ticket
+    # itself (status=ESCALATED) so the wave loop's exit condition fires.
+    # Without this, _dispatch_wave hangs forever on any wave that contains
+    # a human-assigned ticket because PENDING is not in TERMINAL_STATES.
+    assert human.status == TicketStatus.ESCALATED, (
+        f"dispatch-skip must set status=ESCALATED for terminal-success "
+        f"accounting; got {human.status!r}"
+    )
 
 
 async def test_dispatch_skips_human_assigned_label_case_insensitive(monkeypatch):
     """AB-17-v: label match is case-insensitive (mirrors
-    ``_is_wave_gate_excused``)."""
+    ``_is_wave_gate_excused``). The skip path also sets status=ESCALATED
+    so a wave containing only human-assigned tickets exits cleanly."""
     orch = _mk_orchestrator()
     orch.poll_sleep_sec = 0
     orch.max_parallel_subs = 4
@@ -5404,6 +5397,7 @@ async def test_dispatch_skips_human_assigned_label_case_insensitive(monkeypatch)
         return []
 
     monkeypatch.setattr(orch, "_mark_repo_missing_tickets", _noop)
+    monkeypatch.setattr(orch, "_poll_children", _noop_list)
     monkeypatch.setattr(orch, "_poll_reviews", _noop_list)
     monkeypatch.setattr(orch, "_check_budget", _noop)
     monkeypatch.setattr(orch, "_status_tick", _noop)
@@ -5420,15 +5414,6 @@ async def test_dispatch_skips_human_assigned_label_case_insensitive(monkeypatch)
         ticket.status = TicketStatus.MERGED_GREEN
 
     monkeypatch.setattr(orch, "_dispatch_child", _spy_dispatch)
-
-    # _poll_children flips the lone human-assigned ticket terminal so the
-    # wave loop exits.
-    async def _poll_terminalises_human():
-        if human.status not in TERMINAL_STATES:
-            human.status = TicketStatus.ESCALATED
-        return []
-
-    monkeypatch.setattr(orch, "_poll_children", _poll_terminalises_human)
 
     ticks = {"n": 0}
     real_sleep = asyncio.sleep
@@ -5449,4 +5434,8 @@ async def test_dispatch_skips_human_assigned_label_case_insensitive(monkeypatch)
     assert dispatched == [], (
         f"Mixed-case 'Human-Assigned' label must still skip dispatch; "
         f"got {[t.identifier for t in dispatched]!r}"
+    )
+    assert human.status == TicketStatus.ESCALATED, (
+        f"dispatch-skip must set status=ESCALATED on case-insensitive "
+        f"label match; got {human.status!r}"
     )

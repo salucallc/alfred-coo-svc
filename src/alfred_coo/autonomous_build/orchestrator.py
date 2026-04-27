@@ -2414,6 +2414,7 @@ class AutonomousBuildOrchestrator:
                         "%s has human-assigned label; skipping dispatch (treated as terminal-success)",
                         ticket.identifier,
                     )
+                    ticket.status = TicketStatus.ESCALATED
                     continue
                 try:
                     await self._dispatch_child(ticket)
