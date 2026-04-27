@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Wizard Screen 8 – Admin Initialization</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; }
+    .container { max-width: 600px; margin: auto; }
+    label { display: block; margin-top: 1rem; }
+    input { width: 100%; padding: .5rem; margin-top: .3rem; }
+    button { margin-top: 1.5rem; padding: .7rem 1.2rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Admin Passphrase Setup</h1>
+    <p>Set the admin passphrase that will be used to initialize the appliance admin account.</p>
+    <form id="adminForm" action="#" method="post">
+      <label for="passphrase">Admin Passphrase:</label>
+      <input type="password" id="passphrase" name="passphrase" required minlength="8" />
+      <button type="submit">Initialize Admin</button>
+    </form>
+    <pre id="output" style="margin-top:1rem;background:#f4f4f4;padding:1rem;display:none;"></pre>
+  </div>
+  <script>
+    const form = document.getElementById('adminForm');
+    const output = document.getElementById('output');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const pass = document.getElementById('passphrase').value;
+      output.style.display = 'block';
+      output.textContent = 'Initializing admin...';
+      try {
+        const resp = await fetch('/scripts/mc_auth_init_admin.sh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passphrase: pass })
+        });
+        const txt = await resp.text();
+        output.textContent = txt;
+      } catch (err) {
+        output.textContent = 'Error: ' + err;
+      }
+    });
+  </script>
+</body>
+</html>
