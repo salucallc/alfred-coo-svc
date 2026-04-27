@@ -1776,12 +1776,51 @@ async def http_get(url: str) -> Dict[str, Any]:
 SLACK_ACK_POLL_TIMEOUT_SEC = 30.0
 SLACK_ACK_POLL_PAGE_LIMIT = 100
 
+# Relaxed-matcher token set (Fix E). Applied when (a) the message is a
+# threaded reply to the gate post or (b) only one gate is currently
+# pending. These shortened forms accept the natural ways Cristian replies
+# without the literal SS-08 token: "approved", "lgtm", a thumbs-up emoji,
+# the canonical Slack `:thumbsup:` shortcode, or a plain `+1`. Matched
+# case-insensitive as full-token regex (anchored to word/punctuation
+# boundaries so "lgtm-but-no" doesn't false-positive).
+RELAXED_ACK_TOKEN_REGEXES: List[str] = [
+    r"\back(?:nowledged)?\b",
+    r"\bapprove(?:d)?\b",
+    r"\blgtm\b",
+    r"\bok(?:ay)?\b",
+    r"\bgo\b",
+    r"\bship\s*it\b",
+    r"\+1",
+    r"👍",
+    r":thumbsup:",
+    r":\+1:",
+    r":white_check_mark:",
+    r"✅",
+]
+
+
+def _compile_relaxed_patterns() -> List[tuple[str, "re.Pattern[str]"]]:
+    out: List[tuple[str, "re.Pattern[str]"]] = []
+    for kw in RELAXED_ACK_TOKEN_REGEXES:
+        try:
+            out.append((kw, re.compile(kw, re.IGNORECASE)))
+        except re.error:
+            # Skip malformed entries rather than failing the whole poll;
+            # the constant is hand-curated so this should never fire in
+            # production.
+            continue
+    return out
+
 
 async def slack_ack_poll(
     channel: str,
     after_ts: str,
     author_user_id: str,
     keywords: List[str],
+    *,
+    gate_post_ts: Optional[str] = None,
+    relaxed: bool = False,
+    single_pending: bool = False,
 ) -> Dict[str, Any]:
     """Poll Slack `conversations.history` for an ACK message from one author.
 
@@ -1794,8 +1833,28 @@ async def slack_ack_poll(
     schema to #batcave, wait for Cristian to reply `ACK SS-08` (or similar),
     then proceed with dispatch.
 
+    Fix E (relaxed matcher, default off):
+      * ``relaxed=True`` opts into the shortened-token set
+        (``RELAXED_ACK_TOKEN_REGEXES``) under two safety conditions:
+        (a) the message is a threaded reply to ``gate_post_ts`` — the
+            thread context implies the ACK target — or
+        (b) ``single_pending=True`` — the orchestrator has only one gate
+            posted, so a bare "approved" is unambiguous.
+      * If neither condition holds (non-threaded message + multiple gates
+        pending), only the strict ``keywords`` regex set is consulted.
+        That preserves the no-false-ACK guarantee of the original AB-03
+        matcher.
+      * When ``gate_post_ts`` is set the poll also fetches
+        ``conversations.replies`` for that thread so threaded replies are
+        considered (``conversations.history`` returns thread parents only).
+
+    The strict ``keywords`` regex set always applies regardless of
+    ``relaxed``; it is a superset of permissible matches, not an
+    alternative.
+
     Returns:
-      {"matched": True, "message_ts": "...", "text": "...", "matched_keyword": "..."}
+      {"matched": True, "message_ts": "...", "text": "...",
+       "matched_keyword": "...", "via": "thread"|"single_pending"|"strict"}
         on a match, or {"matched": False} if no matching message is found.
     """
     token = os.environ.get("SLACK_BOT_TOKEN_ALFRED") or os.environ.get("SLACK_BOT_TOKEN")
@@ -1819,16 +1878,75 @@ async def slack_ack_poll(
         except re.error as e:
             return {"error": f"invalid regex {k!r}: {e}"}
 
-    cursor: Optional[str] = None
-    while True:
-        qs = (
-            f"channel={urllib.parse.quote(channel)}"
-            f"&oldest={urllib.parse.quote(after_ts)}"
-            f"&limit={SLACK_ACK_POLL_PAGE_LIMIT}"
+    relaxed_patterns: List[tuple[str, "re.Pattern[str]"]] = (
+        _compile_relaxed_patterns() if relaxed else []
+    )
+
+    def _match_text(
+        text: str,
+        is_threaded_reply: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Apply strict + relaxed pattern sets per Fix E rules. Returns the
+        match dict (without ``message_ts`` / ``text`` — caller fills those)
+        or ``None`` if no rule fires.
+        """
+        # Strict patterns apply always — preserves the AB-03 guarantee.
+        for raw_kw, pat in patterns:
+            if pat.search(text):
+                return {"matched_keyword": raw_kw, "via": "strict"}
+
+        if not relaxed:
+            return None
+
+        # Relaxed gates: threaded reply OR single_pending. Without one of
+        # these, a bare "approved" with multiple gates posted is too
+        # ambiguous to accept.
+        if is_threaded_reply:
+            for raw_kw, pat in relaxed_patterns:
+                if pat.search(text):
+                    return {"matched_keyword": raw_kw, "via": "thread"}
+        elif single_pending:
+            for raw_kw, pat in relaxed_patterns:
+                if pat.search(text):
+                    return {
+                        "matched_keyword": raw_kw,
+                        "via": "single_pending",
+                    }
+        return None
+
+    def _consider_message(
+        msg: Dict[str, Any],
+        *,
+        force_threaded: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Apply author + match rules to one Slack message dict."""
+        if msg.get("user") != author_user_id:
+            return None
+        text = msg.get("text") or ""
+        # A message is "a threaded reply to the gate post" when its
+        # ``thread_ts`` matches the gate's ``ts`` AND it isn't itself the
+        # parent (parent has thread_ts == ts).
+        msg_ts = msg.get("ts")
+        msg_thread_ts = msg.get("thread_ts")
+        is_threaded_reply = force_threaded or bool(
+            gate_post_ts
+            and msg_thread_ts == gate_post_ts
+            and msg_ts != gate_post_ts
         )
-        if cursor:
-            qs += f"&cursor={urllib.parse.quote(cursor)}"
-        url = f"https://slack.com/api/conversations.history?{qs}"
+        match = _match_text(text, is_threaded_reply=is_threaded_reply)
+        if match is None:
+            return None
+        return {
+            "matched": True,
+            "message_ts": msg_ts,
+            "text": text,
+            **match,
+        }
+
+    def _build_url(base: str, query: str) -> str:
+        return f"https://slack.com/api/{base}?{query}"
+
+    async def _http_get(url: str) -> Dict[str, Any]:
         req = urllib.request.Request(
             url,
             headers={
@@ -1840,13 +1958,76 @@ async def slack_ack_poll(
         try:
             with urllib.request.urlopen(req, timeout=SLACK_ACK_POLL_TIMEOUT_SEC) as r:
                 if r.status != 200:
-                    return {"error": f"slack http {r.status}"}
-                body = json.loads(r.read())
+                    return {"_error": f"slack http {r.status}"}
+                return json.loads(r.read())
         except urllib.error.HTTPError as e:
-            return {"error": f"slack http {e.code}: {e.read().decode(errors='replace')[:300]}"}
+            return {
+                "_error": f"slack http {e.code}: {e.read().decode(errors='replace')[:300]}"
+            }
         except Exception as e:
-            return {"error": f"slack transport: {type(e).__name__}: {e}"}
+            return {"_error": f"slack transport: {type(e).__name__}: {e}"}
 
+    # ── Pass 1: scan threaded replies if a gate_post_ts was supplied. ──
+    # `conversations.history` returns the thread parent only (no replies),
+    # so threaded ACKs are invisible without a separate `conversations.replies`
+    # call. We do this BEFORE the history scan because threaded ACKs are the
+    # most common Cristian-friendly path and we want to short-circuit the
+    # paginated history walk if we find one.
+    if gate_post_ts:
+        replies_qs = (
+            f"channel={urllib.parse.quote(channel)}"
+            f"&ts={urllib.parse.quote(gate_post_ts)}"
+            f"&limit={SLACK_ACK_POLL_PAGE_LIMIT}"
+        )
+        replies_cursor: Optional[str] = None
+        while True:
+            qs = replies_qs
+            if replies_cursor:
+                qs += f"&cursor={urllib.parse.quote(replies_cursor)}"
+            body = await _http_get(_build_url("conversations.replies", qs))
+            if "_error" in body:
+                # Surface the same error shape callers already handle. We
+                # deliberately bail on the threaded scan rather than the
+                # whole poll — falling through to history scan would
+                # silently mask a transient API problem.
+                return {"error": body["_error"]}
+            if not body.get("ok"):
+                return {
+                    "error": f"slack {body.get('error', 'unknown')}",
+                    "raw": body,
+                }
+            messages = body.get("messages") or []
+            # `conversations.replies` returns the parent first then replies
+            # in chronological order. Skip the parent (its `ts` equals the
+            # gate post) and consider only the replies as threaded.
+            for msg in messages:
+                if msg.get("ts") == gate_post_ts:
+                    continue
+                hit = _consider_message(msg, force_threaded=True)
+                if hit is not None:
+                    return hit
+            if not body.get("has_more"):
+                break
+            next_cursor = (
+                (body.get("response_metadata") or {}).get("next_cursor")
+            ) or ""
+            if not next_cursor:
+                break
+            replies_cursor = next_cursor
+
+    # ── Pass 2: scan channel history (existing behaviour). ──────────────
+    cursor: Optional[str] = None
+    while True:
+        qs = (
+            f"channel={urllib.parse.quote(channel)}"
+            f"&oldest={urllib.parse.quote(after_ts)}"
+            f"&limit={SLACK_ACK_POLL_PAGE_LIMIT}"
+        )
+        if cursor:
+            qs += f"&cursor={urllib.parse.quote(cursor)}"
+        body = await _http_get(_build_url("conversations.history", qs))
+        if "_error" in body:
+            return {"error": body["_error"]}
         if not body.get("ok"):
             return {"error": f"slack {body.get('error', 'unknown')}", "raw": body}
 
@@ -1854,17 +2035,9 @@ async def slack_ack_poll(
         # Slack returns messages newest-first; iterate oldest-first so the
         # "first match" is the earliest qualifying reply.
         for msg in reversed(messages):
-            if msg.get("user") != author_user_id:
-                continue
-            text = msg.get("text") or ""
-            for raw_kw, pat in patterns:
-                if pat.search(text):
-                    return {
-                        "matched": True,
-                        "message_ts": msg.get("ts"),
-                        "text": text,
-                        "matched_keyword": raw_kw,
-                    }
+            hit = _consider_message(msg)
+            if hit is not None:
+                return hit
 
         # Pagination. Slack surfaces `has_more` + `response_metadata.next_cursor`.
         if not body.get("has_more"):
@@ -2517,7 +2690,11 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "regex keywords (case-insensitive). Paginates via cursor. Used by "
             "the autonomous_build orchestrator's SS-08 gate to wait on a "
             "Cristian ACK before dispatching sensitive tickets. Requires the "
-            "bot to have `channels:history` scope on the target channel."
+            "bot to have `channels:history` scope on the target channel. "
+            "Optionally accepts a relaxed-matching mode that recognises "
+            "shortened ACK tokens (`approved`, `lgtm`, `+1`, 👍, ✅) when "
+            "either (a) the message is a threaded reply to the gate post or "
+            "(b) only one gate is currently pending."
         ),
         parameters={
             "type": "object",
@@ -2538,6 +2715,34 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Regex patterns; matched case-insensitive against message text.",
+                },
+                "gate_post_ts": {
+                    "type": "string",
+                    "description": (
+                        "Optional Slack ts of the gate post itself. When "
+                        "provided AND `relaxed=true`, threaded replies "
+                        "(`thread_ts == gate_post_ts`) are matched against "
+                        "the relaxed token set in addition to the strict "
+                        "`keywords`."
+                    ),
+                },
+                "relaxed": {
+                    "type": "boolean",
+                    "description": (
+                        "Opt into the shortened-token set "
+                        "(`approved`/`lgtm`/`+1`/👍/✅). The strict regex "
+                        "still applies; the relaxed set is additive and only "
+                        "fires under thread or single-gate-pending guards."
+                    ),
+                },
+                "single_pending": {
+                    "type": "boolean",
+                    "description": (
+                        "Caller asserts that only one gate is currently "
+                        "posted and waiting for ACK. With `relaxed=true`, "
+                        "non-threaded short-form replies are accepted under "
+                        "this guard alone."
+                    ),
                 },
             },
             "required": ["channel", "after_ts", "author_user_id", "keywords"],

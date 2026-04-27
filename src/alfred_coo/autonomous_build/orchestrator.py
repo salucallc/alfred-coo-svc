@@ -5195,12 +5195,17 @@ class AutonomousBuildOrchestrator:
     async def _maybe_ss08_gate(self, ticket: Ticket) -> bool:
         """SS-08 gate: post JWS claims schema + poll #batcave for ACK.
 
-        AB-06 implementation. Contract:
+        AB-06 implementation, extended by SAL-2890 (Fix D + Fix E).
+        Contract:
           - Non-SS-08 tickets: no-op, return True.
           - `self.state.ss08_acked` already True: skip gate, return True.
-          - Otherwise run `run_ss08_gate(cadence, slack_ack_poll_fn)`:
-              * On ACK: set `state.ss08_acked = True`, checkpoint,
-                return True (dispatch proceeds).
+          - Soul-memory has a fresh ACK record for
+            ``(linear_project_id, "SS-08")``: short-circuit the poll, flip
+            the in-process flag, return True. Survives daemon restarts.
+          - Otherwise run `run_ss08_gate(cadence, slack_ack_poll_fn,
+            on_ack_detected=...)`:
+              * On ACK: persist to soul memory + set `state.ss08_acked = True`,
+                checkpoint, return True (dispatch proceeds).
               * On 4h timeout: mark ticket FAILED, record event,
                 checkpoint, return False (skip + defer to v1.1 per D2).
               * On gate crash: log, mark FAILED, return False.
@@ -5213,6 +5218,42 @@ class AutonomousBuildOrchestrator:
                 ticket.identifier,
             )
             return True
+
+        # Fix D: pre-ACK check from soul memory. Survives daemon restarts.
+        # Without this, every daemon bounce burns a fresh "ACK SS-08" round-
+        # trip with Cristian — observed 3x across v7ab/v7ac/v7ad on 2026-04-26.
+        from .state import lookup_gate_ack, is_gate_ack_fresh, record_gate_ack
+
+        gate_name = "SS-08"
+        if self.linear_project_id:
+            try:
+                prior = await lookup_gate_ack(
+                    self.soul,
+                    linear_project_id=self.linear_project_id,
+                    gate_name=gate_name,
+                )
+            except Exception:
+                logger.exception(
+                    "lookup_gate_ack raised; falling through to live poll"
+                )
+                prior = None
+
+            if prior is not None and is_gate_ack_fresh(prior):
+                logger.info(
+                    "[gate-ack] %s pre-acked at %s by %s; skipping poll",
+                    gate_name, prior.acked_at,
+                    prior.acked_by_user_id or "(unknown)",
+                )
+                self.state.ss08_acked = True
+                self.state.record_event(
+                    "ss08_gate_preacked",
+                    identifier=ticket.identifier,
+                    acked_at=prior.acked_at,
+                    acked_by_user_id=prior.acked_by_user_id,
+                    ack_message_ts=prior.ack_message_ts,
+                )
+                await checkpoint(self.state, self.soul, self.task_id)
+                return True
 
         # Lazy import avoids forcing ss08_gate into the orchestrator's
         # import graph for tests that never touch SS-08 tickets.
@@ -5237,11 +5278,35 @@ class AutonomousBuildOrchestrator:
             await checkpoint(self.state, self.soul, self.task_id)
             return False
 
+        # Fix D persistence callback. Captured by reference so we can hand
+        # it to ``run_ss08_gate``; closes over self for project + soul access.
+        async def _persist_ack(payload: Dict[str, Any]) -> None:
+            if not self.linear_project_id:
+                logger.debug(
+                    "skipping gate-ack persist: linear_project_id unset"
+                )
+                return
+            try:
+                await record_gate_ack(
+                    self.soul,
+                    linear_project_id=self.linear_project_id,
+                    gate_name=gate_name,
+                    acked_by_user_id=payload.get("acked_by_user_id"),
+                    ack_message_ts=payload.get("ack_message_ts"),
+                    ack_message_text=payload.get("ack_message_text"),
+                    acked_at=payload.get("acked_at"),
+                )
+            except Exception:
+                logger.exception(
+                    "record_gate_ack raised; in-process flip still applies"
+                )
+
         try:
             acked = await run_ss08_gate(
                 cadence=self.cadence,
                 slack_ack_poll_fn=poll_fn,
                 logger_=logger,
+                on_ack_detected=_persist_ack,
             )
         except Exception as e:
             logger.exception("SS-08 gate errored: %s", e)

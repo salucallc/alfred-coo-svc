@@ -49,6 +49,17 @@ WAVE_PASS_TOPIC_INFIX = "wave_pass"
 # drift in Linear or GitHub state.
 WAVE_PASS_FRESHNESS_SEC = 24 * 60 * 60
 
+# Gate-ACK topic infix. Persists Cristian-approved gate ACKs (e.g. SS-08)
+# keyed by ``(linear_project_id, gate_name)`` so a daemon restart inside
+# the same project does not re-prompt for an ACK already given.
+GATE_ACK_TOPIC_INFIX = "gate_ack"
+
+# Default freshness window for a gate ACK. 30 days is generous: gates are
+# tied to a specific spec revision and the project lifecycle is typically
+# days-to-weeks. Anything older should re-prompt on the chance the spec
+# drifted.
+GATE_ACK_FRESHNESS_SEC = 30 * 24 * 60 * 60
+
 
 def state_topic_for(kickoff_task_id: str) -> str:
     return f"{STATE_TOPIC_PREFIX}:{kickoff_task_id}:{STATE_TOPIC_SUFFIX}"
@@ -65,6 +76,22 @@ def wave_pass_topic_for(linear_project_id: str, wave_n: int) -> str:
     return (
         f"{STATE_TOPIC_PREFIX}:{WAVE_PASS_TOPIC_INFIX}:"
         f"{linear_project_id}:wave_{wave_n}"
+    )
+
+
+def gate_ack_topic_for(linear_project_id: str, gate_name: str) -> str:
+    """Topic key for a persisted gate-ACK record.
+
+    Keyed by ``(linear_project_id, gate_name)`` so the ACK survives daemon
+    restarts within the same Linear project lifecycle. A fresh kickoff for
+    the same project will skip the gate poll entirely if a recent ACK is
+    on file. The gate name (e.g. ``"SS-08"``) is appended verbatim so each
+    gate gets its own record — orchestrators with multiple gates do not
+    cross-pollute.
+    """
+    return (
+        f"{STATE_TOPIC_PREFIX}:{GATE_ACK_TOPIC_INFIX}:"
+        f"{linear_project_id}:{gate_name}"
     )
 
 
@@ -395,3 +422,172 @@ def _calendar_timegm(struct) -> int:
     """
     import calendar
     return calendar.timegm(struct)
+
+
+# ── Gate-ACK persistence (Fix D) ───────────────────────────────────────────
+#
+# Cristian-approved gate ACKs (e.g. SS-08) are persisted to soul memory keyed
+# by ``(linear_project_id, gate_name)`` so a daemon restart inside the same
+# project does not re-prompt for an ACK already given. Without this, every
+# daemon bounce burns a fresh "ACK SS-08" round-trip with Cristian — observed
+# 3x on 2026-04-26 across v7ab/v7ac/v7ad runs.
+#
+# Read on gate evaluation by ``AutonomousBuildOrchestrator._maybe_ss08_gate``;
+# written after ``run_ss08_gate`` reports a successful ACK detection.
+
+
+@dataclass
+class GateAckRecord:
+    """Persisted Cristian-approved gate ACK.
+
+    All fields are optional except ``linear_project_id``, ``gate_name``, and
+    ``acked_at``; the rest are diagnostic (which message, which user). Forward-
+    compat: extra keys in stored JSON are dropped on load rather than raising.
+    """
+
+    linear_project_id: str
+    gate_name: str
+    acked_at: str  # ISO-8601 UTC, "Z"-suffixed
+    acked_by_user_id: Optional[str] = None
+    ack_message_ts: Optional[str] = None
+    ack_message_text: Optional[str] = None
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True)
+
+    @classmethod
+    def from_json(cls, blob: str) -> "GateAckRecord":
+        data = json.loads(blob)
+        known = {f for f in cls.__dataclass_fields__}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
+
+
+async def record_gate_ack(
+    soul_client,
+    *,
+    linear_project_id: str,
+    gate_name: str,
+    acked_by_user_id: Optional[str] = None,
+    ack_message_ts: Optional[str] = None,
+    ack_message_text: Optional[str] = None,
+    acked_at: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Persist a gate-ACK record under the canonical gate-ack topic.
+
+    ``acked_at`` defaults to UTC now() in the ``%Y-%m-%dT%H:%M:%SZ`` format
+    used elsewhere in this module.
+
+    Failures are logged + swallowed; the orchestrator's existing in-process
+    ``state.ss08_acked`` flag is the source of truth for the running session,
+    so a soul write failure only costs us cross-restart persistence.
+    """
+    if soul_client is None:
+        logger.debug("record_gate_ack skipped: soul_client is None (dry-run?)")
+        return None
+    if not linear_project_id:
+        logger.debug("record_gate_ack skipped: empty linear_project_id")
+        return None
+    if not gate_name:
+        logger.debug("record_gate_ack skipped: empty gate_name")
+        return None
+    if acked_at is None:
+        acked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    record = GateAckRecord(
+        linear_project_id=linear_project_id,
+        gate_name=gate_name,
+        acked_at=acked_at,
+        acked_by_user_id=acked_by_user_id,
+        ack_message_ts=ack_message_ts,
+        ack_message_text=ack_message_text,
+    )
+    topic = gate_ack_topic_for(linear_project_id, gate_name)
+    try:
+        blob = record.to_json()
+    except (TypeError, ValueError):
+        logger.exception("failed to serialise gate-ack record")
+        return None
+    try:
+        return await soul_client.write_memory(
+            blob,
+            topics=[topic, STATE_TOPIC_PREFIX, GATE_ACK_TOPIC_INFIX],
+        )
+    except Exception:
+        logger.exception(
+            "soul write_memory failed during record_gate_ack "
+            "(project=%s gate=%s)", linear_project_id, gate_name,
+        )
+        return None
+
+
+async def lookup_gate_ack(
+    soul_client,
+    *,
+    linear_project_id: str,
+    gate_name: str,
+) -> Optional[GateAckRecord]:
+    """Fetch the most recent gate-ACK record for ``(project, gate)``.
+
+    Returns ``None`` if no record exists, the record is malformed, or the
+    soul lookup fails. Returns the parsed ``GateAckRecord`` otherwise — the
+    caller is responsible for checking ``acked_at`` freshness via
+    ``is_gate_ack_fresh``.
+    """
+    if soul_client is None or not linear_project_id or not gate_name:
+        return None
+    topic = gate_ack_topic_for(linear_project_id, gate_name)
+    try:
+        recent = await soul_client.recent_memories(limit=5, topics=[topic])
+    except Exception:
+        logger.exception(
+            "soul recent_memories failed during lookup_gate_ack "
+            "(project=%s gate=%s)", linear_project_id, gate_name,
+        )
+        return None
+    if isinstance(recent, dict):
+        recent = recent.get("memories") or []
+    if not isinstance(recent, list) or not recent:
+        return None
+    for mem in recent:
+        content = (mem or {}).get("content") if isinstance(mem, dict) else None
+        if not content:
+            continue
+        try:
+            record = GateAckRecord.from_json(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning(
+                "skipping malformed gate-ack record (project=%s gate=%s)",
+                linear_project_id, gate_name,
+            )
+            continue
+        # Belt-and-braces: reject records whose embedded keys disagree with
+        # our query. A topic collision shouldn't happen, but cheap to check.
+        if record.linear_project_id and record.linear_project_id != linear_project_id:
+            logger.warning(
+                "ignored gate-ack record with mismatched project id %s "
+                "(wanted %s)", record.linear_project_id, linear_project_id,
+            )
+            continue
+        if record.gate_name and record.gate_name != gate_name:
+            continue
+        return record
+    return None
+
+
+def is_gate_ack_fresh(record: GateAckRecord, *, now: Optional[float] = None,
+                      max_age_sec: int = GATE_ACK_FRESHNESS_SEC) -> bool:
+    """True iff ``record.acked_at`` is within ``max_age_sec`` of ``now``.
+
+    Tolerant of unparseable timestamps — returns False rather than raising
+    so callers can treat a malformed record as "stale, re-prompt".
+    """
+    if not record or not record.acked_at:
+        return False
+    if now is None:
+        now = time.time()
+    try:
+        acked_struct = time.strptime(record.acked_at, "%Y-%m-%dT%H:%M:%SZ")
+        acked_epoch = float(_calendar_timegm(acked_struct))
+    except (ValueError, TypeError):
+        return False
+    return (now - acked_epoch) <= max_age_sec
