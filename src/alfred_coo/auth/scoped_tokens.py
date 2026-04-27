@@ -22,3 +22,14 @@ def get_token(scopes: List[str]) -> str:
     # resp = httpx.post(AUTHELIA_TOKEN_URL, data=data, headers=headers, timeout=10.0)
     # resp.raise_for_status()
     # return resp.json()["access_token"]
+
+# --- TTL validation integration (OPS-14d) ---
+from .ttl_validator import validate_iat as _validate_iat
+
+def is_token_iat_valid(iat: int) -> bool:
+    """Return True if the `iat` claim is present and within the 24‑hour TTL.
+
+    The helper delegates to the shared TTL validator.
+    """
+    valid, _ = _validate_iat(iat)
+    return valid
