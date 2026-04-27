@@ -1,54 +1,42 @@
-import pytest
+import base64
+import json
 from fastapi import FastAPI, Depends
 from fastapi.testclient import TestClient
-from starlette.middleware.base import BaseHTTPMiddleware
-
 from src.alfred_coo.auth.scope_middleware import ScopeMiddleware, requires_scope
 
-# Simple token injection middleware for testing purposes.
-class TokenInjectMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, token):
-        super().__init__(app)
-        self.token = token
+app = FastAPI()
+app.add_middleware(ScopeMiddleware)
 
-    async def dispatch(self, request, call_next):
-        request.state.token = self.token
-        return await call_next(request)
+@app.get("/protected")
+def protected(dep: None = Depends(requires_scope("fleet:read"))):
+    return {"ok": True}
 
-
-def create_app(token):
-    app = FastAPI()
-    app.add_middleware(TokenInjectMiddleware, token=token)
-    app.add_middleware(ScopeMiddleware)
-
-    @app.get("/protected")
-    @requires_scope("fleet:read")
-    async def protected_endpoint():
-        return {"result": "ok"}
-
-    return app
+def make_token(payload: dict) -> str:
+    header = {"alg": "none"}
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+    return f"{b64(header)}.{b64(payload)}."
 
 
 def test_scope_present_returns_200():
-    app = create_app({"scope": "fleet:read fleet:write"})
+    token = make_token({"scope": "fleet:read other:perm"})
     client = TestClient(app)
-    response = client.get("/protected")
-    assert response.status_code == 200
-    assert response.json() == {"result": "ok"}
+    resp = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
 
 
 def test_scope_missing_returns_403_with_payload():
-    app = create_app({"scope": "fleet:write"})
+    token = make_token({"scope": "other:perm"})
     client = TestClient(app)
-    response = client.get("/protected")
-    assert response.status_code == 403
-    assert response.json() == {"error": "insufficient_scope", "required": "fleet:read"}
+    resp = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 403
+    assert resp.json() == {"error": "insufficient_scope", "required": "fleet:read"}
 
 
 def test_no_scope_claim_returns_403():
-    app = create_app({})
+    token = make_token({})
     client = TestClient(app)
-    response = client.get("/protected")
-    assert response.status_code == 403
-    assert response.json() == {"error": "insufficient_scope", "required": "fleet:read"}
-
+    resp = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 403
+    assert resp.json() == {"error": "insufficient_scope", "required": "fleet:read"}

@@ -1,43 +1,37 @@
-from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-from typing import Callable
-
-
-def requires_scope(scope: str) -> Callable:
-    """Decorator to declare required OAuth2 scope for a route.
-
-    The decorator attaches a `_required_scope` attribute to the endpoint function.
-    """
-    def decorator(func: Callable) -> Callable:
-        setattr(func, "_required_scope", scope)
-        return func
-    return decorator
-
+import base64
+import json
+from typing import Callable, List
 
 class ScopeMiddleware(BaseHTTPMiddleware):
-    """FastAPI/ASGI middleware that enforces required scopes on routes.
-
-    It expects a JWT token to be attached to ``request.state.token`` by a prior
-    authentication step. The token should contain either a ``scope`` (string) or
-    ``scopes`` (string) claim containing space‑delimited scope identifiers.
-    """
-
     async def dispatch(self, request: Request, call_next):
-        # Retrieve token injected by upstream auth middleware.
-        token = getattr(request.state, "token", {})
-        scope_claim = token.get("scope") or token.get("scopes") or ""
-        token_scopes = set(scope_claim.split()) if scope_claim else set()
+        auth = request.headers.get("Authorization")
+        scopes: List[str] = []
+        if auth and auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1]
+            parts = token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+                try:
+                    payload_bytes = base64.urlsafe_b64decode(payload_b64)
+                    payload = json.loads(payload_bytes)
+                    claim = payload.get("scope") or payload.get("scopes")
+                    if isinstance(claim, str):
+                        scopes = claim.split()
+                    elif isinstance(claim, list):
+                        scopes = claim
+                except Exception:
+                    pass
+        request.state.scopes = scopes
+        response = await call_next(request)
+        return response
 
-        # FastAPI stores the endpoint function in ``request.scope['endpoint']``.
-        endpoint = request.scope.get("endpoint")
-        required = getattr(endpoint, "_required_scope", None) if endpoint else None
-
-        if required is not None:
-            if required not in token_scopes:
-                return JSONResponse(
-                    {"error": "insufficient_scope", "required": required},
-                    status_code=403,
-                )
-        return await call_next(request)
-
+def requires_scope(required: str) -> Callable[[Request], None]:
+    async def dependency(request: Request):
+        if required not in getattr(request.state, "scopes", []):
+            raise HTTPException(
+                status_code=403,
+                content={"error": "insufficient_scope", "required": required},
+            )
+    return dependency
