@@ -1,4 +1,4 @@
-# OPS-20: Add pre-provisioned Grafana dashboards
+# OPS-20: 4 provisioned dashboards
 
 ## Target paths
 - deploy/appliance/grafana/dashboards/appliance_health.json
@@ -7,11 +7,11 @@
 - deploy/appliance/grafana/dashboards/auth_and_access.json
 
 ## Acceptance criteria
-- All 4 uids resolve; mc-health green on clean install
+All 4 uids resolve; mc-health green on clean install
 
 ## Verification approach
-- Deploy with `docker compose up`; verify Grafana dashboards are available and each loads without errors; ensure health status is green.
+Run `curl http://localhost:3000/api/dashboards/uid/<uid>` for each dashboard and verify HTTP 200 and correct JSON. Check that `mc-health` service reports green status via health endpoint after deployment.
 
 ## Risks
-- Dashboard JSON syntax errors causing Grafana import failures.
-- Inconsistent UID references if Grafana provisioning changes.
+- Dashboard JSON may need additional fields for panels; minimal dashboards may lack useful visuals.
+- Future changes to Grafana schema could require updates.
