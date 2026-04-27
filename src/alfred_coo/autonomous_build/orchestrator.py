@@ -2837,6 +2837,17 @@ class AutonomousBuildOrchestrator:
             ticket.code,
             vr=self._verified_hints.get(ticket.code),
         )
+        # 2026-04-27: pre-render the canonical APE/V acceptance section
+        # from the Linear ticket body into the dispatched task body. This
+        # gives the builder the byte-verbatim text Hawkman validates
+        # against, so Step 4(b)'s "copy verbatim into the PR body" path
+        # has zero ambiguity (no http_get round-trip, no plan-doc drift).
+        # 2026-04-27 deep dive showed 75% of hawkman REQUEST_CHANGES were
+        # "missing APE/V citation" — primarily because builders paraphrase
+        # the acceptance text. Embedding it here closes the prompt gap.
+        # Best-effort: a Linear hiccup must not block dispatch, so on any
+        # failure we fall back to the legacy placeholder checklist.
+        apev_block = self._render_apev_acceptance_block(ticket)
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -2849,14 +2860,7 @@ class AutonomousBuildOrchestrator:
             f"\n"
             f"{target_block}"
             f"\n"
-            f"## Acceptance (APE/V)\n"
-            f"- [ ] Implementation matches the plan section for this ticket.\n"
-            f"- [ ] Unit + integration tests added or updated.\n"
-            f"- [ ] `ruff` + `pytest` green in CI.\n"
-            f"- [ ] PR opened via `propose_pr`; orchestrator will dispatch a "
-            f"hawkman-qa-a review on merge-ready.\n"
-            f"- [ ] Structured output envelope includes the PR URL in "
-            f"`summary` or `follow_up_tasks`.\n"
+            f"{apev_block}"
             f"\n"
             f"## Plan doc context\n"
             f"Plan doc (fetch via http_get): {plan_doc}\n"
@@ -2870,6 +2874,81 @@ class AutonomousBuildOrchestrator:
             f"`## Target` block above pins the repo + paths — do NOT edit "
             f"files outside those paths without opening a grounding-gap "
             f"Linear issue first.\n"
+        )
+
+    def _render_apev_acceptance_block(self, ticket: Ticket) -> str:
+        """Render the canonical APE/V acceptance section for a child task.
+
+        Hawkman GATE 1 validates byte-verbatim against the Linear ticket
+        body's ``## APE/V Acceptance (machine-checkable)`` section. The
+        2026-04-27 deep dive (75% reject rate, dominant reason 'missing
+        APE/V citation') showed that builders paraphrase the acceptance
+        text when they have to fetch it themselves. Embedding the
+        verbatim text directly in the dispatched task body lets the
+        builder copy-paste it into the PR body with no ambiguity.
+
+        Best-effort: a missing Linear key, transport failure, or absent
+        section returns the legacy placeholder checklist so dispatch is
+        never blocked.
+        """
+        # Lazy import — keeps test stubs isolated from tools.py.
+        try:
+            from alfred_coo.tools import _fetch_linear_acceptance_criteria  # noqa: WPS433
+        except ImportError:
+            _fetch_linear_acceptance_criteria = None  # type: ignore[assignment]
+
+        canonical: Optional[str] = None
+        if _fetch_linear_acceptance_criteria and ticket.code:
+            try:
+                canonical = _fetch_linear_acceptance_criteria(ticket.code)
+            except Exception:  # noqa: BLE001 — best-effort, never block dispatch
+                canonical = None
+        # Fall back to the ticket.identifier (e.g. SAL-2641) if the code
+        # field is empty but the identifier carries a SAL-NNNN string.
+        if (
+            canonical is None
+            and _fetch_linear_acceptance_criteria
+            and ticket.identifier
+            and ticket.identifier != ticket.code
+        ):
+            try:
+                canonical = _fetch_linear_acceptance_criteria(
+                    ticket.identifier
+                )
+            except Exception:  # noqa: BLE001
+                canonical = None
+
+        if canonical and canonical.strip():
+            # Embed the canonical block under the heading hawkman expects.
+            # Builders are instructed (persona Step 4(b)) to copy this
+            # entire section, byte-for-byte, into the PR body's first
+            # top-level section.
+            return (
+                "## APE/V Acceptance (machine-checkable)\n"
+                "(Copy this entire section, byte-for-byte, into the "
+                "`body` argument of your `propose_pr`/`update_pr` call. "
+                "Hawkman validates a verbatim substring match — do NOT "
+                "paraphrase, reformat, or reorder.)\n"
+                "\n"
+                f"{canonical.strip()}\n"
+            )
+        # Legacy fallback: the v1-GA placeholder checklist. The persona
+        # tells the builder to fetch the canonical APE/V via http_get on
+        # the plan doc when this fallback fires (Step 1(b)).
+        return (
+            "## Acceptance (APE/V)\n"
+            "- [ ] Implementation matches the plan section for this ticket.\n"
+            "- [ ] Unit + integration tests added or updated.\n"
+            "- [ ] `ruff` + `pytest` green in CI.\n"
+            "- [ ] PR opened via `propose_pr`; orchestrator will dispatch a "
+            "hawkman-qa-a review on merge-ready.\n"
+            "- [ ] Structured output envelope includes the PR URL in "
+            "`summary` or `follow_up_tasks`.\n"
+            "(Linear ticket body had no `## APE/V Acceptance "
+            "(machine-checkable)` section to pre-render — fetch it via "
+            "http_get on the plan doc, then paste the verbatim text into "
+            "the PR body's `## APE/V Acceptance (machine-checkable)` "
+            "section per Step 4(b).)\n"
         )
 
     #: Base URL where v1-GA plan docs live in the alfred-coo-svc repo.
@@ -4666,6 +4745,14 @@ class AutonomousBuildOrchestrator:
         # in `_builder_iteration_cap` so the respawn gets size-S=16 / size-M=20.
         size_line = f"Size: {ticket.size}\n" if ticket.size else ""
 
+        # 2026-04-27: include the canonical APE/V acceptance block on
+        # fix-round respawns too. SAL-2965 documented fix-round drift
+        # (builders rewrite the plan doc on respawn and the auto-inject
+        # ships a paraphrased citation); embedding the verbatim Linear
+        # text here gives the builder a stable reference even when the
+        # plan doc has drifted.
+        apev_block = self._render_apev_acceptance_block(ticket)
+
         body = (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -4680,12 +4767,19 @@ class AutonomousBuildOrchestrator:
             f"\n"
             f"{prior_pr_block}"
             f"\n"
-            f"## Acceptance (APE/V)\n"
+            f"{apev_block}"
+            f"\n"
+            f"## Fix-round checklist\n"
             f"- [ ] Address every point in the review feedback below.\n"
             f"- [ ] Tests still green (`ruff` + `pytest`).\n"
             f"- [ ] Push fixes to the EXISTING branch for {ticket.pr_url} "
             f"via the `update_pr` tool; do NOT open a new PR. The reviewer "
             f"bot will re-review automatically once your new commit lands.\n"
+            f"- [ ] If you replace the PR `body`, it MUST keep the "
+            f"`## APE/V Acceptance (machine-checkable)` heading + "
+            f"verbatim acceptance lines (auto-inject is skipped on "
+            f"`update_pr`, so YOU own the citation on every body "
+            f"replacement).\n"
             f"\n"
             f"## Review feedback\n"
             f"{review_excerpt or _NO_REVIEW_BODY_NOTE}\n"

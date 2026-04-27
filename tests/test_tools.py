@@ -134,6 +134,75 @@ async def test_mesh_task_create_new_tool_registered():
         assert key in required
 
 
+def test_propose_pr_body_field_states_apev_requirement():
+    """2026-04-27 builder reliability fix: the `body` parameter
+    description MUST tell the model that hawkman REQUEST_CHANGES on any
+    PR body lacking the canonical `## APE/V Acceptance (machine-
+    checkable)` heading. The persona prompt is the primary leverage
+    point; the tool description is a backup so models that read tool
+    schemas separately (e.g., on a stale persona cache) still see the
+    requirement.
+
+    Evidence: builder_reliability_2026-04-27.md (75% reject rate, deep
+    dive in Z:/_planning/builder-reliability).
+    """
+    schema = openai_tool_schema(BUILTIN_TOOLS["propose_pr"])
+    body_desc = schema["function"]["parameters"]["properties"]["body"][
+        "description"
+    ]
+    # Canonical hawkman heading must be named verbatim.
+    assert "## APE/V Acceptance (machine-checkable)" in body_desc, (
+        "propose_pr body description must reference the canonical "
+        "hawkman heading verbatim"
+    )
+    lower = body_desc.lower()
+    # Must call out byte-verbatim — paraphrase is the actual failure.
+    assert "byte-verbatim" in lower or "byte-for-byte" in lower, (
+        "propose_pr body description must require byte-verbatim text"
+    )
+
+
+def test_propose_pr_top_level_description_warns_about_apev():
+    """Belt-and-braces: the propose_pr tool's top-level description
+    (which some model harnesses surface above the per-field text) must
+    also warn about the APE/V citation requirement. Models that skip
+    per-field descriptions still see this banner.
+    """
+    spec = BUILTIN_TOOLS["propose_pr"]
+    assert "APE/V" in spec.description, (
+        "propose_pr top-level description must mention APE/V"
+    )
+    assert (
+        "machine-checkable" in spec.description
+        or "Acceptance" in spec.description
+    ), (
+        "propose_pr top-level description must reference the canonical "
+        "hawkman heading"
+    )
+
+
+def test_update_pr_body_field_warns_about_apev_on_replacement():
+    """Fix-round respawns: when update_pr replaces the PR body, the
+    auto-inject is SKIPPED (per SAL-2965 fix-round-overwrite logic).
+    The tool description must therefore tell the model that any body
+    replacement still needs the canonical APE/V heading + verbatim
+    text, otherwise the fix-round PR regresses GATE 1.
+    """
+    schema = openai_tool_schema(BUILTIN_TOOLS["update_pr"])
+    body_desc = schema["function"]["parameters"]["properties"]["body"][
+        "description"
+    ]
+    assert "## APE/V Acceptance (machine-checkable)" in body_desc, (
+        "update_pr body description must reference the canonical "
+        "hawkman heading"
+    )
+    lower = body_desc.lower()
+    assert "byte-verbatim" in lower or "byte-for-byte" in lower, (
+        "update_pr body description must require byte-verbatim text on "
+        "fix-round body replacement"
+    )
+
+
 @pytest.mark.asyncio
 async def test_propose_pr_rejects_bad_owner(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
