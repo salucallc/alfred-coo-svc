@@ -5634,30 +5634,253 @@ class AutonomousBuildOrchestrator:
             )
         return flipped
 
+    # ── stale-sweep PR-to-ticket matcher (tightening rule) ─────────────────
+    #
+    # The 2026-04-26 verification audit caught the sweeper auto-flipping
+    # tickets to Done based purely on a GitHub-Search code hit, with no
+    # check that the merged PR actually edited the ticket's expected
+    # files. Three confirmed misfires (TIR-15, OPS-08, F19) plus 3 likely
+    # (OPS-14, FLEET-29, SS-07) all traced back to PRs #73/#109/#120/#126
+    # that only edited ``src/alfred_coo/autonomous_build/orchestrator.py``
+    # (adding ``_TARGET_HINTS`` strings). The sweeper read the ticket code
+    # in the PR body and concluded the ticket shipped, even though no
+    # implementation file changed.
+    #
+    # Tightening rule: a search-hit PR is treated as evidence iff the PR's
+    # ``files_changed`` intersects the ticket's ``_TARGET_HINTS[code].paths
+    # ∪ new_paths``. PRs whose only changed file is a known "non-evidence"
+    # file (the orchestrator hints table is the canonical example — any
+    # ticket can be referenced there without being implemented there) are
+    # rejected outright as a fast-path defence.
+
+    # Files that, when changed in isolation, NEVER count as evidence that
+    # a ticket shipped. The orchestrator's _TARGET_HINTS dict cites every
+    # ticket code by definition — a PR that only modifies this file is a
+    # hints-data update, not a ticket implementation.
+    _NON_EVIDENCE_FILES: Tuple[str, ...] = (
+        "src/alfred_coo/autonomous_build/orchestrator.py",
+    )
+
+    @staticmethod
+    def _pr_files_match_hint(
+        files_changed: Tuple[str, ...],
+        hint: Optional[TargetHint],
+    ) -> bool:
+        """Pure helper: does any file in ``files_changed`` match the hint's
+        expected scope (``hint.paths ∪ hint.new_paths``)?
+
+        Returns False when ``hint is None`` (no hint to compare against —
+        cannot verify, must NOT auto-flip), when ``files_changed`` is
+        empty, or when the only changed file is in the non-evidence
+        allowlist (orchestrator hints table). Match is exact-string on
+        repo-relative POSIX paths — the GitHub Pulls API returns paths
+        in this form natively.
+        """
+        if hint is None:
+            return False
+        if not files_changed:
+            return False
+        # Fast-path: if the ENTIRE diff is non-evidence files, reject.
+        # (A PR that touches orchestrator.py *and* a real implementation
+        # file is fine — the implementation file will hit the intersect
+        # below. We only short-circuit the pure-hints-table case.)
+        non_evidence = set(
+            AutonomousBuildOrchestrator._NON_EVIDENCE_FILES
+        )
+        if all(f in non_evidence for f in files_changed):
+            return False
+        expected = set(hint.paths) | set(hint.new_paths)
+        if not expected:
+            return False
+        return any(f in expected for f in files_changed)
+
+    async def _fetch_pr_files(
+        self, pr_url: str,
+    ) -> Optional[Tuple[str, ...]]:
+        """Return the list of repo-relative file paths changed by the PR
+        at ``pr_url`` (e.g. ``https://github.com/<owner>/<repo>/pull/123``),
+        or ``None`` on any error / unparseable URL.
+
+        Tests stub this via ``self._gh_pr_files_fn`` to avoid live HTTP.
+        Mirrors the ``_gh_pr_search_fn`` pattern used by the sibling
+        ``_find_recent_merged_pr_for`` helper.
+        """
+        # Test hook: bypass HTTP entirely.
+        stub = getattr(self, "_gh_pr_files_fn", None)
+        if stub is not None:
+            try:
+                files = await stub(pr_url)
+            except Exception:
+                logger.exception(
+                    "[stale-sweep] _gh_pr_files_fn stub raised for %s",
+                    pr_url,
+                )
+                return None
+            if files is None:
+                return None
+            return tuple(files)
+        # Parse owner/repo/num out of the html_url.
+        m = re.match(
+            r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)",
+            pr_url or "",
+        )
+        if not m:
+            logger.debug(
+                "[stale-sweep] cannot parse PR url %r; skipping file check",
+                pr_url,
+            )
+            return None
+        owner, repo, num = m.group(1), m.group(2), m.group(3)
+        token = os.environ.get("GITHUB_TOKEN") or ""
+        if not token:
+            logger.debug(
+                "[stale-sweep] GITHUB_TOKEN unset; cannot fetch files for %s",
+                pr_url,
+            )
+            return None
+        # Pulls API: ``GET /repos/{owner}/{repo}/pulls/{num}/files``.
+        # Up to 100 files per page; stale-sweep PRs are tiny, one page
+        # is plenty.
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls/{num}/files",
+                    params={"per_page": "100"},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "User-Agent": "saluca-alfred/1.0",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                if r.status_code != 200:
+                    logger.warning(
+                        "[stale-sweep] GitHub pulls/files returned %d for "
+                        "%s (body=%r)",
+                        r.status_code, pr_url, r.text[:300],
+                    )
+                    return None
+                payload = r.json()
+        except Exception:
+            logger.exception(
+                "[stale-sweep] GitHub pulls/files raised for %s", pr_url,
+            )
+            return None
+        if not isinstance(payload, list):
+            return None
+        files = tuple(
+            (item.get("filename") or "")
+            for item in payload
+            if isinstance(item, dict) and item.get("filename")
+        )
+        return files
+
     async def _find_recent_merged_pr_for(self, ticket_ident: str) -> Optional[str]:
         """Search ``salucallc/*`` for a merged PR citing ``ticket_ident``
-        in title or body within the last ``_STALE_SWEEP_PR_LOOKBACK_SEC``.
+        in title or body within the last ``_STALE_SWEEP_PR_LOOKBACK_SEC``,
+        AND whose changed files intersect the ticket's expected scope.
 
         Returns the first matching PR URL (or None). Uses the GitHub
         Search API directly — no gh CLI dependency, matches the rest of
         ``alfred_coo.tools`` (systemd ``ProtectHome=true``).
 
+        Tightening rule (2026-04-26, fix for TIR-15/OPS-08/F19 misfires):
+        a candidate PR is only returned if its ``files_changed`` overlaps
+        ``_TARGET_HINTS[code].paths ∪ new_paths`` for the ticket. PRs that
+        only touch the ``_TARGET_HINTS`` orchestrator file (or any other
+        ``_NON_EVIDENCE_FILES`` entry) are rejected even when the search
+        hit them by code mention. If the ticket has no hint we cannot
+        verify scope, so we conservatively return None — the sweeper
+        leaves it for human review rather than auto-flip on weak evidence.
+
         Tests stub this via ``self._gh_pr_search_fn`` to avoid live HTTP.
+        ``self._gh_pr_files_fn`` separately stubs the file fetch used by
+        the new intersection check.
         """
         if not ticket_ident:
             return None
-        # Test hook: bypass HTTP entirely.
+
+        # Resolve the ticket's plan-doc code so we can look up the hint.
+        # ``self.graph`` is populated by the wave loop before any sweep
+        # runs; if it's not yet built (early-startup race), skip rather
+        # than guess.
+        graph = getattr(self, "graph", None)
+        ticket = graph.get_by_identifier(ticket_ident) if graph else None
+        code = (getattr(ticket, "code", "") or "").upper().strip()
+        hint = _TARGET_HINTS.get(code) if code else None
+
+        candidate_urls = await self._search_recent_merged_pr_urls(
+            ticket_ident,
+        )
+        if not candidate_urls:
+            return None
+
+        # Walk candidates in search-rank order, returning the first that
+        # passes the file-overlap check.
+        for url in candidate_urls:
+            if hint is None:
+                # No hint to compare against. Refuse to auto-flip — the
+                # whole point of the tightening rule is to require
+                # positive evidence, and a code-search hit on a PR with
+                # no scope contract isn't enough.
+                logger.info(
+                    "[stale-sweep] candidate PR %s found for %s but no "
+                    "_TARGET_HINTS entry exists for code %r; refusing to "
+                    "auto-flip on weak evidence",
+                    url, ticket_ident, code,
+                )
+                continue
+            files_changed = await self._fetch_pr_files(url)
+            if files_changed is None:
+                logger.debug(
+                    "[stale-sweep] file fetch failed for %s (ticket %s); "
+                    "skipping this candidate",
+                    url, ticket_ident,
+                )
+                continue
+            if not self._pr_files_match_hint(files_changed, hint):
+                logger.info(
+                    "[stale-sweep] candidate PR %s for %s does NOT "
+                    "intersect expected scope (paths=%r new_paths=%r "
+                    "changed=%r); rejecting as not-an-implementation",
+                    url, ticket_ident, hint.paths, hint.new_paths,
+                    files_changed[:8],
+                )
+                continue
+            return url
+        return None
+
+    async def _search_recent_merged_pr_urls(
+        self, ticket_ident: str,
+    ) -> List[str]:
+        """Return the list of merged-PR ``html_url`` values from a
+        GitHub-Search hit on ``ticket_ident`` within the lookback window.
+
+        Extracted from ``_find_recent_merged_pr_for`` so the search step
+        is unit-testable independently of the file-overlap intersection
+        step. Honours the ``self._gh_pr_search_fn`` stub for legacy tests
+        (which return a single URL instead of a list).
+        """
+        # Test hook: bypass HTTP entirely. Legacy stubs return a single
+        # url-or-None (matching the original signature); wrap so the new
+        # caller sees a list either way.
         stub = getattr(self, "_gh_pr_search_fn", None)
         if stub is not None:
             try:
-                return await stub(ticket_ident)
+                result = await stub(ticket_ident)
             except Exception:
                 logger.exception(
                     "[stale-sweep] _gh_pr_search_fn stub raised for %s",
                     ticket_ident,
                 )
-                return None
-        # Live path — guarded by env presence; missing token returns None
+                return []
+            if result is None:
+                return []
+            if isinstance(result, str):
+                return [result]
+            # Allow newer stubs to return a list directly.
+            return [u for u in result if isinstance(u, str)]
+        # Live path — guarded by env presence; missing token returns []
         # so the sweep degrades to a no-op rather than erroring out.
         token = os.environ.get("GITHUB_TOKEN") or ""
         if not token:
@@ -5665,7 +5888,7 @@ class AutonomousBuildOrchestrator:
                 "[stale-sweep] GITHUB_TOKEN unset; skipping PR search for %s",
                 ticket_ident,
             )
-            return None
+            return []
         # GitHub Search API. Ref:
         #   https://docs.github.com/en/rest/search/search#search-issues-and-pull-requests
         # We look for PRs in the salucallc org, merged, that mention the
@@ -5698,19 +5921,20 @@ class AutonomousBuildOrchestrator:
                         "(body=%r)",
                         r.status_code, ticket_ident, r.text[:300],
                     )
-                    return None
+                    return []
                 payload = r.json()
         except Exception:
             logger.exception(
                 "[stale-sweep] GitHub search raised for %s", ticket_ident,
             )
-            return None
+            return []
         items = (payload or {}).get("items") or []
+        urls: List[str] = []
         for item in items:
             url = item.get("html_url") or ""
             if "/pull/" in url:
-                return url
-        return None
+                urls.append(url)
+        return urls
 
     # ── kickoff termination ─────────────────────────────────────────────────
 
