@@ -2471,7 +2471,15 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "write the given files, commit + push, and open a pull request. "
             "Returns the PR URL on success. Only Saluca-owned repos are allowed "
             "(salucallc, saluca-labs, cristianxruvalcaba-coder). File paths must "
-            "be relative. This is the primary tool for autonomous code changes."
+            "be relative. This is the primary tool for autonomous code changes. "
+            "REQUIRED: the `body` argument MUST contain a "
+            "`## APE/V Acceptance (machine-checkable)` heading followed by the "
+            "byte-verbatim acceptance lines from the Linear ticket body, or "
+            "hawkman QA will REQUEST_CHANGES with reason 'missing APE/V "
+            "citation' (75% of v7af rejects). Do not paraphrase the acceptance "
+            "text — copy it exactly from the dispatched task body's "
+            "`## APE/V Acceptance (machine-checkable)` section, or from the "
+            "Linear ticket if the task body did not pre-render it."
         ),
         parameters={
             "type": "object",
@@ -2487,7 +2495,23 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
                     "description": "Base branch, typically 'main'.",
                 },
                 "title": {"type": "string", "description": "PR title"},
-                "body": {"type": "string", "description": "PR body (markdown)"},
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "PR body (markdown). MUST contain a "
+                        "`## APE/V Acceptance (machine-checkable)` heading "
+                        "with the byte-verbatim acceptance lines from the "
+                        "Linear ticket body — no paraphrasing, no "
+                        "reformatting. Hawkman QA REQUEST_CHANGES on any "
+                        "PR whose body lacks this heading, and the helper "
+                        "auto-inject only fires when the heading is ABSENT, "
+                        "so a paraphrased citation reaches hawkman and "
+                        "fails GATE 1's verbatim substring match. Best "
+                        "practice: paste the canonical block as the FIRST "
+                        "section of the body, then your normal "
+                        "Summary/Diff/Tests sections."
+                    ),
+                },
                 "files": {
                     "type": "object",
                     "description": "Mapping of relative-path -> file-content. Each file is written, added, committed, and pushed.",
@@ -2550,7 +2574,18 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
                 },
                 "body": {
                     "type": "string",
-                    "description": "Optional PR body replacement. Omit to keep existing.",
+                    "description": (
+                        "Optional PR body replacement. Omit to keep "
+                        "existing. If you DO replace the body, it MUST "
+                        "still contain a `## APE/V Acceptance "
+                        "(machine-checkable)` heading with byte-verbatim "
+                        "acceptance lines from the Linear ticket — "
+                        "fix-round respawns must not regress GATE 1. The "
+                        "auto-inject is skipped on update_pr (preserves "
+                        "the original PR body's citation), so YOU own the "
+                        "verbatim block on every update_pr that passes "
+                        "body."
+                    ),
                 },
                 "force_push": {
                     "type": "boolean",

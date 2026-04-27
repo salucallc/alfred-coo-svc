@@ -755,6 +755,116 @@ def test_child_task_body_unparseable_code_emits_escalate_line():
     ) in body, f"missing escalate fallback line in body:\n{body}"
 
 
+# ── 2026-04-27 builder propose_pr APE/V citation reliability fix ────────────
+#
+# 75% of hawkman REQUEST_CHANGES in the 2026-04-26 v7af window were
+# "missing APE/V citation". Root cause: builders paraphrased the
+# acceptance text instead of byte-verbatim-copying from the Linear
+# ticket body's `## APE/V Acceptance (machine-checkable)` section. Fix:
+# the orchestrator pre-renders the canonical APE/V block into the
+# dispatched task body so the builder can copy-paste with no ambiguity.
+# Evidence: builder_reliability_2026-04-27.md.
+
+
+def test_child_task_body_embeds_canonical_apev_when_linear_returns_text(
+    monkeypatch,
+):
+    """When Linear returns a canonical `## APE/V Acceptance
+    (machine-checkable)` section, the dispatched child body MUST embed
+    that text under the canonical heading so the builder copies it
+    byte-verbatim into the PR body. This closes the prompt gap that
+    made paraphrase the dominant 75% reject reason.
+    """
+    canonical = (
+        "- given X happens, when Y is invoked, then Z is true and green\n"
+        "- (action_class, risk_tier) tuples enumerated; no enum drift\n"
+        "- pytest tests/test_invariants.py green"
+    )
+
+    def fake_fetcher(code):
+        # Verify the orchestrator passes the ticket code through.
+        assert code == "SAL-2641"
+        return canonical
+
+    monkeypatch.setattr(
+        "alfred_coo.tools._fetch_linear_acceptance_criteria",
+        fake_fetcher,
+    )
+
+    orch = _mk_orchestrator()
+    ticket = _t("u-2641", "SAL-2641", "OPS-08", 4, "ops")
+    body = orch._child_task_body(ticket)
+
+    # Canonical heading present — what hawkman validates against.
+    assert "## APE/V Acceptance (machine-checkable)" in body, (
+        "child body must surface the canonical hawkman heading"
+    )
+    # Verbatim text from Linear is embedded byte-for-byte.
+    assert canonical in body, (
+        "Linear acceptance text must appear byte-verbatim in dispatched "
+        "body (no paraphrasing, no reformatting)"
+    )
+    # The instruction to copy verbatim into the PR body is also present.
+    assert "byte-for-byte" in body or "byte-verbatim" in body.lower(), (
+        "child body must instruct the builder to copy byte-verbatim"
+    )
+
+
+def test_child_task_body_falls_back_to_placeholder_when_linear_unavailable(
+    monkeypatch,
+):
+    """A Linear hiccup (no key, transport error, missing section) MUST
+    NOT block dispatch. The body falls back to the legacy placeholder
+    checklist + a note pointing the builder at the plan doc.
+    """
+    def fake_fetcher(code):
+        return None
+
+    monkeypatch.setattr(
+        "alfred_coo.tools._fetch_linear_acceptance_criteria",
+        fake_fetcher,
+    )
+
+    orch = _mk_orchestrator()
+    ticket = _t("u-na", "SAL-9999", "OPS-NA", 1, "ops")
+    body = orch._child_task_body(ticket)
+
+    # Legacy fallback heading still present so the builder gets *some*
+    # APE/V scaffold.
+    assert "## Acceptance (APE/V)" in body or (
+        "## APE/V Acceptance (machine-checkable)" in body
+    ), "fallback path must still emit some APE/V scaffold"
+    # The fallback must direct the builder to fetch via http_get on
+    # the plan doc (Step 1(b) path).
+    assert "plan doc" in body.lower(), (
+        "fallback must point the builder at the plan-doc fetch path"
+    )
+
+
+def test_child_task_body_falls_back_when_fetcher_raises(monkeypatch):
+    """Defensive: any exception from the fetcher (transport hiccup,
+    JSON decode error, etc.) must be swallowed and dispatch must
+    proceed with the legacy placeholder.
+    """
+    def boom(code):
+        raise RuntimeError("simulated transport error")
+
+    monkeypatch.setattr(
+        "alfred_coo.tools._fetch_linear_acceptance_criteria",
+        boom,
+    )
+
+    orch = _mk_orchestrator()
+    ticket = _t("u-boom", "SAL-2222", "OPS-BOOM", 1, "ops")
+    # Must not raise.
+    body = orch._child_task_body(ticket)
+    assert isinstance(body, str) and body, "body must be a non-empty string"
+    # Falls through to placeholder.
+    assert "## Acceptance (APE/V)" in body, (
+        "exception path must surface the fallback placeholder, not crash"
+    )
+
+
 async def test_run_missing_linear_project_id_fails_kickoff():
     """Payload without linear_project_id → orchestrator fails the kickoff
     cleanly instead of crashing."""

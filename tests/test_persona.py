@@ -236,6 +236,85 @@ def test_alfred_coo_a_prompt_contains_all_mandated_phrases():
         assert f"STEP {i}" in prompt, f"missing STEP {i} marker"
 
 
+# ── 2026-04-27 builder propose_pr APE/V citation reliability fix ────────────
+#
+# 75% of hawkman REQUEST_CHANGES in the 2026-04-26 v7af window were
+# "missing APE/V citation". Root cause: the persona told builders to
+# write `## APE/V Citation`, but hawkman validates byte-verbatim against
+# the Linear ticket body's `## APE/V Acceptance (machine-checkable)`
+# section, and builders paraphrased the acceptance text from memory.
+# These tests guard the prompt fix that:
+#   1. Names the canonical heading explicitly
+#      (`## APE/V Acceptance (machine-checkable)`).
+#   2. Instructs byte-verbatim copy from the Linear ticket body —
+#      forbids paraphrase / reformat / reorder.
+#   3. Calls out that the auto-inject only fires when heading is ABSENT
+#      (so a paraphrased citation reaches hawkman and rejects).
+# Evidence: builder_reliability_2026-04-27.md.
+
+
+def test_alfred_coo_a_prompt_names_canonical_apev_heading():
+    """The persona MUST name the canonical heading hawkman validates
+    against: `## APE/V Acceptance (machine-checkable)`. Without this
+    explicit phrase the builder defaults to the older `## APE/V
+    Citation` heading and paraphrases the acceptance lines.
+    """
+    prompt = _alfred_prompt()
+    assert "## APE/V Acceptance (machine-checkable)" in prompt, (
+        "persona prompt must name the canonical hawkman heading "
+        "verbatim — heading mismatch is the dominant 75% reject reason"
+    )
+
+
+def test_alfred_coo_a_prompt_requires_byte_verbatim_copy():
+    """The persona MUST tell the builder to copy the acceptance text
+    BYTE-VERBATIM — paraphrase is the actual failure mode hawkman gates
+    on. Several phrasings count as evidence the prompt is explicit:
+    the literal phrase 'byte-verbatim', 'BYTE-VERBATIM', or
+    'byte-for-byte', plus an explicit forbid-paraphrase clause.
+    """
+    prompt = _alfred_prompt()
+    lower = prompt.lower()
+    assert (
+        "byte-verbatim" in lower
+        or "byte-for-byte" in lower
+    ), "prompt must require byte-verbatim acceptance text"
+    assert (
+        "do not paraphrase" in lower
+        or "no paraphras" in lower
+        or "do not rewrite" in lower
+    ), "prompt must explicitly forbid paraphrase"
+
+
+def test_alfred_coo_a_prompt_warns_auto_inject_is_fallback_only():
+    """The persona MUST clarify the auto-inject only fires when the
+    heading is ABSENT — paraphrased citations bypass it and reach
+    hawkman. Without this nuance, builders treat the auto-inject as a
+    blanket safety net and keep paraphrasing.
+    """
+    prompt = _alfred_prompt()
+    assert "auto-inject" in prompt, (
+        "prompt must mention the auto-inject so the builder understands "
+        "the relationship between explicit body and the safety net"
+    )
+    # The clarifying language must indicate the auto-inject is a fallback
+    # / safety net for the missing-heading case, not a rewriter.
+    lower = prompt.lower()
+    assert any(
+        phrase in lower
+        for phrase in (
+            "fires when the heading is absent",
+            "fires when the heading is missing",
+            "only fires when the heading is absent",
+            "fallback for the missing-heading case",
+            "primary path",
+        )
+    ), (
+        "prompt must explain the auto-inject only handles missing-heading "
+        "cases, not paraphrased ones — otherwise builders rely on it"
+    )
+
+
 # ── AB-15: hawkman-qa-a APE/V citation + 300-line diff cap (SAL-2700) ───────
 #
 # Root cause R1/R2 of the 2026-04-24 off-scope PR incident (#31/#32): the
