@@ -2400,6 +2400,21 @@ class AutonomousBuildOrchestrator:
                     allowed = await self._maybe_ss08_gate(ticket)
                     if not allowed:
                         continue
+                # Human-assigned label check (AB-17-v dispatch-side enforcement).
+                # Wave-gate already excuses human-assigned tickets, but the
+                # dispatch path historically still ran builders against them,
+                # producing stub PRs that flipped tickets Done in error
+                # (2026-04-27 incident — SAL-2641, SAL-2647, +4 phantom flips).
+                labels = getattr(ticket, "labels", None) or []
+                if any(
+                    isinstance(lbl, str) and lbl.lower() == HUMAN_ASSIGNED_LABEL
+                    for lbl in labels
+                ):
+                    logger.info(
+                        "%s has human-assigned label; skipping dispatch (treated as terminal-success)",
+                        ticket.identifier,
+                    )
+                    continue
                 try:
                     await self._dispatch_child(ticket)
                     in_flight.append(ticket)
