@@ -383,12 +383,25 @@ async def test_sweep_stale_in_progress_flips_ticket_with_merged_pr(monkeypatch):
     )
 
     orch = _mk_orch(kickoff={"linear_project_id": proj})
+    # 2026-04-26 tightening: matcher now requires a hint + file overlap.
+    # Seed graph so SAL-2656 -> OPS-23 hint resolves.
+    g = TicketGraph()
+    t = _t("uuid-2656", "SAL-2656", "OPS-23", 1, status=TicketStatus.IN_PROGRESS)
+    g.nodes[t.id] = t
+    g.identifier_index[t.identifier] = t.id
+    orch.graph = g
 
     async def fake_pr_search(ident: str):
         if ident == "SAL-2656":
             return "https://github.com/salucallc/alfred-coo-svc/pull/145"
         return None
     orch._gh_pr_search_fn = fake_pr_search
+
+    async def fake_pr_files(pr_url: str):
+        # PR #145 is a real OPS-23 implementation: configs/model_pricing.yaml
+        # is in OPS-23.new_paths, so this satisfies the file-overlap rule.
+        return ("configs/model_pricing.yaml", "src/alfred_coo/pricing.py")
+    orch._gh_pr_files_fn = fake_pr_files
 
     flipped = await orch._sweep_stale_in_progress(proj)
     assert flipped == 1
@@ -503,6 +516,328 @@ async def test_sweep_stale_in_progress_skips_tickets_in_other_states(monkeypatch
     flipped = await orch._sweep_stale_in_progress(proj)
     assert flipped == 0
     assert updates == []
+
+
+# ── Fix B+ · PR-to-ticket file-overlap matcher (2026-04-26 tightening) ──────
+#
+# Regression coverage for the 2026-04-26 verification audit, which caught
+# the sweeper auto-flipping TIR-15 / OPS-08 / F19 to Done based purely on
+# a GitHub-Search code hit, even though the merged PR only edited the
+# ``_TARGET_HINTS`` dict in
+# ``src/alfred_coo/autonomous_build/orchestrator.py``. The matcher now
+# also requires the merged PR's changed files to intersect the ticket's
+# expected scope (paths ∪ new_paths) before treating it as evidence.
+
+
+def _seed_with_code(orch, identifier: str, code: str) -> None:
+    """Seed orch.graph with a single ticket whose ``code`` keys into
+    ``_TARGET_HINTS``. Used by the file-overlap regression tests so the
+    matcher can resolve identifier -> code -> hint."""
+    g = TicketGraph()
+    t = _t("u-overlap", identifier, code, 0, status=TicketStatus.IN_PROGRESS)
+    g.nodes[t.id] = t
+    g.identifier_index[t.identifier] = t.id
+    orch.graph = g
+
+
+def test_pr_files_match_hint_pure_helper_truth_table():
+    """Pure-function intersection rule: scope hit -> True; no hit / only
+    non-evidence file / empty hint / empty diff -> False."""
+    from alfred_coo.autonomous_build.orchestrator import (
+        AutonomousBuildOrchestrator,
+        TargetHint,
+    )
+
+    hint_paths = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("plans/v1-ga/OPS-08.md",),
+        new_paths=("scripts/migrate_state_secrets.sh", "MIGRATION.md"),
+    )
+
+    # Diff inside hint.paths -> match.
+    assert AutonomousBuildOrchestrator._pr_files_match_hint(
+        ("plans/v1-ga/OPS-08.md", "README.md"), hint_paths,
+    ) is True
+    # Diff inside hint.new_paths -> match.
+    assert AutonomousBuildOrchestrator._pr_files_match_hint(
+        ("scripts/migrate_state_secrets.sh",), hint_paths,
+    ) is True
+    # Diff entirely outside both -> no match (CATCHES THE BUG).
+    assert AutonomousBuildOrchestrator._pr_files_match_hint(
+        ("docs/UNRELATED.md", "tests/test_other.py"), hint_paths,
+    ) is False
+    # Diff is *only* the orchestrator hints file -> no match
+    # (CATCHES THE BUG; PRs #73/#109/#120/#126 pattern).
+    assert AutonomousBuildOrchestrator._pr_files_match_hint(
+        ("src/alfred_coo/autonomous_build/orchestrator.py",), hint_paths,
+    ) is False
+    # No hint at all -> no match (cannot verify scope).
+    assert AutonomousBuildOrchestrator._pr_files_match_hint(
+        ("anything.py",), None,
+    ) is False
+    # Empty diff -> no match.
+    assert AutonomousBuildOrchestrator._pr_files_match_hint(
+        (), hint_paths,
+    ) is False
+
+
+def test_pr_files_match_hint_orchestrator_plus_real_file_still_matches():
+    """A PR that touches orchestrator.py *and* a real implementation file
+    must still match — we only short-circuit the pure-hints-table case."""
+    from alfred_coo.autonomous_build.orchestrator import (
+        AutonomousBuildOrchestrator,
+        TargetHint,
+    )
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=("src/mcctl/commands/policy.py",),
+    )
+    # F19 misfire pattern, but PR also includes the real file -> match.
+    assert AutonomousBuildOrchestrator._pr_files_match_hint(
+        (
+            "src/alfred_coo/autonomous_build/orchestrator.py",
+            "src/mcctl/commands/policy.py",
+        ),
+        hint,
+    ) is True
+
+
+async def test_find_recent_merged_pr_rejects_orchestrator_only_pr(monkeypatch):
+    """Regression for TIR-15 / OPS-08 / F19 misfire: a search hit on a
+    PR whose only changed file is the orchestrator hints table must be
+    rejected, NOT returned as evidence the ticket shipped."""
+    proj = "PROJ-AAAA"
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    # OPS-08 has a real _TARGET_HINTS entry; seed identifier->code so
+    # the matcher can look up the hint.
+    _seed_with_code(orch, "SAL-2641", "OPS-08")
+
+    async def fake_search(ident: str):
+        # Sweeper finds PR #73-style merged PR mentioning OPS-08.
+        return "https://github.com/salucallc/alfred-coo-svc/pull/73"
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        # PR only touches the orchestrator hints table.
+        return ("src/alfred_coo/autonomous_build/orchestrator.py",)
+    orch._gh_pr_files_fn = fake_files
+
+    result = await orch._find_recent_merged_pr_for("SAL-2641")
+    assert result is None, (
+        "PRs that only edit the _TARGET_HINTS orchestrator file must be "
+        "rejected; this is the 2026-04-26 regression case (OPS-08 etc.)"
+    )
+
+
+async def test_find_recent_merged_pr_rejects_diff_outside_hint_scope(monkeypatch):
+    """A PR that mentions the ticket code but whose diff is entirely
+    outside the ticket's expected paths must be rejected."""
+    proj = "PROJ-AAAA"
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    # TIR-15 has a real hint with deploy/appliance/tiresias/* paths.
+    _seed_with_code(orch, "SAL-2597", "TIR-15")
+
+    async def fake_search(ident: str):
+        return "https://github.com/salucallc/alfred-coo-svc/pull/120"
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        # Diff is all in unrelated docs / test fixtures.
+        return ("docs/random.md", "tests/test_unrelated.py")
+    orch._gh_pr_files_fn = fake_files
+
+    result = await orch._find_recent_merged_pr_for("SAL-2597")
+    assert result is None, (
+        "PR diff outside hint.paths∪new_paths must not count as evidence"
+    )
+
+
+async def test_find_recent_merged_pr_accepts_diff_inside_paths(monkeypatch):
+    """Positive case: PR diff lands inside hint.paths -> match."""
+    proj = "PROJ-AAAA"
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    # OPS-01 hint.paths = ("deploy/appliance/docker-compose.yml",)
+    _seed_with_code(orch, "SAL-OPS01", "OPS-01")
+
+    async def fake_search(ident: str):
+        return "https://github.com/salucallc/alfred-coo-svc/pull/200"
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        # Real implementation file in hint.paths -> should match.
+        return ("deploy/appliance/docker-compose.yml", "README.md")
+    orch._gh_pr_files_fn = fake_files
+
+    result = await orch._find_recent_merged_pr_for("SAL-OPS01")
+    assert result == "https://github.com/salucallc/alfred-coo-svc/pull/200"
+
+
+async def test_find_recent_merged_pr_accepts_diff_inside_new_paths(monkeypatch):
+    """Positive case: PR diff lands inside hint.new_paths -> match."""
+    proj = "PROJ-AAAA"
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    # OPS-02 hint.new_paths = ("deploy/appliance/IMAGE_PINS.md",)
+    _seed_with_code(orch, "SAL-OPS02", "OPS-02")
+
+    async def fake_search(ident: str):
+        return "https://github.com/salucallc/alfred-coo-svc/pull/201"
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        return ("deploy/appliance/IMAGE_PINS.md",)
+    orch._gh_pr_files_fn = fake_files
+
+    result = await orch._find_recent_merged_pr_for("SAL-OPS02")
+    assert result == "https://github.com/salucallc/alfred-coo-svc/pull/201"
+
+
+async def test_find_recent_merged_pr_rejects_when_no_hint_for_code(monkeypatch):
+    """Defence-in-depth: a ticket whose code has no _TARGET_HINTS entry
+    cannot be auto-flipped — we have no scope contract to verify."""
+    proj = "PROJ-AAAA"
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    # Use a code that is intentionally not in _TARGET_HINTS.
+    _seed_with_code(orch, "SAL-NOHINT", "DOES-NOT-EXIST-99")
+
+    async def fake_search(ident: str):
+        return "https://github.com/salucallc/alfred-coo-svc/pull/999"
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        return ("src/anything.py",)
+    orch._gh_pr_files_fn = fake_files
+
+    result = await orch._find_recent_merged_pr_for("SAL-NOHINT")
+    assert result is None
+
+
+async def test_find_recent_merged_pr_walks_candidates_until_a_match(monkeypatch):
+    """Multiple search hits: matcher walks them in rank order and returns
+    the first one whose diff intersects the hint."""
+    proj = "PROJ-AAAA"
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    _seed_with_code(orch, "SAL-OPS01", "OPS-01")
+
+    async def fake_search(ident: str):
+        # Newer test stubs may return a list; the matcher accepts both.
+        return [
+            "https://github.com/salucallc/alfred-coo-svc/pull/300",  # bad
+            "https://github.com/salucallc/alfred-coo-svc/pull/301",  # bad
+            "https://github.com/salucallc/alfred-coo-svc/pull/302",  # good
+        ]
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        if pr_url.endswith("/300"):
+            return ("src/alfred_coo/autonomous_build/orchestrator.py",)
+        if pr_url.endswith("/301"):
+            return ("docs/elsewhere.md",)
+        # 302 is the real implementation.
+        return ("deploy/appliance/docker-compose.yml",)
+    orch._gh_pr_files_fn = fake_files
+
+    result = await orch._find_recent_merged_pr_for("SAL-OPS01")
+    assert result == "https://github.com/salucallc/alfred-coo-svc/pull/302"
+
+
+async def test_sweep_does_not_flip_when_pr_only_touches_orchestrator(monkeypatch):
+    """End-to-end: a stale-sweep tick with a search-hit but
+    orchestrator-only diff must NOT flip the ticket. This is the exact
+    misfire pattern that produced the 2026-04-26 false positives
+    (TIR-15 / OPS-08 / F19)."""
+    proj = "PROJ-AAAA"
+    list_response = {
+        "issues": [
+            {
+                "id": "uuid-2641",
+                "identifier": "SAL-2641",
+                "title": "OPS-08 migrate state secrets",
+                "labels": ["wave-2"],
+                "estimate": 3,
+                "state": {"name": "In Progress"},
+                "relations": [],
+            },
+        ],
+    }
+    updates: list[dict] = []
+    comments: list[dict] = []
+    _install_fake_linear_tools(
+        monkeypatch,
+        list_response=list_response,
+        update_recorder=updates,
+        comment_recorder=comments,
+    )
+
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    _seed_with_code(orch, "SAL-2641", "OPS-08")
+
+    async def fake_search(ident: str):
+        return "https://github.com/salucallc/alfred-coo-svc/pull/73"
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        # PR #73 pattern: only edits the orchestrator hints table.
+        return ("src/alfred_coo/autonomous_build/orchestrator.py",)
+    orch._gh_pr_files_fn = fake_files
+
+    flipped = await orch._sweep_stale_in_progress(proj)
+    assert flipped == 0, (
+        "Sweep must not auto-flip when the only matching PR is a "
+        "_TARGET_HINTS-only edit"
+    )
+    assert updates == []
+    assert comments == []
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "ticket_auto_flipped_stale" not in kinds
+
+
+async def test_sweep_still_flips_legitimate_implementation_pr(monkeypatch):
+    """End-to-end: when the merged PR's diff actually intersects the
+    ticket's expected paths, the sweep behaves exactly as before."""
+    proj = "PROJ-AAAA"
+    list_response = {
+        "issues": [
+            {
+                "id": "uuid-ops01",
+                "identifier": "SAL-OPS01",
+                "title": "OPS-01 mc-ops network",
+                "labels": ["wave-1"],
+                "estimate": 3,
+                "state": {"name": "In Progress"},
+                "relations": [],
+            },
+        ],
+    }
+    updates: list[dict] = []
+    comments: list[dict] = []
+    _install_fake_linear_tools(
+        monkeypatch,
+        list_response=list_response,
+        update_recorder=updates,
+        comment_recorder=comments,
+    )
+
+    orch = _mk_orch(kickoff={"linear_project_id": proj})
+    _seed_with_code(orch, "SAL-OPS01", "OPS-01")
+
+    async def fake_search(ident: str):
+        return "https://github.com/salucallc/alfred-coo-svc/pull/400"
+    orch._gh_pr_search_fn = fake_search
+
+    async def fake_files(pr_url: str):
+        # Real OPS-01 implementation path.
+        return ("deploy/appliance/docker-compose.yml",)
+    orch._gh_pr_files_fn = fake_files
+
+    flipped = await orch._sweep_stale_in_progress(proj)
+    assert flipped == 1
+    assert len(updates) == 1
+    assert updates[0]["issue_id"] == "uuid-ops01"
+    assert updates[0]["state_name"] == "Done"
+    assert "/pull/400" in comments[0]["body"]
 
 
 async def test_wave_pass_record_written_after_all_green_gate(monkeypatch):
