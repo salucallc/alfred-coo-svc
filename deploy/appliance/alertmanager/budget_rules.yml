@@ -1,0 +1,19 @@
+# Alertmanager budget alert rules
+
+groups:
+  - name: budget_alerts
+    rules:
+      - alert: TenantDailyBudgetExceeded
+        expr: sum by (tenant_id) (mc_cost_usd_total) > 10
+        for: 5m
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} exceeded daily budget"
+          description: "Daily cost {{ $value }} USD exceeds $10"
+          runbook: "https://github.com/salucallc/alfred-coo-svc/wiki/Budget-Alert-Runbook"
+      - alert: PersonaMonthlyBudgetExceeded
+        expr: sum by (persona_id) (mc_cost_usd_total) > 50
+        for: 5m
+        annotations:
+          summary: "Persona {{ $labels.persona_id }} exceeded monthly budget"
+          description: "Monthly cost {{ $value }} USD exceeds $50"
+          runbook: "https://github.com/salucallc/alfred-coo-svc/wiki/Budget-Alert-Runbook"
