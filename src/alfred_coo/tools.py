@@ -2327,6 +2327,97 @@ async def linear_add_label_to_issue(
     }
 
 
+# ── linear_add_comment ─────────────────────────────────────────────────────
+
+# Module-level cache: identifier (e.g. "SAL-2680") -> issue UUID. Linear
+# issue UUIDs are stable; one lookup per identifier per process is plenty.
+# The orchestrator's audit/escalation comment paths frequently target the
+# same parent ticket multiple times in a single tick (destructive-guardrail
+# trip + ticket_escalated event + later stale-sweep), so caching avoids
+# N redundant GraphQL hits. Mirrors ``_LINEAR_TEAM_STATES_CACHE`` /
+# ``_LINEAR_TEAM_LABELS_CACHE`` shape and lifetime.
+_LINEAR_ISSUE_UUID_CACHE: Dict[str, str] = {}
+
+
+async def linear_add_comment(
+    issue_id: str,
+    body: str,
+) -> Dict[str, Any]:
+    """Post a markdown comment on a Linear issue.
+
+    Mirrors ``linear_update_issue_state`` / ``linear_add_label_to_issue``:
+    ``issue_id`` accepts either the UUID or the human identifier (e.g.
+    ``"SAL-2680"``); identifier->UUID resolution is cached so repeat
+    comments on the same parent in one tick collapse to a single lookup.
+
+    Issues the GraphQL ``commentCreate`` mutation. Returns
+    ``{ok, comment_id, url, identifier}`` on success, ``{error, ...}`` on
+    failure. Failure is non-fatal at the orchestrator layer — the helpers
+    that call this swallow errors after logging, same as
+    ``_post_destructive_guardrail_linear_comment`` and the stale-sweep
+    audit path.
+    """
+    key = os.environ.get("LINEAR_API_KEY") or os.environ.get(
+        "ALFRED_OPS_LINEAR_API_KEY"
+    )
+    if not key:
+        return {"error": "LINEAR_API_KEY not configured"}
+    if not issue_id or not isinstance(issue_id, str):
+        return {"error": "issue_id must be a non-empty string"}
+    if not body or not isinstance(body, str):
+        return {"error": "body must be a non-empty string"}
+
+    # 1. Resolve issue -> UUID (cached). The ``issue(id:)`` query accepts
+    # either a UUID or a human identifier directly, so a UUID input round-
+    # trips through here cheaply on cache miss.
+    cached_uuid = _LINEAR_ISSUE_UUID_CACHE.get(issue_id)
+    identifier: Optional[str] = None
+    if cached_uuid is not None:
+        uuid = cached_uuid
+    else:
+        issue_query = (
+            "query IssueLookup($id: String!) { "
+            "issue(id: $id) { id identifier } }"
+        )
+        body_resp, err = await _linear_graphql(issue_query, {"id": issue_id}, key)
+        if err is not None:
+            return {"error": err}
+        issue = ((body_resp or {}).get("data") or {}).get("issue") or {}
+        if not issue.get("id"):
+            return {"error": f"linear issue {issue_id!r} not found"}
+        uuid = issue["id"]
+        identifier = issue.get("identifier")
+        _LINEAR_ISSUE_UUID_CACHE[issue_id] = uuid
+        # Also cache by identifier so a subsequent call with the human
+        # form short-circuits even if this call passed the UUID.
+        if identifier and identifier != issue_id:
+            _LINEAR_ISSUE_UUID_CACHE[identifier] = uuid
+
+    # 2. Issue the mutation.
+    mutation = (
+        "mutation CommentCreate($input: CommentCreateInput!) { "
+        "commentCreate(input: $input) "
+        "{ success comment { id url } } }"
+    )
+    body_resp, err = await _linear_graphql(
+        mutation,
+        {"input": {"issueId": uuid, "body": body}},
+        key,
+    )
+    if err is not None:
+        return {"error": err}
+    result = ((body_resp or {}).get("data") or {}).get("commentCreate") or {}
+    if not result.get("success"):
+        return {"error": "linear commentCreate returned success=false", "raw": body_resp}
+    comment = result.get("comment") or {}
+    return {
+        "ok": True,
+        "comment_id": comment.get("id"),
+        "url": comment.get("url"),
+        "identifier": identifier or issue_id,
+    }
+
+
 # ── linear_list_project_issues ──────────────────────────────────────────────
 
 LINEAR_LIST_PAGE_SIZE = 25  # Linear complexity cap ~10000 hit at page=100 with labels+state+relations (observed 12081 on SAL project, 2026-04-23)
@@ -2977,6 +3068,35 @@ BUILTIN_TOOLS: Dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         handler=linear_add_label_to_issue,
+    ),
+    "linear_add_comment": ToolSpec(
+        name="linear_add_comment",
+        description=(
+            "Post a markdown comment on a Linear issue. Resolves "
+            "`issue_id` (UUID or human identifier like 'SAL-2680') to "
+            "the underlying issue UUID and issues the `commentCreate` "
+            "mutation. Identifier->UUID lookups cache per-process so "
+            "repeat comments on the same parent within one tick collapse "
+            "to a single GraphQL hit. Used by the autonomous_build "
+            "orchestrator's audit / escalation / destructive-guardrail / "
+            "stale-sweep paths."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "issue_id": {
+                    "type": "string",
+                    "description": "Linear issue UUID or identifier (e.g. 'SAL-2680').",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Comment body (markdown supported).",
+                },
+            },
+            "required": ["issue_id", "body"],
+            "additionalProperties": False,
+        },
+        handler=linear_add_comment,
     ),
     "linear_list_project_issues": ToolSpec(
         name="linear_list_project_issues",
