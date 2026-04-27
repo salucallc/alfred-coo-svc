@@ -185,6 +185,17 @@ services:
     networks:
       - appliance
 
+  # One‑off state secret migrator (runs once on first boot)
+  state-migrator:
+    image: alpine:3.20
+    restart: "no"
+    depends_on:
+      - alfred-coo-svc
+    volumes:
+      - ./infisical/migrate_state_secrets.sh:/usr/local/bin/migrate_state_secrets.sh:ro
+      - ./state/secrets:/state/secrets:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/migrate_state_secrets.sh"]
+
   # — end services
 
 volumes:
