@@ -1,0 +1,14 @@
+# Authelia OAuth2 client configuration for scoped tokens
+# Each client includes allowed scopes and token TTL in seconds
+clients:
+  - id: ops-14-scoped-token
+    secret: "{{ AUTHELIA_OAUTH2_CLIENT_SECRET_OPS_14 }}"  # set in env
+    scopes:
+      - soul:memory:read
+      - soul:memory:write
+      - tiresias:audit:read
+      - tiresias:cost:read
+      - mcp:tools:invoke
+      - vault:read
+      - vault:write
+    ttl: 86400  # 24h in seconds
