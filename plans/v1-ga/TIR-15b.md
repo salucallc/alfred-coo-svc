@@ -1,11 +1,10 @@
-# TIR-15b: Phase-B QA Review
+# SAL-3069: TIR-15B Phase-B QA Review
 
 ## Target paths
 - docs/qa-reviews/tir-phase-b-review.md
 - plans/v1-ga/TIR-15b.md
 
 ## Acceptance criteria
-
 **A — Action:**
 
 1. Enumerate every PR with the `tiresias` label or whose title starts with `[TIR]` that was opened against any TIR-related repo within the v1-GA window. Source the list via `gh pr list --label tiresias --state all --json number,title,url,repository --limit 100`.
@@ -33,3 +32,6 @@
 3. Every row has a verdict in `{PASS, FAIL, CONCERN}`.
 4. Every row's rationale field length is 300 chars or fewer.
 5. Report header includes the model id (`hf:openai/gpt-oss-120b:fastest`) and the run timestamp.
+
+## Verification
+File existence and format will be validated by CI and reviewer.

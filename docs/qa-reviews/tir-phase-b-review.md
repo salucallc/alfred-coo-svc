@@ -1,7 +1,3 @@
-# TIR-15b QA Review Report
+# TIR-15B Phase-B QA Review
 
-Generated QA review aggregation for TIR-15b.
-
-## Report
-
-*Placeholder for aggregated QA results as per APE/V requirements.*
+This document will contain the aggregated QA review report for all Tiresias-labeled PRs as described in the APE/V acceptance criteria.
