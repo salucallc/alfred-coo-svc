@@ -1,4 +1,4 @@
-# OPS-24: tiresias-cost-exporter
+# OPS-24: Add tiresias-cost-exporter for cost accounting
 
 ## Target paths
 - deploy/appliance/tiresias-cost-exporter/main.go
@@ -8,16 +8,16 @@
 - plans/v1-ga/OPS-24.md
 
 ## Acceptance criteria
-- Implementation matches the plan section for this ticket.
-- Unit + integration tests added or updated.
-- `ruff` + `pytest` green in CI.
-- PR opened via `propose_pr`; orchestrator will dispatch a hawkman-qa-a review on merge-ready.
-- Structured output envelope includes the PR URL in `summary` or `follow_up_tasks`.
+- [ ] Address every point in the review feedback below.
+- [ ] Tests still green (`ruff` + `pytest`).
+- [ ] Push fixes to the EXISTING branch for https://github.com/salucallc/alfred-coo-svc/pull/146 via the `update_pr` tool; do NOT open a new PR. The reviewer bot will re-review automatically once your new commit lands.
 
 ## Verification approach
-- Build the Docker image and run the container.
-- Ensure the `/metrics` endpoint returns `mc_tokens_total` and `mc_cost_usd_total` gauges with the expected label set.
-- Verify the exporter updates values at 60‑second intervals.
+- Build the Go binary inside the Docker image and run the container.
+- Query `http://localhost:8080/metrics` and verify that `mc_tokens_total` and `mc_cost_usd_total` appear with the expected label sets.
+- Run existing `ruff` and `pytest` suites to ensure they remain green.
 
 ## Risks
-- Minimal risk: exporter is read‑only and does not modify existing services.
+- The exporter currently contains a stub implementation; real audit‑log querying must be added before production use.
+- Adding a new service may increase resource consumption; monitor CPU/memory after deployment.
+- Ensure the port (8080) does not conflict with existing services in the compose network.
