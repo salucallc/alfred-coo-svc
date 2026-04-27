@@ -1,0 +1,14 @@
+# OAuth2 client configuration for OPS-14 scoped tokens
+clients:
+  - id: ops-14-client
+    secret: "<replace-with-secure-secret>"
+    redirect_uris: []
+    scopes:
+      - soul:memory:read
+      - soul:memory:write
+      - tiresias:audit:read
+      - tiresias:cost:read
+      - mcp:tools:invoke
+      - vault:read/write
+    token_ttl: 24h
+    rotation_endpoint: /auth/rotate
