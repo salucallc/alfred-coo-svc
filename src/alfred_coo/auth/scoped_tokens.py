@@ -3,6 +3,8 @@ import base64  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 from typing import List
 import httpx  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 
+from .ttl_validator import validate_token_iat  # New import for TTL enforcement
+
 AUTHELIA_TOKEN_URL = os.getenv("AUTHELIA_TOKEN_URL", "http://localhost:9091/api/oauth2/token")
 
 def get_token(scopes: List[str]) -> str:
@@ -22,3 +24,12 @@ def get_token(scopes: List[str]) -> str:
     # resp = httpx.post(AUTHELIA_TOKEN_URL, data=data, headers=headers, timeout=10.0)
     # resp.raise_for_status()
     # return resp.json()["access_token"]
+
+# Example helper that could be used by request handlers
+def validate_scoped_token_payload(payload: dict) -> None:
+    """Validate a token payload, enforcing TTL.
+
+    This function is a thin wrapper that currently only enforces the TTL
+    requirement defined in OPS-14D. Additional validation can be added here.
+    """
+    validate_token_iat(payload)
