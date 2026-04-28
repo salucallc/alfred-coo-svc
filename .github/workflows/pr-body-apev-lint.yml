@@ -1,0 +1,25 @@
+name: pr-body-apev-lint
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check APE/V Acceptance heading in PR body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # Skip body lint for explicit non-ticket PRs (revert, dependabot, plan-doc PRs)
+          if echo "$PR_TITLE" | grep -qiE "^(revert|chore\(deps\)|docs\(plans\))"; then
+            echo "Skipping body-lint for non-ticket PR: $PR_TITLE"
+            exit 0
+          fi
+          if ! echo "$PR_BODY" | grep -qE '^## APE/V Acceptance'; then
+            echo "::error::PR body is missing the required '## APE/V Acceptance' section."
+            echo "::error::Copy the section from the Linear ticket body verbatim."
+            echo "::error::See builder persona BLOCKING REQUIREMENT for details."
+            exit 1
+          fi
+          echo "APE/V Acceptance heading found."
