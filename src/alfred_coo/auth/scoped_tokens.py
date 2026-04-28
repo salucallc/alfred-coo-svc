@@ -2,6 +2,7 @@ import os  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 import base64  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 from typing import List
 import httpx  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
+from .ttl_validator import validate_iat
 
 AUTHELIA_TOKEN_URL = os.getenv("AUTHELIA_TOKEN_URL", "http://localhost:9091/api/oauth2/token")
 
@@ -21,4 +22,10 @@ def get_token(scopes: List[str]) -> str:
     # data = {"grant_type": "client_credentials", "scope": " ".join(scopes)}
     # resp = httpx.post(AUTHELIA_TOKEN_URL, data=data, headers=headers, timeout=10.0)
     # resp.raise_for_status()
-    # return resp.json()["access_token"]
+    # return resp.json()["token"]
+
+def validate_token_iat(iat: int | None):
+    """Validate iat claim using ttl_validator logic.
+    Returns empty dict if valid, otherwise error dict.
+    """
+    return validate_iat(iat)
