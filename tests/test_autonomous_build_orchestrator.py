@@ -5975,3 +5975,334 @@ async def test_wave_gate_stall_force_pass_after_30min(monkeypatch):
     # History reset post-force-pass so a re-entry on the next kickoff
     # doesn't immediately re-trip on stale entries.
     assert orch._wave_progress_history.get(3) == []
+
+
+# ── Sequential-discipline bundle tests (2026-04-28) ────────────────────────
+
+
+async def test_builder_hard_timeout_consumes_retry_and_escalates_on_exhaustion(
+    monkeypatch,
+):
+    """Sequential-discipline Fix 1: a ticket dispatched but silent for
+    >BUILDER_HARD_TIMEOUT_SEC must force-fail with retry budget consumed
+    (NOT phantom-class). When retry is exhausted on the timeout, the
+    ticket force-escalates to ESCALATED + Linear Backlog +
+    ``human-assigned`` label + audit comment with grounding_gap_ident=
+    ``builder-hard-timeout`` so an operator gets the ticket instead of
+    seeing it loop forever.
+    """
+    import time as _time
+
+    from alfred_coo.autonomous_build.orchestrator import (
+        BUILDER_HARD_TIMEOUT_SEC,
+    )
+
+    # Empty mesh — no completed/failed/claimed records, so the child is
+    # nowhere to be found. The hard-timeout branch should fire as soon as
+    # ``dispatched_at`` exceeds the threshold, regardless of mesh state.
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    assert orch.retry_budget == 2
+
+    t = _t("u-ht", "SAL-3070-HT", "F19A", 3, "fleet", size="M", estimate=5)
+    t.linear_state = "In Progress"
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-silent-zzz"
+    # Pretend the dispatch happened > BUILDER_HARD_TIMEOUT_SEC ago.
+    t.dispatched_at = _time.time() - (BUILDER_HARD_TIMEOUT_SEC + 30)
+    t.retry_count = 0
+    t.retry_budget = 2
+    _seed_graph(orch, [t])
+
+    linear_calls: list[tuple[str, str]] = []
+
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    label_calls: list[tuple[str, str]] = []
+
+    async def _fake_label(ticket, label_name):
+        label_calls.append((ticket.identifier, label_name))
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
+
+    comment_calls: list[tuple[str, str]] = []
+
+    async def _fake_comment(ticket, grounding_gap_ident=None):
+        comment_calls.append((ticket.identifier, grounding_gap_ident))
+
+    monkeypatch.setattr(
+        orch, "_post_escalated_linear_comment", _fake_comment
+    )
+
+    # First hard-timeout fire: retry available (0 → 1 of 2 used).
+    # Sub-threshold check first: at 0/2 the carve-out path goes through
+    # _back_off_ticket. Call _poll_children to drive the branch.
+    await orch._poll_children()
+
+    # After first call: must NOT be in ESCALATED yet (retry remains).
+    # Because last_failure_reason="builder_hard_timeout" is NOT in
+    # PHANTOM_FAILURE_REASONS, _apply_phantom_carve_out routes through
+    # _back_off_ticket: retry_count=1, status=BACKED_OFF.
+    assert t.status == TicketStatus.BACKED_OFF, (
+        f"first hard-timeout with retry available must route through "
+        f"_back_off_ticket (BACKED_OFF), got {t.status!r}"
+    )
+    assert t.retry_count == 1, (
+        f"first hard-timeout must consume one retry (NOT phantom-class); "
+        f"got retry_count={t.retry_count}"
+    )
+    # Linear must NOT have been transitioned to Backlog with
+    # human-assigned label on the first fire — that's only the
+    # exhaustion path.
+    assert ("SAL-3070-HT", "human-assigned") not in label_calls, (
+        f"first hard-timeout must not apply human-assigned label; "
+        f"got {label_calls}"
+    )
+    # No exhaustion comment yet.
+    assert not any(
+        ident == "builder-hard-timeout"
+        for _, ident in comment_calls
+    ), (
+        f"first hard-timeout must not post escalation comment; "
+        f"got {comment_calls}"
+    )
+    # Wave-Backlog from the timeout itself was written, but no
+    # ESCALATED status yet.
+    assert any(
+        e["kind"] == "ticket_failed"
+        and e.get("reason") == "builder_hard_timeout"
+        for e in orch.state.events
+    ), "first hard-timeout must emit ticket_failed reason=builder_hard_timeout"
+
+    # Now arm the SECOND hard-timeout (retry exhausted). Wake the
+    # ticket from BACKED_OFF + re-dispatch state, then re-fire.
+    t.status = TicketStatus.DISPATCHED
+    t.child_task_id = "child-silent-second"
+    t.dispatched_at = _time.time() - (BUILDER_HARD_TIMEOUT_SEC + 30)
+    # retry_count is already 1 of 2 from the first fire → next bump
+    # exhausts the budget.
+    assert t.retry_count == 1
+    assert t.retry_budget == 2
+
+    label_calls.clear()
+    comment_calls.clear()
+
+    await orch._poll_children()
+
+    # Exhaustion outcome: ESCALATED, retry_count incremented to budget,
+    # Linear Backlog + human-assigned + audit comment all fired.
+    assert t.status == TicketStatus.ESCALATED, (
+        f"hard-timeout with budget exhausted must escalate; got {t.status!r}"
+    )
+    assert t.retry_count == 2, (
+        f"final retry slot must be consumed on exhaustion-escalation; "
+        f"got retry_count={t.retry_count}"
+    )
+    assert ("SAL-3070-HT", "Backlog") in linear_calls, (
+        f"hard-timeout exhaustion must transition Linear to Backlog; "
+        f"got {linear_calls}"
+    )
+    assert ("SAL-3070-HT", "Done") not in linear_calls, (
+        f"hard-timeout exhaustion must NOT mark Linear Done; "
+        f"got {linear_calls}"
+    )
+    assert ("SAL-3070-HT", "human-assigned") in label_calls, (
+        f"hard-timeout exhaustion must apply human-assigned label; "
+        f"got {label_calls}"
+    )
+    assert (
+        "SAL-3070-HT",
+        "builder-hard-timeout",
+    ) in comment_calls, (
+        f"hard-timeout exhaustion must post audit comment with "
+        f"grounding_gap_ident='builder-hard-timeout'; got {comment_calls}"
+    )
+    # ticket.linear_state mirrored locally so the next tick sees Backlog.
+    assert t.linear_state == "Backlog", (
+        f"ticket.linear_state must be updated to Backlog locally; "
+        f"got {t.linear_state}"
+    )
+
+
+async def test_dispatch_idempotency_refuses_duplicate_in_flight(monkeypatch):
+    """Sequential-discipline Fix 2: ``_dispatch_child`` must refuse a
+    duplicate dispatch when the ticket already has an in-flight child
+    registered in ``self._in_flight_dispatches``. Prevents the orphan
+    storm pattern observed 2026-04-28 where phantom-cleanup races a
+    still-running child and produces 10+ siblings on a single ticket.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    t = _t("u-idem", "SAL-3070-IDEM", "OPS-14D", 1, "ops", size="S",
+           estimate=1)
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+    # Skip per-dispatch hint re-verify — orthogonal to this test, and
+    # there's no hint registered for the synthetic OPS-14D code anyway.
+    async def _noop_verify(code_key, hint):
+        return VerificationResult(
+            code=code_key,
+            hint=hint,
+            status=HintStatus.UNVERIFIED,
+            repo_exists=True,
+            path_results=tuple(),
+            error=None,
+            verified_at=0.0,
+        )
+
+    monkeypatch.setattr(orch, "_verify_hint", _noop_verify)
+
+    # First dispatch — succeeds, registers in-flight ledger entry.
+    await orch._dispatch_child(t)
+    assert t.status == TicketStatus.DISPATCHED, (
+        f"first dispatch must transition to DISPATCHED; got {t.status!r}"
+    )
+    assert t.child_task_id is not None, (
+        "first dispatch must assign child_task_id"
+    )
+    assert orch._in_flight_dispatches.get(t.id) == t.child_task_id, (
+        f"first dispatch must register in-flight ledger entry; got "
+        f"{orch._in_flight_dispatches.get(t.id)!r}"
+    )
+    first_child_id = t.child_task_id
+    assert len(mesh.created) == 1, (
+        f"first dispatch must create exactly one mesh task; got "
+        f"{len(mesh.created)}"
+    )
+    first_attempt = t.dispatch_attempts
+    assert first_attempt == 1, (
+        f"dispatch_attempts must be 1 after first dispatch; got "
+        f"{first_attempt}"
+    )
+
+    # Second dispatch attempt with the in-flight entry still live —
+    # must be refused. The ticket's child_task_id and dispatch_attempts
+    # must NOT change; no new mesh task created.
+    await orch._dispatch_child(t)
+
+    assert t.child_task_id == first_child_id, (
+        f"duplicate dispatch must not change child_task_id; got "
+        f"{t.child_task_id!r}"
+    )
+    assert t.dispatch_attempts == first_attempt, (
+        f"duplicate dispatch must not increment dispatch_attempts; got "
+        f"{t.dispatch_attempts}"
+    )
+    assert len(mesh.created) == 1, (
+        f"duplicate dispatch must NOT create a second mesh task; got "
+        f"{len(mesh.created)} created tasks"
+    )
+    # Audit event for the skip.
+    skip_events = [
+        e for e in orch.state.events
+        if e["kind"] == "dispatch_idempotency_skip"
+    ]
+    assert len(skip_events) == 1, (
+        f"duplicate dispatch must emit exactly one "
+        f"dispatch_idempotency_skip event; got {skip_events}"
+    )
+    assert skip_events[0]["identifier"] == "SAL-3070-IDEM"
+    assert skip_events[0]["existing_child_task_id"] == first_child_id
+
+
+async def test_builder_fallback_chain_swaps_model_on_retry(monkeypatch):
+    """Sequential-discipline Fix 3: the first dispatch uses the chain's
+    first model (gpt-oss:120b-cloud → no tag, persona default); the
+    second dispatch (after a force-fail) must use the chain's second
+    model (qwen3-coder:480b-cloud → ``[tag:code]`` marker on the title
+    so ``dispatch.select_model`` routes to qwen).
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    # Force the default chain so the test is deterministic regardless of
+    # any future payload-default tweak. Two-element chain mirrors the
+    # production default.
+    orch.builder_fallback_chain = (
+        "gpt-oss:120b-cloud",
+        "qwen3-coder:480b-cloud",
+    )
+
+    t = _t("u-fb", "SAL-3070-FB", "OPS-14D", 1, "ops", size="S",
+           estimate=1)
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    async def _noop_verify(code_key, hint):
+        return VerificationResult(
+            code=code_key,
+            hint=hint,
+            status=HintStatus.UNVERIFIED,
+            repo_exists=True,
+            path_results=tuple(),
+            error=None,
+            verified_at=0.0,
+        )
+
+    monkeypatch.setattr(orch, "_verify_hint", _noop_verify)
+
+    # First dispatch — attempt index 0 → gpt-oss:120b-cloud (no tag,
+    # persona default routes to gpt-oss in dispatch.select_model).
+    await orch._dispatch_child(t)
+    assert t.dispatch_attempts == 1
+    first_title = mesh.created[-1]["title"]
+    assert "[tag:code]" not in first_title, (
+        f"first dispatch (gpt-oss) must NOT carry [tag:code] marker; "
+        f"got title={first_title!r}"
+    )
+    assert "[tag:strategy]" not in first_title, (
+        f"first dispatch must NOT carry [tag:strategy]; "
+        f"got title={first_title!r}"
+    )
+
+    # Simulate a hard-timeout / back-off: clear in-flight ledger so the
+    # next dispatch is not idempotency-blocked, reset child_task_id +
+    # dispatched_at the same way _back_off_ticket would.
+    t.status = TicketStatus.PENDING
+    t.child_task_id = None
+    t.dispatched_at = None
+    orch._in_flight_dispatches.pop(t.id, None)
+
+    # Second dispatch — attempt index 1 → qwen3-coder:480b-cloud
+    # ([tag:code] marker on title so dispatch.select_model picks qwen).
+    await orch._dispatch_child(t)
+    assert t.dispatch_attempts == 2
+    second_title = mesh.created[-1]["title"]
+    assert "[tag:code]" in second_title, (
+        f"second dispatch (qwen retry) MUST carry [tag:code] marker so "
+        f"dispatch.select_model routes to qwen3-coder:480b-cloud; "
+        f"got title={second_title!r}"
+    )
+    # Distinct mesh tasks created (no idempotency block this time).
+    assert len(mesh.created) == 2, (
+        f"two distinct dispatches must create two mesh tasks; "
+        f"got {len(mesh.created)}"
+    )
+    # Dispatch events record the model picked for each attempt.
+    dispatch_events = [
+        e for e in orch.state.events
+        if e["kind"] == "ticket_dispatched"
+    ]
+    assert len(dispatch_events) == 2, (
+        f"two dispatches must emit two ticket_dispatched events; "
+        f"got {dispatch_events}"
+    )
+    assert dispatch_events[0]["model"] == "gpt-oss:120b-cloud", (
+        f"first dispatch event must record gpt-oss:120b-cloud; "
+        f"got {dispatch_events[0]}"
+    )
+    assert dispatch_events[1]["model"] == "qwen3-coder:480b-cloud", (
+        f"second dispatch event must record qwen3-coder:480b-cloud; "
+        f"got {dispatch_events[1]}"
+    )
