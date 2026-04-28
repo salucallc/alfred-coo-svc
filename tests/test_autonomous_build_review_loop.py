@@ -692,3 +692,130 @@ async def test_poll_children_skips_tickets_already_in_reviewing(monkeypatch):
     assert t.status == TicketStatus.REVIEWING, (
         f"Ticket status changed unexpectedly: {t.status}"
     )
+
+
+# ── Test (SAL-3038/SAL-3070 follow-up): respawn-path human-assigned gate ────
+#
+# PRs #259 and #265 gated the two primary dispatch paths
+# (wave-loop dispatch in `orchestrator._tick` and the bare poll/claim
+# path in `main.py`). The post-incident audit flagged a third call site
+# inside the review-loop: `_handle_review_verdict` on a REQUEST_CHANGES
+# verdict respawns a fresh builder via `_respawn_child_with_fixes`. If
+# the Linear ticket acquires the `human-assigned` label (or transitions
+# to a terminal state) AFTER the original dispatch but BEFORE the
+# respawn fires, the original dispatch gate has already passed and only
+# the gate at this respawn site can prevent a builder from being
+# launched against a ticket the orchestrator should no longer touch.
+#
+# These tests pin the respawn-path gate to the same shared predicate
+# (`alfred_coo.main._should_skip_for_human_or_terminal`) so future
+# refactors can't silently un-gate the path.
+
+
+async def test_respawn_skips_when_human_assigned_label_present(monkeypatch):
+    """REQUEST_CHANGES + human-assigned label → no respawn, ESCALATED."""
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    ticket = _mk_reviewing_ticket(review_cycles=0)
+    # Simulate a label flip that happened AFTER the build child was
+    # originally dispatched but BEFORE Hawkman filed REQUEST_CHANGES.
+    ticket.labels = ["wave-1", "epic:gate-fix", "human-assigned"]
+    _seed_graph(orch, [ticket])
+    orch._last_completed_by_id = {
+        "review-1": _review_record(
+            "review-1",
+            state="REQUEST_CHANGES",
+            summary="REQUEST_CHANGES: address feedback",
+            extra_tool_calls=[
+                {
+                    "name": "pr_review",
+                    "result": {
+                        "state": "REQUEST_CHANGES",
+                        "body": "address feedback",
+                    },
+                }
+            ],
+        ),
+    }
+
+    async def _noop_linear(t, state_name):
+        return None
+
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_linear)
+
+    await orch._poll_reviews()
+
+    # Status flipped to ESCALATED, NOT DISPATCHED.
+    assert ticket.status == TicketStatus.ESCALATED, (
+        f"expected ESCALATED, got {ticket.status}"
+    )
+    # No fresh mesh task was created (no respawn fired).
+    assert mesh.created == [], (
+        f"respawn fired despite human-assigned label: {mesh.created}"
+    )
+    # The skip event was recorded with the right reason.
+    skip_events = [
+        e for e in orch.state.events
+        if e["kind"] == "respawn_skipped_human_or_terminal"
+    ]
+    assert len(skip_events) == 1
+    assert skip_events[0]["identifier"] == ticket.identifier
+    assert skip_events[0]["reason"] == "human_assigned"
+    # The ticket_respawned event was NOT recorded.
+    respawn_events = [
+        e for e in orch.state.events if e["kind"] == "ticket_respawned"
+    ]
+    assert respawn_events == []
+    # review_cycles was NOT incremented (we treat this as out-of-band
+    # closure, not a forward step).
+    assert ticket.review_cycles == 0
+
+
+async def test_respawn_proceeds_without_human_assigned_label(monkeypatch):
+    """REQUEST_CHANGES + ordinary labels → respawn fires as normal.
+
+    Regression guard: the new gate must NOT short-circuit the existing
+    happy path (`test_request_changes_respawns_child` covers the
+    contract; this test specifically asserts the gate's negative branch
+    doesn't trip on plain ordinary labels).
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    ticket = _mk_reviewing_ticket(review_cycles=0)
+    ticket.labels = ["wave-1", "epic:gate-fix"]  # no human-assigned
+    _seed_graph(orch, [ticket])
+    orch._last_completed_by_id = {
+        "review-1": _review_record(
+            "review-1",
+            state="REQUEST_CHANGES",
+            summary="REQUEST_CHANGES: fix the null check",
+            extra_tool_calls=[
+                {
+                    "name": "pr_review",
+                    "result": {
+                        "state": "REQUEST_CHANGES",
+                        "body": "fix the null check",
+                    },
+                }
+            ],
+        ),
+    }
+
+    async def _noop_linear(t, state_name):
+        return None
+
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_linear)
+
+    await orch._poll_reviews()
+
+    # Normal respawn path.
+    assert ticket.status == TicketStatus.DISPATCHED
+    assert ticket.review_cycles == 1
+    assert len(mesh.created) == 1
+    assert "fix: round 1" in mesh.created[0]["title"]
+    # No skip event was recorded.
+    skip_events = [
+        e for e in orch.state.events
+        if e["kind"] == "respawn_skipped_human_or_terminal"
+    ]
+    assert skip_events == []
