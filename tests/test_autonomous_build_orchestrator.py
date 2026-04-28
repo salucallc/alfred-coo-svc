@@ -5678,3 +5678,300 @@ async def test_dispatch_skips_human_assigned_label_case_insensitive(monkeypatch)
         f"dispatch-skip must set status=ESCALATED on case-insensitive "
         f"label match; got {human.status!r}"
     )
+
+
+# ── SAL-3070 / SAL-3038 phantom-loop circuit breakers (2026-04-28) ─────────
+#
+# Live incident: at 02:00 UTC on 2026-04-28 the orchestrator was stuck for
+# 2h+ in a 60-90s phantom-loop on SAL-3038 (OPS-14D) + SAL-3070 (F19A). The
+# pattern was:
+#   AB-17-x: phantom child <uuid> for SAL-3070 — not in claimed/completed/
+#       failed for Ns; force-failing
+#   [SAL-2870] SAL-3070 phantom-child cleanup (reason=phantom_child);
+#       skipping BACKED_OFF, dispatching fresh immediately (retry 0/2
+#       unchanged)
+#   ... (repeat) ...
+# PR #149 design preserves retry budget on phantom-cleanup, which is correct
+# for transient flakes but creates infinite loops when the builder is
+# genuinely silent-with-tools. These two tests pin the two circuit-breaker
+# mechanisms shipped in this PR:
+#   1. consecutive-phantom: 5 phantoms in 10 min for one ticket → ESCALATED
+#      + Linear Backlog + human-assigned label
+#   2. wave-stall: green_count flat for 30 min in a wave → force-pass +
+#      remaining tickets escalated
+
+
+async def test_consecutive_phantom_circuit_breaker_escalates_after_5(
+    monkeypatch,
+):
+    """SAL-3070 / SAL-3038 fix #1: a ticket that produces 5 consecutive
+    phantom-cleanup events inside the 10-min trailing window must be
+    force-escalated by the circuit breaker. The 5th call to
+    ``_apply_phantom_carve_out`` for the same FAILED+phantom_child ticket
+    flips it to ESCALATED, transitions Linear to Backlog, applies the
+    ``human-assigned`` label, and posts an audit comment with
+    grounding_gap_ident=``phantom-loop-circuit-breaker``. Calls 1..4 still
+    go through the SAL-2870 phantom-child carve-out unchanged (PENDING +
+    retry_count unchanged) so legitimate transient flakes are unaffected.
+    """
+    from alfred_coo.autonomous_build.orchestrator import (
+        PHANTOM_LOOP_MAX_IN_WINDOW,
+    )
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+    assert orch.retry_budget == 2  # carve-out only applies when retry on
+
+    t = _t("u-loop", "SAL-3070", "F19A", 3, "fleet", size="M", estimate=5)
+    t.linear_state = "In Progress"
+    _seed_graph(orch, [t])
+
+    linear_calls: list[tuple[str, str]] = []
+
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    label_calls: list[tuple[str, str]] = []
+
+    async def _fake_label(ticket, label_name):
+        label_calls.append((ticket.identifier, label_name))
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
+
+    comment_calls: list[tuple[str, str]] = []
+
+    async def _fake_comment(ticket, grounding_gap_ident=None):
+        comment_calls.append((ticket.identifier, grounding_gap_ident))
+
+    monkeypatch.setattr(
+        orch, "_post_escalated_linear_comment", _fake_comment
+    )
+
+    # Drive 5 phantom-cleanup events (the threshold) for the same ticket.
+    # Re-arm FAILED + phantom_child between calls because the carve-out
+    # mutates the ticket back to PENDING on calls 1..4. Calls 1..4 must
+    # leave retry_count untouched (SAL-2870 carve-out semantics); call 5
+    # must trip the breaker and escalate.
+    for i in range(PHANTOM_LOOP_MAX_IN_WINDOW):
+        t.status = TicketStatus.FAILED
+        t.last_failure_reason = "phantom_child"
+        t.child_task_id = f"child-loop-{i}"
+        await orch._apply_phantom_carve_out([t])
+        if i < PHANTOM_LOOP_MAX_IN_WINDOW - 1:
+            assert t.status == TicketStatus.PENDING, (
+                f"call {i+1}/5 below threshold must short-circuit to "
+                f"PENDING (not escalate); got {t.status!r}"
+            )
+            assert t.retry_count == 0, (
+                f"call {i+1}/5 must not consume retry budget; got "
+                f"retry_count={t.retry_count}"
+            )
+
+    # Trip outcome: ESCALATED + Backlog + human-assigned + audit comment.
+    assert t.status == TicketStatus.ESCALATED, (
+        f"5th consecutive phantom in 10min window must escalate; "
+        f"got {t.status!r}"
+    )
+    assert ("SAL-3070", "Backlog") in linear_calls, (
+        f"phantom-loop circuit breaker must transition Linear to Backlog; "
+        f"got {linear_calls}"
+    )
+    assert ("SAL-3070", "Done") not in linear_calls, (
+        f"phantom-loop circuit breaker must NOT mark Linear Done "
+        f"(false completion); got {linear_calls}"
+    )
+    assert ("SAL-3070", "human-assigned") in label_calls, (
+        f"phantom-loop circuit breaker must apply human-assigned label; "
+        f"got {label_calls}"
+    )
+    assert (
+        "SAL-3070",
+        "phantom-loop-circuit-breaker",
+    ) in comment_calls, (
+        f"phantom-loop circuit breaker must post audit comment with "
+        f"grounding_gap_ident='phantom-loop-circuit-breaker'; "
+        f"got {comment_calls}"
+    )
+    # ticket.linear_state mirrored locally so the next tick / restore sees
+    # the new state without a Linear re-read.
+    assert t.linear_state == "Backlog", (
+        f"ticket.linear_state must be updated to Backlog locally; "
+        f"got {t.linear_state}"
+    )
+    # Audit: a ticket_escalated event with the circuit-breaker grounding
+    # gap must be present so ops can grep for the breaker fire.
+    breaker_events = [
+        e for e in orch.state.events
+        if e["kind"] == "ticket_escalated"
+        and e.get("grounding_gap") == "phantom-loop-circuit-breaker"
+    ]
+    assert len(breaker_events) == 1, (
+        f"expected exactly one phantom-loop-circuit-breaker escalation "
+        f"event; got {breaker_events}"
+    )
+    assert breaker_events[0]["identifier"] == "SAL-3070"
+    # Counter reset post-escalation so a re-entry starts fresh.
+    assert orch._consecutive_phantoms.get(t.id, []) == [], (
+        f"counter must be cleared after escalation; got "
+        f"{orch._consecutive_phantoms.get(t.id)}"
+    )
+
+
+async def test_wave_gate_stall_force_pass_after_30min(monkeypatch):
+    """SAL-3070 / SAL-3038 fix #3: a wave whose ``green_count`` has not
+    increased over the trailing 30-min window must be force-passed by
+    ``_maybe_force_pass_stalled_wave``. Every remaining non-terminal
+    ticket is escalated (ESCALATED + Linear Backlog + human-assigned
+    label) and the helper returns True so the dispatch loop breaks. A
+    wave whose green_count is still rising must NOT force-pass — that
+    invariant is exercised by the `still_rising` sub-case below.
+
+    The test drives the helper directly (not via ``_dispatch_wave``) so
+    we can synthesize the "30-min flat" history without a 30-min sleep.
+    The history field is a per-wave list of (monotonic_ts, green_count)
+    samples; we hand-seed it with a flat window plus the current sample.
+    """
+    from alfred_coo.autonomous_build.orchestrator import (
+        WAVE_STALL_FORCE_PASS_SEC,
+    )
+    import time as _time
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    # Two stuck tickets in the wave: one in BLOCKED, one in DISPATCHED.
+    # Both must be escalated when the helper force-passes.
+    a = _t("u-stall-a", "SAL-3038", "OPS-14D", 3, "ops", size="M",
+           estimate=5)
+    a.status = TicketStatus.BLOCKED
+    a.linear_state = "In Progress"
+    b = _t("u-stall-b", "SAL-3070-b", "F19A", 3, "fleet", size="M",
+           estimate=5)
+    b.status = TicketStatus.DISPATCHED
+    b.child_task_id = "child-stall-b"
+    b.linear_state = "In Progress"
+    # One green ticket so the green_count baseline is non-zero (the live-
+    # incident shape: wave-3 has prior greens, the stalled tickets are
+    # the tail).
+    g = _t("u-stall-g", "SAL-GREEN", "OPS-99", 3, "ops", size="S",
+           estimate=1)
+    g.status = TicketStatus.MERGED_GREEN
+    _seed_graph(orch, [a, b, g])
+    wave_tickets = [a, b, g]
+
+    linear_calls: list[tuple[str, str]] = []
+
+    async def _fake_update(ticket, state_name):
+        linear_calls.append((ticket.identifier, state_name))
+
+    monkeypatch.setattr(orch, "_update_linear_state", _fake_update)
+
+    label_calls: list[tuple[str, str]] = []
+
+    async def _fake_label(ticket, label_name):
+        label_calls.append((ticket.identifier, label_name))
+
+    monkeypatch.setattr(orch, "_apply_linear_label", _fake_label)
+
+    comment_calls: list[tuple[str, str]] = []
+
+    async def _fake_comment(ticket, grounding_gap_ident=None):
+        comment_calls.append((ticket.identifier, grounding_gap_ident))
+
+    monkeypatch.setattr(
+        orch, "_post_escalated_linear_comment", _fake_comment
+    )
+
+    # Sub-case 1: green_count still rising — must NOT force-pass.
+    # Seed history so the earliest in-window sample is older than the
+    # 30-min cutoff but green_count has gone up since then (1 -> 1 -> 2).
+    now = _time.monotonic()
+    orch._wave_progress_history[3] = [
+        (now - WAVE_STALL_FORCE_PASS_SEC - 60, 0),
+        (now - (WAVE_STALL_FORCE_PASS_SEC // 2), 0),
+        (now - 60, 1),  # green_count rose mid-window
+    ]
+    rising = await orch._maybe_force_pass_stalled_wave(3, wave_tickets)
+    assert rising is False, (
+        "wave with rising green_count must NOT force-pass; helper "
+        "returned True"
+    )
+    assert a.status == TicketStatus.BLOCKED, (
+        f"non-terminal tickets must be untouched when wave is still "
+        f"making progress; got {a.status!r}"
+    )
+    assert b.status == TicketStatus.DISPATCHED, (
+        f"non-terminal tickets must be untouched when wave is still "
+        f"making progress; got {b.status!r}"
+    )
+    assert linear_calls == [], (
+        f"no Linear writes when wave still making progress; "
+        f"got {linear_calls}"
+    )
+
+    # Sub-case 2: green_count flat for >30min — MUST force-pass.
+    # Reseed with a flat window: every sample inside the 30-min window
+    # has green_count=1 (the one MERGED_GREEN ticket). The earliest
+    # sample is older than the 30-min cutoff so window_span ≥ threshold.
+    now = _time.monotonic()
+    orch._wave_progress_history[3] = [
+        (now - WAVE_STALL_FORCE_PASS_SEC - 120, 1),
+        (now - WAVE_STALL_FORCE_PASS_SEC - 60, 1),
+        (now - (WAVE_STALL_FORCE_PASS_SEC // 2), 1),
+        (now - 60, 1),
+    ]
+
+    forced = await orch._maybe_force_pass_stalled_wave(3, wave_tickets)
+    assert forced is True, (
+        "wave stalled for >30min must force-pass; helper returned False"
+    )
+
+    # Both non-terminal tickets escalated.
+    assert a.status == TicketStatus.ESCALATED, (
+        f"stalled non-terminal ticket must be escalated; got {a.status!r}"
+    )
+    assert b.status == TicketStatus.ESCALATED, (
+        f"stalled non-terminal ticket must be escalated; got {b.status!r}"
+    )
+    # The already-MERGED_GREEN ticket is left alone.
+    assert g.status == TicketStatus.MERGED_GREEN, (
+        f"green tickets must be untouched on force-pass; got {g.status!r}"
+    )
+    # Both stuck tickets transitioned to Linear Backlog with the human-
+    # assigned label and the wave-stall audit comment.
+    assert ("SAL-3038", "Backlog") in linear_calls, (
+        f"wave-stall force-pass must transition Linear to Backlog; "
+        f"got {linear_calls}"
+    )
+    assert ("SAL-3070-b", "Backlog") in linear_calls
+    assert ("SAL-3038", "human-assigned") in label_calls
+    assert ("SAL-3070-b", "human-assigned") in label_calls
+    assert ("SAL-3038", "wave-stall-force-pass") in comment_calls
+    assert ("SAL-3070-b", "wave-stall-force-pass") in comment_calls
+    # No Linear write on the already-merged green ticket — operator must
+    # not see a phantom Backlog flip on a real green.
+    assert ("SAL-GREEN", "Backlog") not in linear_calls
+    # Linear-state mirrored locally on the escalated tickets so a restore
+    # / next tick sees the new state without a Linear re-read.
+    assert a.linear_state == "Backlog"
+    assert b.linear_state == "Backlog"
+    # Audit: one wave_force_passed_stalled event with the escalated list.
+    force_pass_evts = [
+        e for e in orch.state.events
+        if e["kind"] == "wave_force_passed_stalled"
+    ]
+    assert len(force_pass_evts) == 1, (
+        f"expected exactly one wave_force_passed_stalled event; "
+        f"got {force_pass_evts}"
+    )
+    assert force_pass_evts[0]["wave"] == 3
+    escalated = force_pass_evts[0]["escalated"]
+    assert "SAL-3038" in escalated and "SAL-3070-b" in escalated, (
+        f"force-pass event must list both stuck tickets as escalated; "
+        f"got {escalated}"
+    )
+    # History reset post-force-pass so a re-entry on the next kickoff
+    # doesn't immediately re-trip on stale entries.
+    assert orch._wave_progress_history.get(3) == []
