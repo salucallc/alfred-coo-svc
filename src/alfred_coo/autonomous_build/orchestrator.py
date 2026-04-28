@@ -6411,6 +6411,16 @@ class AutonomousBuildOrchestrator:
         # threshold). The wave-skip cache key is the (project, wave_n)
         # pair, so a soft-green pass should NOT poison the cache for a
         # later run.
+        #
+        # 2026-04-28: writer must persist the FULL wave membership
+        # (`wave_tickets`), not the post-excusal `scored` set. The
+        # reader (`_should_skip_wave`) compares against
+        # `self.graph.tickets_in_wave(wave_n)` and treats any cached/live
+        # diff as "new tickets added → invalidate". If the writer omits
+        # excused tickets (human-assigned, PATH_CONFLICT, NO_HINT), the
+        # reader sees them as "new" on every subsequent kickoff and the
+        # cache structurally never fires for any wave that contains an
+        # excused ticket. See RCA: wave-skip-cache-rca-2026-04-28.md.
         try:
             await record_wave_pass(
                 self.soul,
@@ -6419,7 +6429,7 @@ class AutonomousBuildOrchestrator:
                 ratio=green_ratio,
                 denominator=denominator,
                 green_count=len(green),
-                ticket_codes_seen=[t.identifier for t in scored],
+                ticket_codes_seen=[t.identifier for t in wave_tickets],
             )
         except Exception:
             logger.exception(

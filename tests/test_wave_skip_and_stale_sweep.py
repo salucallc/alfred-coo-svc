@@ -879,3 +879,87 @@ async def test_wave_pass_record_written_after_all_green_gate(monkeypatch):
 
     # And the consumer side returns True on a freshly-written cache.
     assert await orch._should_skip_wave(0) is True
+
+
+async def test_wave_pass_writer_persists_excused_tickets_so_reader_can_skip(monkeypatch):
+    """Regression for the v7ap kickoff incident (2026-04-28).
+
+    The writer used to persist `scored` (post-excusal), but the reader
+    (`_should_skip_wave`) compares against the FULL wave membership
+    (`self.graph.tickets_in_wave(wave_n)`) and treats any cached/live
+    diff as "new tickets added → invalidate". With the asymmetric sets,
+    every wave that carried an excused ticket structurally invalidated
+    its own cache on every subsequent kickoff — the diff between the
+    reader's live set and the writer's persisted set was exactly the
+    excused subset.
+
+    Setup: 9 scored greens + 1 human-assigned excused ticket. With the
+    SAL-3072 denominator (excused-in-denom), green_ratio = 9/10 = 0.9,
+    which clears the default SOFT_GREEN_THRESHOLD and reaches the
+    all-green writer branch (failed=[] → not soft-green). The test
+    then asserts writer-reader set symmetry: persisted
+    `ticket_codes_seen` MUST cover the full wave (excused + scored)
+    so the next `_should_skip_wave` returns True instead of seeing the
+    excused ticket as "newly added".
+    """
+    proj = "PROJ-AAAA"
+    soul = _FakeSoul()
+    orch = _mk_orch(kickoff={"linear_project_id": proj}, soul=soul)
+    orch.poll_sleep_sec = 0
+
+    # 9 scored greens + 1 human-assigned excused. ratio = 9/10 = 0.9
+    # → meets the 0.9 default threshold → all-green branch (failed=[]).
+    scored_tickets = [
+        _t(f"u{i}", f"SAL-{i}", f"TIR-{i:02d}", 0, status=TicketStatus.MERGED_GREEN)
+        for i in range(9)
+    ]
+    excused_ticket = _t("u-excused", "SAL-99", "TIR-99", 0,
+                       status=TicketStatus.MERGED_GREEN)
+    excused_ticket.labels = ["human-assigned"]
+    _seed(orch, scored_tickets + [excused_ticket])
+
+    async def _nosleep(delay):
+        return None
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.asyncio.sleep", _nosleep
+    )
+
+    await orch._wait_for_wave_gate(0)
+
+    # Writer reached the all-green branch and persisted a record.
+    pass_writes = [
+        w for w in soul.writes
+        if wave_pass_topic_for(proj, 0) in (w["topics"] or [])
+    ]
+    assert len(pass_writes) == 1, (
+        "writer should have reached the all-green branch with green_ratio=0.9"
+    )
+    record = WavePassRecord.from_json(pass_writes[0]["content"])
+
+    # CORE INVARIANT: the persisted set must match what the reader
+    # looks up. The reader does:
+    #   wave_tickets = self.graph.tickets_in_wave(wave_n)
+    #   live_idents = {t.identifier for t in wave_tickets}
+    #   added = live_idents - cached_idents  -> must be empty
+    live_idents = {
+        t.identifier for t in orch.graph.tickets_in_wave(0)
+    }
+    cached_idents = set(record.ticket_codes_seen)
+    assert cached_idents == live_idents, (
+        "writer must persist the full wave membership the reader looks "
+        "up; otherwise excused tickets leak into the reader's `added` "
+        "set on every kickoff and the cache never fires. "
+        f"diff (live - cached) = {live_idents - cached_idents}"
+    )
+    # Specifically: the excused ticket MUST be in the persisted set.
+    assert "SAL-99" in cached_idents
+
+    # End-to-end: cache fires on the next kickoff even with excused
+    # tickets present. Pre-fix this returned False because SAL-99 was
+    # in live_idents but not cached_idents (the v7ap incident).
+    # NOTE: _should_skip_wave additionally requires record.ratio == 1.0;
+    # this wave persisted at ratio=0.9 so it won't actually skip via
+    # the cache. The set-symmetry assertion above is the real
+    # regression coverage; we leave the ratio==1.0 cache-fires path
+    # covered by `test_wave_pass_record_written_after_all_green_gate`
+    # (3 greens, 0 excused → ratio=1.0).
