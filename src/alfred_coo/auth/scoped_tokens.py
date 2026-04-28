@@ -2,6 +2,8 @@ import os  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 import base64  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 from typing import List
 import httpx  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
+import time
+from .ttl_validator import validate_iat
 
 AUTHELIA_TOKEN_URL = os.getenv("AUTHELIA_TOKEN_URL", "http://localhost:9091/api/oauth2/token")
 
@@ -22,3 +24,11 @@ def get_token(scopes: List[str]) -> str:
     # resp = httpx.post(AUTHELIA_TOKEN_URL, data=data, headers=headers, timeout=10.0)
     # resp.raise_for_status()
     # return resp.json()["access_token"]
+
+def validate_token_iat(payload: dict):
+    """Validate the `iat` claim in a token payload.
+
+    Returns a tuple (status_code, body) where body is a dict for error responses.
+    """
+    iat = payload.get("iat")
+    return validate_iat(iat)
