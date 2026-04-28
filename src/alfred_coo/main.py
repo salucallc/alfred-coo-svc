@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 # id out of the mesh task title for the observability header contract.
 _LINEAR_TICKET_RE = re.compile(r"\b([A-Z]{2,5}-\d{1,6})\b")
 
+# SAL-3038 / SAL-3070 (2026-04-28): Linear label name and terminal-state
+# names that disqualify a freshly-claimed mesh task from dispatch.
+# Mirrors `HUMAN_ASSIGNED_LABEL` in autonomous_build/orchestrator.py — the
+# orchestrator path already enforces this gate on hydrated `Ticket`
+# objects (orchestrator.py:3076-3084, PR #171). The bare poll loop here
+# never goes through hydration, so the label was being silently
+# bypassed. Keep this constant in sync if the orchestrator one moves.
+HUMAN_ASSIGNED_LABEL = "human-assigned"
+LINEAR_TERMINAL_STATES = frozenset({"done", "cancelled", "canceled", "duplicate"})
+
 # AB-17-m: regex for the `Size: X` line the autonomous-build orchestrator
 # writes into the child task body via `_child_task_body` (see
 # `autonomous_build/orchestrator.py`). Matches `Size: S`, `Size: M`, `Size: L`
@@ -328,6 +338,47 @@ def _peek_linear_ticket(task: dict) -> Optional[str]:
     if m:
         return m.group(1)
     return None
+
+
+def _should_skip_for_human_or_terminal(
+    status: Optional[dict],
+) -> tuple[bool, Optional[str]]:
+    """SAL-3038 / SAL-3070 predicate: should a freshly-claimed mesh task
+    be skipped because its Linear ticket is human-owned or already
+    terminal?
+
+    Args:
+        status: Output of ``tools.linear_get_issue_status`` —
+            ``{"identifier": str, "labels": list[str], "state": str}`` —
+            or ``None`` when the lookup couldn't run (no API key,
+            transport error, ticket not found).
+
+    Returns:
+        ``(should_skip, reason)``. ``should_skip`` is True iff the
+        ticket carries the ``human-assigned`` label OR its workflow
+        state is one of ``Done`` / ``Cancelled`` / ``Duplicate``.
+        ``reason`` is a short tag for the mesh-complete result body
+        (``"human_assigned"`` or ``"terminal_state:<state>"``). When
+        ``status`` is ``None`` we fail-open: ``(False, None)``. The
+        caller is responsible for proceeding to dispatch in that case.
+
+    Pure function — no I/O, no logging — so the orchestrator's hydrated
+    ``Ticket`` path can call it too with a cheap dict adapter and the
+    same predicate is the single source of truth across both dispatch
+    paths. Tests in ``tests/test_main_human_assigned_gate.py``.
+    """
+    if not isinstance(status, dict):
+        return False, None
+    labels = status.get("labels") or []
+    if any(
+        isinstance(lbl, str) and lbl.lower() == HUMAN_ASSIGNED_LABEL
+        for lbl in labels
+    ):
+        return True, "human_assigned"
+    state = status.get("state")
+    if isinstance(state, str) and state.lower() in LINEAR_TERMINAL_STATES:
+        return True, f"terminal_state:{state}"
+    return False, None
 
 
 def _resolve_handler(handler_name: str):
@@ -673,6 +724,68 @@ async def main() -> None:
                         settings=settings,
                     )
                     continue
+
+                # SAL-3038 / SAL-3070 (2026-04-28): human-assigned + terminal-state
+                # gate on the bare claim path. PR #171 closed this gap inside the
+                # orchestrator's wave-dispatch loop (orchestrator.py:3076-3084),
+                # but tasks claimed *directly* from the mesh poll here never went
+                # through hydration so the label was silently ignored. Result: 47
+                # mesh tasks queued for SAL-3038 at 00:40-00:54 UTC kept being
+                # consumed after the label was applied later, producing 22 zombie
+                # PRs at ~6 min/PR. Same pattern was brewing on SAL-3070. We do
+                # one Linear GET per claim (50s tick interval keeps cost trivial)
+                # and fail-open on any lookup failure — better to dispatch one
+                # extra builder than stall the loop on Linear flakiness.
+                ticket_code = _peek_linear_ticket(task)
+                if ticket_code is None:
+                    logger.debug(
+                        "[gate] no linear ticket id in task %s title; gate not applicable",
+                        task.get("id"),
+                    )
+                else:
+                    try:
+                        from .tools import linear_get_issue_status
+                        ticket_status = await linear_get_issue_status(ticket_code)
+                    except Exception as e:
+                        logger.warning(
+                            "[gate] linear_get_issue_status raised for %s; "
+                            "fail-open and proceeding to dispatch: %s",
+                            ticket_code, e,
+                        )
+                        ticket_status = None
+                    should_skip, skip_reason = _should_skip_for_human_or_terminal(
+                        ticket_status
+                    )
+                    if should_skip:
+                        logger.info(
+                            "[gate] skipping dispatch of %s (mesh task %s): %s "
+                            "labels=%s state=%s",
+                            ticket_code,
+                            task.get("id"),
+                            skip_reason,
+                            (ticket_status or {}).get("labels"),
+                            (ticket_status or {}).get("state"),
+                        )
+                        try:
+                            await mesh.complete(
+                                task["id"],
+                                session_id=settings.soul_session_id,
+                                status="failed",
+                                result={
+                                    "error": "human_assigned_or_terminal",
+                                    "reason": skip_reason,
+                                    "linear_ticket": ticket_code,
+                                    "linear_state": (ticket_status or {}).get("state"),
+                                    "linear_labels": (ticket_status or {}).get("labels"),
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[gate] failed to mark mesh task %s failed after gate hit; "
+                                "task will likely re-surface and re-trigger the gate",
+                                task.get("id"),
+                            )
+                        continue
 
                 # Context load (non-fatal on error). Scoped by persona topics.
                 try:

@@ -2085,6 +2085,91 @@ async def _linear_graphql(
         return None, f"linear transport: {type(e).__name__}: {e}"
 
 
+# SAL-3038 / SAL-3070 (2026-04-28): the bare mesh-claim path in `main.py`
+# was bypassing the human-assigned + terminal-state gate that PR #171
+# added to the orchestrator path. When a Linear ticket gets the
+# `human-assigned` label *after* mesh tasks for it have been queued
+# (47 tasks queued for SAL-3038 at 00:40-00:54 UTC, label applied
+# later), the bare-claim loop kept consuming them and dispatching
+# builders, producing 22 zombie PRs. The orchestrator's existing check
+# (orchestrator.py:3076-3084) only fires on hydrated `Ticket` objects
+# inside the wave-dispatch loop — it never sees the bare mesh poll.
+#
+# This helper is the canonical "fetch labels + state for an identifier"
+# entry point. Both paths call it. Returns `None` when the lookup is
+# impossible (no key, transport error, ticket not found) so callers can
+# fail-open (gate doesn't apply, dispatch proceeds — the orchestrator
+# path will catch it on the next hydrate if Linear comes back).
+async def linear_get_issue_status(
+    ticket_code: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Fetch a Linear ticket's labels + workflow state by identifier.
+
+    Args:
+        ticket_code: Human Linear identifier (e.g. ``"SAL-3038"``). The
+            GraphQL ``issue(id: $id)`` field accepts either UUID or the
+            human identifier — see the note in
+            ``_fetch_linear_acceptance_criteria``.
+
+    Returns:
+        ``{"identifier": str, "labels": list[str], "state": str}`` on
+        success. ``None`` when:
+
+          * ``ticket_code`` is empty / falsy,
+          * neither ``LINEAR_API_KEY`` nor ``ALFRED_OPS_LINEAR_API_KEY``
+            is set in the environment,
+          * the Linear GraphQL request fails (transport / non-200),
+          * the issue is not found.
+
+        Callers MUST treat ``None`` as fail-open (proceed with
+        dispatch). The cost of an extra builder run is bounded
+        (~6 min), but blocking dispatch on Linear flakiness would stall
+        the entire mesh poll loop.
+
+    Cost: one Linear GraphQL round-trip per call. The bare claim path
+    polls every ~50s with at most ``limit=10`` tasks per tick, so even
+    the worst case is ~12 calls/min — well under Linear's 1500/hour
+    quota. No caching here; the whole point of this gate is to catch
+    label changes that landed *after* mesh tasks were queued.
+    """
+    if not ticket_code:
+        return None
+    key = os.environ.get("LINEAR_API_KEY") or os.environ.get(
+        "ALFRED_OPS_LINEAR_API_KEY"
+    )
+    if not key:
+        return None
+
+    query = (
+        "query IssueStatus($id: String!) { "
+        "issue(id: $id) { "
+        "identifier "
+        "labels { nodes { name } } "
+        "state { name } "
+        "} }"
+    )
+    body, err = await _linear_graphql(query, {"id": ticket_code}, key)
+    if err is not None or body is None:
+        return None
+    issue = (body.get("data") or {}).get("issue") or None
+    if not isinstance(issue, dict) or not issue:
+        return None
+    labels_block = issue.get("labels") or {}
+    label_nodes = labels_block.get("nodes") if isinstance(labels_block, dict) else None
+    labels = [
+        n.get("name")
+        for n in (label_nodes or [])
+        if isinstance(n, dict) and isinstance(n.get("name"), str)
+    ]
+    state_block = issue.get("state") or {}
+    state_name = state_block.get("name") if isinstance(state_block, dict) else None
+    return {
+        "identifier": issue.get("identifier") or ticket_code,
+        "labels": labels,
+        "state": state_name or "",
+    }
+
+
 async def _linear_load_team_states(team_id: str, key: str) -> tuple[Dict[str, str], Optional[str]]:
     """Fetch + cache all workflow states for a Linear team. Returns (map, err)."""
     cached = _LINEAR_TEAM_STATES_CACHE.get(team_id)

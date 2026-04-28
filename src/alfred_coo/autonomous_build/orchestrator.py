@@ -3072,14 +3072,30 @@ class AutonomousBuildOrchestrator:
                 # dispatch path historically still ran builders against them,
                 # producing stub PRs that flipped tickets Done in error
                 # (2026-04-27 incident — SAL-2641, SAL-2647, +4 phantom flips).
-                labels = getattr(ticket, "labels", None) or []
-                if any(
-                    isinstance(lbl, str) and lbl.lower() == HUMAN_ASSIGNED_LABEL
-                    for lbl in labels
-                ):
+                #
+                # SAL-3038 / SAL-3070 (2026-04-28): the predicate now lives
+                # in `alfred_coo.main._should_skip_for_human_or_terminal` so
+                # the bare-claim path in `main.py` (which never hydrates a
+                # `Ticket`) can apply the same gate. We adapt the hydrated
+                # `Ticket` to the predicate's dict shape; we deliberately
+                # do NOT pass a state — terminal-state tickets are already
+                # filtered out earlier in hydration, and mapping
+                # `TicketStatus` → Linear state names here would couple
+                # the orchestrator to Linear's vocabulary.
+                #
+                # Lazy import: `alfred_coo.main` transitively imports the
+                # orchestrator module via `_resolve_handler`, so a
+                # top-level import here would create a cycle.
+                from ..main import _should_skip_for_human_or_terminal
+                _gate_skip, _gate_reason = _should_skip_for_human_or_terminal({
+                    "labels": getattr(ticket, "labels", None) or [],
+                    "state": "",
+                })
+                if _gate_skip:
                     logger.info(
-                        "%s has human-assigned label; skipping dispatch (treated as terminal-success)",
-                        ticket.identifier,
+                        "%s has human-assigned label; skipping dispatch "
+                        "(treated as terminal-success; reason=%s)",
+                        ticket.identifier, _gate_reason,
                     )
                     ticket.status = TicketStatus.ESCALATED
                     continue
