@@ -5458,6 +5458,41 @@ class AutonomousBuildOrchestrator:
                 updated.append(ticket)
                 return
             # Under cap — spawn a fresh child with the review feedback.
+            #
+            # SAL-3038 / SAL-3070 follow-up (2026-04-28): apply the same
+            # human-assigned + terminal-state gate that PRs #259 (wave-loop
+            # dispatch) and #265 (bare-claim path) installed at the two
+            # primary dispatch points. The respawn path was flagged as
+            # secondary risk by the post-incident audit: if a Linear ticket
+            # acquires the ``human-assigned`` label or transitions to a
+            # terminal state (``Done`` / ``Cancelled`` / ``Duplicate``)
+            # AFTER the build PR was opened but BEFORE Hawkman files
+            # REQUEST_CHANGES, the original dispatch gate has already
+            # passed and only this site can stop a builder from being
+            # respawned against a ticket the orchestrator should no longer
+            # touch. Same shared predicate, same skip semantics: mark
+            # ESCALATED, record the skip, do NOT increment review_cycles
+            # or clear the review task id (we treat it as out-of-band
+            # closure, not a forward step in the review loop).
+            from ..main import _should_skip_for_human_or_terminal
+            _gate_skip, _gate_reason = _should_skip_for_human_or_terminal({
+                "labels": getattr(ticket, "labels", None) or [],
+                "state": "",
+            })
+            if _gate_skip:
+                logger.info(
+                    "%s respawn-path gate fired; skipping fix-round "
+                    "respawn (treated as terminal-success; reason=%s)",
+                    ticket.identifier, _gate_reason,
+                )
+                ticket.status = TicketStatus.ESCALATED
+                self.state.record_event(
+                    "respawn_skipped_human_or_terminal",
+                    identifier=ticket.identifier,
+                    reason=_gate_reason,
+                )
+                updated.append(ticket)
+                return
             review_body = self._extract_review_body(result)
             ticket.review_cycles += 1
             # Clear the stale review task pointer so the next PR_OPEN can
