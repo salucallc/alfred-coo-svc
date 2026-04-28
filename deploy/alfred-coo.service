@@ -10,6 +10,12 @@ User=alfredcoo
 Group=alfredcoo
 WorkingDirectory=/opt/alfred-coo
 EnvironmentFile=/etc/alfred-coo/.env
+# Sub #62 (2026-04-27): point the daemon at the canonical model registry
+# location on Oracle. Falls through to /opt/alfred-coo/model_registry/
+# registry.yaml then to the minipc planning path if MODEL_REGISTRY_PATH
+# is unset or points at a missing file. Edits to the YAML take effect on
+# the NEXT dispatch — no daemon restart required.
+Environment=MODEL_REGISTRY_PATH=/etc/alfred-coo/model_registry.yaml
 ExecStart=/opt/alfred-coo/venv/bin/python -m alfred_coo
 Restart=on-failure
 RestartSec=15
