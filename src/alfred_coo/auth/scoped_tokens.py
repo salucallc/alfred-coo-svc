@@ -3,6 +3,8 @@ import base64  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 from typing import List
 import httpx  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 
+from .ttl_validator import validate_iat  # TTL validation added for OPS-14D
+
 AUTHELIA_TOKEN_URL = os.getenv("AUTHELIA_TOKEN_URL", "http://localhost:9091/api/oauth2/token")
 
 def get_token(scopes: List[str]) -> str:
