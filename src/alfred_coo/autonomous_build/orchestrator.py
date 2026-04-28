@@ -419,8 +419,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "OPS-02": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yml",),
-        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+        paths=(
+            "deploy/appliance/docker-compose.yml",
+            "deploy/appliance/IMAGE_PINS.md",
+        ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-02-pin-images",
         notes="pin all image versions; grep ':latest' must return 0 matches; IMAGE_PINS.md is new per plan D §5 W1 #2",
@@ -446,8 +449,8 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F01": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(),
-        new_paths=("migrations/020_fleet_endpoints.sql",),  # soul-svc is FLAT; next number is 020
+        paths=("migrations/020_fleet_endpoints.sql",),
+        new_paths=(),  # soul-svc is FLAT; next number is 020
         base_branch="main",
         branch_hint="feature/f01-fleet-migration",
         notes="soul-svc migration 020 for fleet tables (4 tables); soul-svc has flat migrations/ dir; existing 005..019",
@@ -456,11 +459,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F02": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "routers/fleet.py",
             "tests/test_fleet_register.py",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/f02-fleet-register",
         notes="/v1/fleet/register endpoint; valid token -> 201; both new files; register new router in serve.py (modify path added at implementation time)",
@@ -469,14 +472,14 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F03": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "src/mcctl/__init__.py",
             "src/mcctl/__main__.py",
             "src/mcctl/commands/__init__.py",
             "src/mcctl/commands/token.py",
             "tests/test_mcctl_token.py",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/f03-mcctl-token-create",
         notes="first mcctl ticket; whole subtree is new; pyproject.toml entry-point update likely required (flag to child)",
@@ -485,8 +488,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F07": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("src/alfred_coo/main.py",),
-        new_paths=("src/alfred_coo/persona_loader.py",),
+        paths=(
+            "src/alfred_coo/main.py",
+            "src/alfred_coo/persona_loader.py",
+        ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/f07-coo-mode",
         notes="COO_MODE env var (hub|endpoint); persona_loader.py is new per F-plan §1 Arch; main.py gains branch on COO_MODE",
@@ -495,13 +501,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F08": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "soul_lite/__init__.py",
             "soul_lite/service.py",
             "soul_lite/Dockerfile",
             "tests/test_soul_lite.py",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/f08-soul-lite",
         notes="new soul-lite subpackage at repo root (soul-svc is flat, no src/); sqlite + /v1/memory/* API for endpoints",
@@ -570,8 +576,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "SS-01": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=("routers/memory.py",),
-        new_paths=("tests/test_bulk_import_topics_queryable.py",),
+        paths=(
+            "routers/memory.py",
+            "tests/test_bulk_import_topics_queryable.py",
+        ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ss01-index-topics-on-import",
         notes="fix: /v1/memory/import must index TKHR topics; plan E §5.1 S-01; keyed as SS-01 because title 'SAL-SS-01' parses to SS-01 (graph.py:67)",
@@ -590,11 +599,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "SS-06": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "scripts/apply_migrations.py",
             "tests/test_apply_migrations_idempotent.py",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ss06-apply-migrations",
         notes="new scripts/ dir + migration runner with _soul_migration_log table; --dry-run default; idempotent re-runs; plan E §5.1 S-06 (note: S-11 later supersedes with asyncpg variant but SS-06 ships the initial script)",
@@ -630,14 +639,15 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "ALT-01": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yml",),
-        new_paths=(
+        paths=(
+            "deploy/appliance/docker-compose.yml",
             "aletheia/Dockerfile",
             "aletheia/app/__init__.py",
             "aletheia/app/main.py",
             "aletheia/pyproject.toml",
             "aletheia/tests/test_healthz.py",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/alt-01-scaffold",
         notes="scaffold standalone aletheia-svc; new aletheia/ package at repo root (no separate repo exists; plan B §2 locks standalone-in-compose decision); append aletheia-svc service block to deploy/appliance/docker-compose.yml; healthz must return {status:'ok'}",
@@ -654,12 +664,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "TIR-01": TargetHint(
         owner="salucallc",
         repo="tiresias-sovereign",
-        paths=(),
-        new_paths=(
+        paths=(
             "pyproject.toml",
             "src/tiresias_sovereign/__init__.py",
             ".github/workflows/ci.yml",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/tir-01-scaffold",
         notes="Scaffold the sovereign Tiresias proxy package. Repo pre-created by AB-20 with README. Your PR adds pyproject.toml + package skeleton + CI workflow; run Plan A §4 Wave 1 scaffold checklist.",
@@ -668,12 +678,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "TIR-02": TargetHint(
         owner="salucallc",
         repo="tiresias-sovereign",
-        paths=(),
-        new_paths=(
+        paths=(
             "src/tiresias_sovereign/principles/registry.json",
             "src/tiresias_sovereign/principles/loader.py",
             "tests/test_principle_registry.py",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/tir-02-principle-registry",
         notes="BLOCKED on TIR-01 (repo must exist); then 12 principles + hash-chain loader",
@@ -695,11 +705,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "TIR-08": TargetHint(
         owner="salucallc",
         repo="tiresias-sovereign",
-        paths=(),
-        new_paths=(
+        paths=(
             "src/tiresias_sovereign/mcp_llm/router.py",
             "tests/test_mcp_llm_cascade.py",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/tir-08-mcp-llm-cascade",
         notes="BLOCKED on TIR-01; mcp-llm cascade router (principle-aware routing)",
@@ -776,13 +786,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "ALT-02": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("aletheia/app/main.py",),
-        new_paths=(
+        paths=(
+            "aletheia/app/main.py",
             "aletheia/app/verdict.py",
             "aletheia/app/soul_writer.py",
             "aletheia/tests/test_verdict_writer.py",
-            "plans/v1-ga/ALT-02.md",
         ),
+        new_paths=("plans/v1-ga/ALT-02.md",),
         base_branch="main",
         branch_hint="feature/alt-02-verdict-model",
         notes="plan B §2 audit/ + SAL-2599; verdict data model + soul-svc writer for topic=aletheia.verdict; main.py wires POST /v1/_debug/verdict + soul_writer; JSON-schema validated in CI",
@@ -791,14 +801,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "ALT-03": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "aletheia/app/prompt/__init__.py",
             "aletheia/app/prompt/parser.py",
             "aletheia/prompts/verify_v1.md",
             "aletheia/tests/test_parser.py",
-            "plans/v1-ga/ALT-03.md",
         ),
+        new_paths=("plans/v1-ga/ALT-03.md",),
         base_branch="main",
         branch_hint="feature/alt-03-verify-prompt-parser",
         notes="plan B §5 ALT-03 + SAL-2600; verify_v1.md prompt template (§5 verbatim) + sentinel parser for `DONE verify={PASS|FAIL|UNCERTAIN}`; 20 canned outputs; prompt sha256 pinned in env",
@@ -807,13 +816,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "ALT-04": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "aletheia/app/router/__init__.py",
             "aletheia/app/router/policy.py",
             "aletheia/tests/test_router.py",
             "plans/v1-ga/ALT-04.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/alt-04-model-router",
         notes="plan B §5 ALT-04 + SAL-2601; two-tier routing (qwen3-coder:480b high/med-stakes, hf:openai/gpt-oss-120b low); refuses when generator_model == candidate_verifier_model; 12 (action_class, risk_tier) test cases",
@@ -822,13 +831,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "ALT-06": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "aletheia/app/watchers/__init__.py",
             "aletheia/app/watchers/github_poller.py",
             "aletheia/tests/test_github_poller.py",
             "plans/v1-ga/ALT-06.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/alt-06-github-poller",
         notes="plan B §5 ALT-06 (Track B) + SAL-2603; polls list_pull_requests every 30s on watched repos (default saluca-llc/* per plan B §4 O4); enqueues pr_review job within 45s; consumes GITHUB_PAT_POLLER env var",
@@ -838,14 +847,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F04": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "src/alfred_coo/fleet_gateway/__init__.py",
             "src/alfred_coo/fleet_gateway/server.py",
             "src/alfred_coo/fleet_gateway/Dockerfile",
             "tests/test_fleet_gateway_ws.py",
-            "plans/v1-ga/F04.md",
         ),
+        new_paths=("plans/v1-ga/F04.md",),
         base_branch="main",
         branch_hint="feature/f04-fleet-gateway-ws",
         notes="plan C §2.3 + SAL-2612; new fleet-gateway sidecar (port 8090) owns WS fan-out; wscat establishes; invalid key→401 close; 100 concurrent clients sustained 5min; compose wire-in defers to F20. Host repo: alfred-coo-svc (sibling to src/alfred_coo) — flag for review",
@@ -854,11 +862,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F05": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=("routers/fleet.py",),
-        new_paths=(
+        paths=(
+            "routers/fleet.py",
             "tests/test_fleet_heartbeat.py",
-            "plans/v1-ga/F05.md",
         ),
+        new_paths=("plans/v1-ga/F05.md",),
         base_branch="main",
         branch_hint="feature/f05-heartbeat-hub",
         notes="plan C §3.2 + SAL-2613; modifies routers/fleet.py (created by F02) adding heartbeat handler; ack p95<500ms localhost; 3 missed → mode_state=degraded; depends on F04 WS upgrade and F02 router",
@@ -886,12 +894,10 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         paths=(
             "deploy/appliance/docker-compose.yml",
             "deploy/appliance/.env.template",
-        ),
-        new_paths=(
             "deploy/appliance/infisical/init.sql",
             "deploy/appliance/infisical/README.md",
-            "plans/v1-ga/OPS-04.md",
         ),
+        new_paths=("plans/v1-ga/OPS-04.md",),
         base_branch="main",
         branch_hint="feature/ops-04-infisical-service",
         notes="plan D §3.5 + SAL-2637; infisical/infisical:v0.124.0-postgres on mc-ops + INFISICAL_* env defaults; init.sql provisions infisical schema in mc-postgres; APE/V: curl infisical:8080/api/status returns ok",
@@ -903,10 +909,10 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         paths=(
             "deploy/appliance/docker-compose.yml",
             "deploy/appliance/.env.template",
+            "deploy/appliance/infisical/README.md",
         ),
         new_paths=(
             "deploy/appliance/infisical/derive_root_key.sh",
-            "deploy/appliance/infisical/README.md",
             "plans/v1-ga/OPS-05.md",
         ),
         base_branch="main",
@@ -931,12 +937,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "OPS-17": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yml",),
-        new_paths=(
+        paths=(
+            "deploy/appliance/docker-compose.yml",
             "deploy/appliance/prometheus/prometheus.yml",
             "deploy/appliance/prometheus/scrape_configs.yml",
             "plans/v1-ga/OPS-17.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-17-prometheus",
         notes="plan D §3.2 + SAL-2650; prom/prometheus:v2.55.1 on mc-ops; 30d retention; scrape_configs targets soul-svc/tiresias/coo/portal /metrics; APE/V: /api/v1/targets shows ≥5 up=1",
@@ -945,13 +952,14 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "OPS-23": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("src/alfred_coo/__init__.py",),
-        new_paths=(
+        paths=(
+            "src/alfred_coo/__init__.py",
             "configs/model_pricing.yaml",
             "src/alfred_coo/pricing.py",
             "tests/test_pricing_loader.py",
             "plans/v1-ga/OPS-23.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-23-model-pricing",
         notes="plan D §3.1 + SAL-2656; YAML pricing table (Ollama Max=flat $100/mo amortized, free=$0, paid per-token); pricing.load() returns dict; configs/ dir does not exist on main — first ticket to create it",
@@ -961,11 +969,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "SS-03": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=("routers/cot_capture.py",),
-        new_paths=(
+        paths=(
+            "routers/cot_capture.py",
             "tests/test_cot_unified.py",
-            "plans/v1-ga/SS-03.md",
         ),
+        new_paths=("plans/v1-ga/SS-03.md",),
         base_branch="main",
         branch_hint="feature/ss03-cot-unify",
         notes="plan E §5.1 S-03 + SAL-2664; rewrite cot_capture.py so /v1/cot/capture writes to _memories with modality=cot, removes file-shim; row in _memories queryable + /var/lib/soul-svc/cot/ never created; D1 decision = merge",
@@ -974,12 +982,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "SS-04": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=("serve.py",),
-        new_paths=(
+        paths=(
+            "serve.py",
             "routers/metrics.py",
             "tests/test_metrics_endpoint.py",
-            "plans/v1-ga/SS-04.md",
         ),
+        new_paths=("plans/v1-ga/SS-04.md",),
         base_branch="main",
         branch_hint="feature/ss04-metrics",
         notes="plan E §5.1 S-04 + SAL-2665; /metrics endpoint with soul_http_requests_total + soul_http_request_duration_seconds histogram + soul_db_query_duration_seconds{table} + soul_memory_writes_total{knowledge_tier}; register router in serve.py; NO tenant_id label (R3 risk register); mirrors existing S-04 hint because parser emits SS-04 from SAL-SS-04",
@@ -1009,12 +1017,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "SS-11": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "scripts/apply_migrations.py",
             "tests/test_apply_migrations_idempotent.py",
-            "plans/v1-ga/SS-11.md",
         ),
+        new_paths=("plans/v1-ga/SS-11.md",),
         base_branch="main",
         branch_hint="feature/ss11-apply-migrations-asyncpg",
         notes="plan E §5.2 S-11 + SAL-2672; supersedes SS-06 implementation; reads DATABASE_URL only (NO SUPABASE_SERVICE_KEY); asyncpg.connect (single conn, serial); _soul_migration_log idempotency + SHA-drift refusal; --dry-run default; bootstrap log table on fresh DB; depends on SS-09",
@@ -1023,13 +1030,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "SS-12": TargetHint(
         owner="salucallc",
         repo="soul-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "tests/e2e/__init__.py",
             "tests/e2e/smoke_backends.sh",
             ".github/workflows/soul-svc-backend-portability.yml",
-            "plans/v1-ga/SS-12.md",
         ),
+        new_paths=("plans/v1-ga/SS-12.md",),
         base_branch="main",
         branch_hint="feature/ss12-multi-backend-smoke",
         notes="plan E §5.2 S-12 + SAL-2673; CI matrix smoke against local Postgres + Supabase (direct PG conn, NOT rpc) + Neon (ephemeral branch); 5 assertions per backend; secrets from GCP Secret Manager (supabase-direct-postgres-url, neon-api-key); depends on SS-09 + SS-10 + SS-11",
@@ -1063,11 +1069,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "C-27": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("src/mcctl/commands/token.py",),
+        paths=(
+            "src/mcctl/commands/token.py",
+            "tests/fleet/__init__.py",
+        ),
         new_paths=(
             "src/alfred_coo/fleet_auth/__init__.py",
             "src/alfred_coo/fleet_auth/tenant_binding.py",
-            "tests/fleet/__init__.py",
             "tests/fleet/test_tenant_auth.py",
             "plans/v1-ga/C-27.md",
         ),
@@ -1118,11 +1126,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "TIR-10": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yml",),
-        new_paths=(
+        paths=(
+            "deploy/appliance/docker-compose.yml",
             "deploy/appliance/tiresias/network_split.md",
             "plans/v1-ga/TIR-10.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/tir-10-network-split",
         notes="plan A §4 Wave 3 + SAL-2592; split docker networks — mc-internal (no internet route) for coo/portal/open-webui/soul; mc-egress for caddy/mcp-*/tiresias only. APE/V: docker exec alfred-coo curl --max-time 5 https://api.github.com fails; docker exec mcp-github curl same URL succeeds. Risk R1 (plan A §6): if internal:true breaks DNS, fallback to iptables OUTPUT REJECT in init container; depends on TIR-09",
@@ -1149,13 +1158,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "TIR-12": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yml",),
-        new_paths=(
+        paths=(
+            "deploy/appliance/docker-compose.yml",
             "deploy/appliance/mc-init/mint_soulkeys.sh",
             "deploy/appliance/mc-init/register_allowlist.sh",
             "deploy/appliance/mc-init/README.md",
-            "plans/v1-ga/TIR-12.md",
         ),
+        new_paths=("plans/v1-ga/TIR-12.md",),
         base_branch="main",
         branch_hint="feature/tir-12-mint-soulkeys",
         notes="plan A §4 Wave 3 + SAL-2594; mc-init mints 6 soulkeys (sk_agent_appliance_<service>_<sha256_tail64>) idempotently on first boot, writes to state/secrets/, SHA-512 hash in tiresias _soulkeys table; registers allowlist rows in _soulkey_allowlist for coo (≥4 entries). APE/V: rowcount(_soulkeys)=6; rowcount(_soulkey_allowlist for coo)>=4. Depends on TIR-07 + TIR-09",
@@ -1181,12 +1190,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "ALT-07": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "aletheia/app/watchers/mesh_subscriber.py",
             "aletheia/tests/test_mesh_subscriber.py",
             "plans/v1-ga/ALT-07.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/alt-07-mesh-subscriber",
         notes="plan B §5 Track B ALT-07 + SAL-2604; subscribes soul-svc pub/sub for mesh_task_complete events; enqueues verify job to Redis aletheia:pending; APE/V: fire mcp__alfred__mesh_task_complete with known id, within 10s verdict record written, soul_memory_search finds it. Depends on ALT-05 + soul-svc pub/sub epic",
@@ -1211,13 +1220,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F09": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "src/alfred_coo/fleet_endpoint/__init__.py",
             "src/alfred_coo/fleet_endpoint/memory_push.py",
             "tests/test_fleet_memory_push.py",
-            "plans/v1-ga/F09.md",
         ),
+        new_paths=("plans/v1-ga/F09.md",),
         base_branch="main",
         branch_hint="feature/f09-endpoint-memory-push",
         notes="plan C §3.3 + SAL-2617; endpoint-side push loop POST /v1/fleet/memory/push 30s cadence or queue >=50; idempotent dup retry; monotonic local_seq. APE/V: 1000 writes reflected in hub fleet_memory_sync_log within 60s; depends on F06 + F08",
@@ -1226,12 +1234,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F10": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
-        new_paths=(
+        paths=(
+            "src/alfred_coo/fleet_endpoint/__init__.py",
             "src/alfred_coo/fleet_endpoint/memory_pull.py",
             "tests/test_fleet_memory_pull.py",
-            "plans/v1-ga/F10.md",
         ),
+        new_paths=("plans/v1-ga/F10.md",),
         base_branch="main",
         branch_hint="feature/f10-endpoint-memory-pull",
         notes="plan C §3.3 + SAL-2618; endpoint pull loop GET /v1/fleet/memory/pull?since_global_seq=N 60s cadence; advance global cursor; APE/V: two endpoints A,B; A writes shared.* topic; B's local search returns within 90s; depends on F09",
@@ -1357,14 +1365,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "F20": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "deploy/endpoint/docker-compose.yml",
             "deploy/endpoint/.env.template",
             "deploy/endpoint/README.md",
             "deploy/endpoint/bootstrap.sh",
-            "plans/v1-ga/F20.md",
         ),
+        new_paths=("plans/v1-ga/F20.md",),
         base_branch="main",
         branch_hint="feature/f20-endpoint-compose",
         notes="plan C §5 F20 + SAL-2628; endpoint footprint compose (alfred-coo-svc COO_MODE=endpoint + soul-lite + optional local MCP shims); no postgres/portal/open-webui — headless; bootstrap README walks fresh-Debian operator <10min. APE/V: clean Debian VM, paste registration_token, endpoint registers + heartbeats. Depends on F06 + F08",
@@ -1417,12 +1424,13 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "OPS-08": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yml",),
-        new_paths=(
+        paths=(
+            "deploy/appliance/docker-compose.yml",
             "deploy/appliance/infisical/migrate_state_secrets.sh",
             "deploy/appliance/infisical/MIGRATION.md",
             "plans/v1-ga/OPS-08.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-08-migrate-state-secrets",
         notes="plan D §3.5 + SAL-2641; init container reads ./state/secrets/* on first boot, pushes into infisical, then chmod 000 (disabled-but-recoverable). APE/V: delete state/secrets dir, restart → all services healthy, secrets visible in infisical UI. Depends on OPS-06 + OPS-07",
@@ -1437,11 +1445,12 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "OPS-08C": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/infisical/migrate_state_secrets.sh",),
-        new_paths=(
+        paths=(
+            "deploy/appliance/infisical/migrate_state_secrets.sh",
             "plans/v1-ga/OPS-08c.md",
             "tests/scripts/test_migrate_secrets.sh",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-08c-migrate-secrets-impl",
         notes="wave 2 decomposition child of OPS-08 (SAL-2641) → SAL-3036; replace placeholder infisical-cli calls in the PR #170 stub with real implementation; APE/V: tests/scripts/test_migrate_secrets.sh exercises happy + failure paths against a fake infisical endpoint and exits 0. Depends on OPS-08 stub.",
@@ -1464,13 +1473,14 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "OPS-10": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("deploy/appliance/docker-compose.yml",),
-        new_paths=(
+        paths=(
+            "deploy/appliance/docker-compose.yml",
             "deploy/appliance/authelia/configuration.yml",
             "deploy/appliance/authelia/users_database.yml",
             "deploy/appliance/authelia/README.md",
             "plans/v1-ga/OPS-10.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-10-authelia-file-backend",
         notes="plan D §3.3 + SAL-2643; authelia/authelia:4.38.17 with file-based user backend (air-gap fallback); admin passphrase set in wizard Screen 8. APE/V: /auth/ renders; admin login returns 200. Depends on OPS-03 + OPS-07",
@@ -1482,10 +1492,9 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         paths=(
             "deploy/appliance/Caddyfile",
             "deploy/appliance/docker-compose.yml",
-        ),
-        new_paths=(
             "plans/v1-ga/OPS-11.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-11-caddy-forward-auth",
         notes="plan D §3.3 + SAL-2644; Caddyfile forward_auth directive on /ops/* routes; unauth → 302 /auth; valid session cookie → 200. APE/V: curl -I /ops/ returns 302; curl with cookie returns 200. Depends on OPS-10",
@@ -1578,12 +1587,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         paths=(
             "deploy/appliance/Caddyfile",
             "deploy/appliance/authelia/configuration.yml",
-        ),
-        new_paths=(
             "deploy/appliance/wizard/screen_8_admin_init.html",
             "scripts/mc_auth_init_admin.sh",
             "plans/v1-ga/OPS-15.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/ops-15-wizard-admin-init",
         notes="plan D §3.3 + SAL-2648; Wizard Screen 8 (between 7 and Open MC) — operator sets appliance-admin passphrase; ./mc.sh auth init-admin --passphrase X seeds users_database.yml. APE/V: post-wizard admin row exists; ./mc.sh auth list-users >=1 row. Depends on OPS-10 + portal-team coordination",
@@ -1684,12 +1692,11 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     "C-29": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=(),
-        new_paths=(
+        paths=(
             "tests/fleet/e2e/__init__.py",
             "tests/fleet/e2e/test_multitenant.py",
-            "plans/v1-ga/C-29.md",
         ),
+        new_paths=("plans/v1-ga/C-29.md",),
         base_branch="main",
         branch_hint="feature/c29-multitenant-e2e",
         notes="plan C §5 C-29 + SAL-2677; extends F21 1-hub-3-endpoints suite — one endpoint hosts two tenants (acme-corp + beta-industries); 3 assertion classes: (1) memory isolation, (2) cross-tenant policy leakage, (3) blackout recovery preserves per-tenant global_seq independence. APE/V: pytest tests/fleet/e2e/test_multitenant.py green; jq '.tenant_id' e2e_audit.jsonl | sort -u | wc -l == 2; entire F21 suite runs <15min. Depends on C-26 + C-27 + C-28 + F21",
@@ -1706,11 +1713,10 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         repo="alfred-coo-svc",
         paths=(
             "tests/fleet/e2e/__init__.py",
-        ),
-        new_paths=(
             "tests/fleet/e2e/test_multitenant.py",
             "plans/v1-ga/C-29a.md",
         ),
+        new_paths=(),
         base_branch="main",
         branch_hint="feature/c29a-multitenant-isolation",
         notes="Phase-B decomposition child of C-29 (SAL-2677) → SAL-3074; creates `tests/fleet/e2e/test_multitenant.py` with assertion class 1 (memory isolation: writes from tenant acme are not readable by tenant beta on the same endpoint) + class 2 (cross-tenant policy leakage: a policy bundle pushed for acme is not enforced against beta requests). APE/V: pytest tests/fleet/e2e/test_multitenant.py::test_memory_isolation + ::test_policy_leakage green. Sibling: C-29B (extends with blackout + jq + monotonicity). Depends on F21 fixtures + C-26/27/28.",
@@ -2164,6 +2170,260 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         branch_hint="feature/pc-n5e-web-push-bridge",
         notes="Phase C cockpit-surface; push notification bridge: web push for halt alerts + DMs even when tab inactive. Service worker receives push; permission asked at install; SW receives event within 5s of test push. Depends on PC-V1E and PC-N5A.",
     ),
+
+    # ── Hint repair 2026-04-28 (SAL-3347 + grounding-gap fix) ───────────
+    # Repairs hints that grounding-gap-escalated wave 0/1/2 builders today.
+    # 40 PATH_CONFLICT entries above had their `new_paths` rewritten in-place
+    # to move shipped files into `paths` (they exist on main; the ticket is
+    # follow-on work, not greenfield create). 18 NO_HINT codes get fresh
+    # entries below so the parser-extracted code resolves to a real file.
+
+    "OPS-18": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/loki/loki-config.yaml",
+            "plans/v1-ga/OPS-18.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-18-loki",
+        notes="plan D §3.2 + SAL-2651; Loki + docker log-driver for log aggregation; APE/V: docker logs streamed into Loki; queryable via /loki/api/v1/query",
+    ),
+
+    "OPS-06": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/infisical/agent_soul_svc.yml",
+            "plans/v1-ga/OPS-06.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-06-infisical-agent-soul",
+        notes="plan D §3.5 + SAL-2639; infisical-agent sidecar for soul-svc; reads secrets to /run/secrets/soul_svc_*; APE/V: cat /run/secrets/soul_svc_DATABASE_URL matches infisical UI",
+    ),
+
+    "OPS-19": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/grafana/datasources/prometheus.yaml",
+            "deploy/appliance/grafana/datasources/loki.yaml",
+            "plans/v1-ga/OPS-19.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-19-grafana-datasources",
+        notes="plan D §3.2 + SAL-2652; Grafana + datasource provisioning (prometheus, loki); APE/V: GET /api/datasources returns ≥2 entries",
+    ),
+
+    "OPS-21": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/alertmanager/alertmanager.yml",
+            "deploy/appliance/alertmanager/batcave_webhook.yml",
+            "plans/v1-ga/OPS-21.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-21-alertmanager",
+        notes="plan D §3.2 + SAL-2654; Alertmanager + Slack #batcave webhook; APE/V: synthetic firing alert posts to #batcave",
+    ),
+
+    "OPS-26": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/restic/backup.sh",
+            "deploy/appliance/restic/restic_cron",
+            "plans/v1-ga/OPS-26.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-26-restic-backup",
+        notes="plan D §3.4 + SAL-2659; Restic + nightly cron backup of mc-postgres + state volumes; APE/V: nightly snapshot in repo; restic snapshots returns row",
+    ),
+
+    "ALT-05": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("aletheia/app/main.py",),
+        new_paths=(
+            "aletheia/app/verify_worker.py",
+            "aletheia/tests/test_verify_worker.py",
+            "plans/v1-ga/ALT-05.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-05-verify-worker",
+        notes="plan B §5 ALT-05 + SAL-2602; verify worker loop + grep-confirm evidence validator; consumes aletheia:pending Redis queue; APE/V: pytest tests/test_verify_worker.py green",
+    ),
+
+    "ALT-09": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "aletheia/app/escalator/__init__.py",
+            "aletheia/app/escalator/batcave.py",
+            "aletheia/tests/test_batcave_escalator.py",
+            "plans/v1-ga/ALT-09.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-09-batcave-escalator",
+        notes="plan B §5 ALT-09 + SAL-2606; #batcave escalator on FAIL/UNCERTAIN verdicts; posts compact card with verify link; APE/V: synthetic FAIL → #batcave message within 30s",
+    ),
+
+    "ALT-10": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("aletheia/app/main.py",),
+        new_paths=(
+            "aletheia/app/api/verify_history.py",
+            "aletheia/tests/test_verify_history_endpoint.py",
+            "plans/v1-ga/ALT-10.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-10-verify-history-api",
+        notes="plan B §5 ALT-10 + SAL-2607; verify-history HTTP endpoint + portal tab; GET /v1/verdicts?since=... returns paginated list; APE/V: 100-row fixture, endpoint returns JSON with cursor",
+    ),
+
+    "ALT-11": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("aletheia/app/main.py",),
+        new_paths=(
+            "aletheia/app/cost_meter.py",
+            "aletheia/tests/test_cost_meter.py",
+            "plans/v1-ga/ALT-11.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/alt-11-cost-metering",
+        notes="plan B §5 ALT-11 + SAL-2608; cost metering + daily cap; tracks per-model token usage, refuses verify when daily cap exceeded; APE/V: $X synthetic spend → 429 with cap_exceeded",
+    ),
+
+    "F06": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/heartbeat.py",
+            "tests/test_fleet_heartbeat_endpoint.py",
+            "plans/v1-ga/F06.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f06-endpoint-heartbeat",
+        notes="plan C §3.2 + SAL-2614; endpoint-side heartbeat sender (every 30s, exponential backoff on miss); 3 missed → mode_state=degraded local-only; APE/V: cut WS for 90s, endpoint flips to degraded; reconnect restores active",
+    ),
+
+    "F13": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/policy_apply.py",
+            "tests/test_fleet_policy_apply.py",
+            "plans/v1-ga/F13.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f13-endpoint-policy-apply",
+        notes="plan C §3.4 + SAL-2621; endpoint applies policy bundle on next task boundary; verifies signer ed25519 sig; APE/V: push test bundle → endpoint loads it within 60s; tampered bundle refused",
+    ),
+
+    "F15": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/key_rotation.py",
+            "tests/test_fleet_key_rotation.py",
+            "plans/v1-ga/F15.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f15-key-rotation",
+        notes="plan C §3.5 + SAL-2623; API-key rotation on heartbeat ack; old key valid for 60s grace; APE/V: hub rotates, old key 401s after 60s, new key 200s",
+    ),
+
+    "F18": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/mcctl/commands/__init__.py",),
+        new_paths=(
+            "src/mcctl/commands/endpoint.py",
+            "tests/test_mcctl_endpoint_cmds.py",
+            "plans/v1-ga/F18.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f18-mcctl-endpoint-mgmt",
+        notes="plan C §5 F18 + SAL-2626; mcctl endpoint list/show/revoke/tail subcommands; APE/V: pytest tests/test_mcctl_endpoint_cmds.py covers each; --format json produces parseable output",
+    ),
+
+    "F23": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/main.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_hub/__init__.py",
+            "src/alfred_coo/fleet_hub/metrics.py",
+            "tests/test_fleet_hub_metrics.py",
+            "plans/v1-ga/F23.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f23-fleet-hub-metrics",
+        notes="plan C §5 F23 + SAL-2631; hub /metrics adds fleet_endpoint_count{mode_state}, fleet_heartbeat_lag_seconds_p95, fleet_replication_lag_seconds; fleet_hub/ subtree is greenfield; APE/V: prometheus scrape returns >=3 series",
+    ),
+
+    "F24": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/fleet_endpoint/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/fleet_endpoint/telemetry.py",
+            "tests/test_fleet_endpoint_telemetry.py",
+            "plans/v1-ga/F24.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/f24-endpoint-telemetry",
+        notes="plan C §5 F24 + SAL-2632; endpoint self-reports task counts, queue depth, fallback hits; sent piggy-backed on heartbeat; APE/V: 10 synthetic tasks → telemetry row in hub fleet_telemetry table",
+    ),
+
+    "SS-05": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(),
+        new_paths=(
+            "tests/test_mcp_compat_smoke.py",
+            "plans/v1-ga/SS-05.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ss05-mcp-compat-smoke",
+        notes="plan E §5.1 S-05 + SAL-2666; smoke every mcp__alfred__soul_* tool against a running soul-svc; matrix-test fixture with expected response shapes; APE/V: pytest tests/test_mcp_compat_smoke.py green; covers ≥10 MCP soul-* tools",
+    ),
+
+    "AB-22": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/__init__.py",),
+        new_paths=("plans/v1-ga/AB-22.md",),
+        base_branch="main",
+        branch_hint="feature/ab-22-umbrella",
+        notes="Umbrella AB-22 hint — parser maps AB-22-{a..g} all to AB-22. Children dispatch with this hint; child must Step-2 verify and write its own paths into a sub-ticket-specific PR. Plan: deploy/appliance + tracing module split.",
+    ),
+
+    "AB-25": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/autonomous_build/orchestrator.py",),
+        new_paths=(
+            "tests/test_decomposition_writes_plan_doc.py",
+            "plans/v1-ga/AB-25.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ab-25-decomp-writes-plan-doc",
+        notes="AB-25 + SAL-3243; orchestrator auto-writes plans/v1-ga/<child>.md on decomposition; APE/V: synthetic decomposition produces a plan-doc commit alongside the child Linear issue",
+    ),
+
 }
 
 
