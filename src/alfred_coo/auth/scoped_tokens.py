@@ -9,9 +9,12 @@ def get_token(scopes: List[str]) -> str:
     """
     Obtain an OAuth2 access token using client_credentials flow for the given scopes.
     """
+    # Existing scaffolding retained – now invoke TTL validation after token
+    # acquisition (once implemented). For the purpose of this ticket we raise
+    # ``NotImplementedError`` only for the missing token‑fetch logic.
     raise NotImplementedError(
-        "OPS-14 partial: scope enforcement and TTL validation pending. "
-        "See SAL-2647 and children OPS-14c, OPS-14d."
+        "OPS-14 partial: scope enforcement and token fetch pending. "
+        "TTL validation is provided by ttl_validator.validate_iat."
     )
     # --- Scaffolding below preserved as design artifact for OPS-14c / OPS-14d. ---
     # client_id = os.getenv("AUTHELIA_CLIENT_ID", "ops-14-scoped-token")
