@@ -1000,3 +1000,97 @@ def test_is_retryable_infra_error_classification():
     # Logic bugs do NOT retry.
     assert _is_retryable_infra_error(ValueError("oops")) is False
     assert _is_retryable_infra_error(KeyError("missing")) is False
+
+
+# ── Sub #62: select_model registry integration ────────────────────────────
+
+
+class _MiniPersona:
+    """Stand-in persona for select_model tests."""
+    def __init__(self, name: str, preferred: str | None = "deepseek-v3.2:cloud"):
+        self.name = name
+        self.preferred_model = preferred
+
+
+def test_select_model_kickoff_override_wins(tmp_path, monkeypatch):
+    """A `model_routing.<role>` field on the task overrides registry + tag."""
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    # Point registry at a temp file with builder=qwen3-coder.
+    p = tmp_path / "registry.yaml"
+    p.write_text(
+        "schema_version: 1\n"
+        "models:\n  qwen3-coder:480b-cloud: {provider: x, capabilities: [], status: active}\n"
+        "  kimi-k2-thinking:cloud: {provider: x, capabilities: [], status: active}\n"
+        "  gpt-oss:120b-cloud: {provider: x, capabilities: [], status: active}\n"
+        "roles:\n"
+        "  builder:\n"
+        "    primary: qwen3-coder:480b-cloud\n"
+        "    fallback_chain: []\n"
+        "    last_resort: gpt-oss:120b-cloud\n"
+        "stable_baseline:\n  builder: gpt-oss:120b-cloud\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODEL_REGISTRY_PATH", str(p))
+    mr._reset_for_tests()
+
+    # Registry says qwen3-coder; kickoff override pins kimi.
+    task = {
+        "title": "[persona:alfred-coo-a] [tag:code] SAL-1 hello",
+        "model_routing": {"builder": "kimi-k2-thinking:cloud"},
+    }
+    persona = _MiniPersona("alfred-coo-a")
+    pick = select_model(task, persona)
+    assert pick == "kimi-k2-thinking:cloud"
+
+    # Without override the registry primary wins (NOT the legacy [tag:code]
+    # path — registry takes precedence over tag for mapped personas).
+    task_no_override = {"title": "[persona:alfred-coo-a] SAL-1 hello"}
+    pick2 = select_model(task_no_override, persona)
+    assert pick2 == "qwen3-coder:480b-cloud"
+    mr._reset_for_tests()
+
+
+def test_select_model_legacy_tag_still_works_for_unmapped_persona(monkeypatch, tmp_path):
+    """Personas not in `_PERSONA_ROLE_MAP` keep legacy tag-based routing."""
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setattr(
+        mr, "_DEFAULT_REGISTRY_PATHS",
+        [str(tmp_path / "x.yaml"), str(tmp_path / "y.yaml")],
+    )
+    monkeypatch.delenv("MODEL_REGISTRY_PATH", raising=False)
+    mr._reset_for_tests()
+
+    # Persona name that's NOT in _PERSONA_ROLE_MAP; legacy tag route applies.
+    task = {"title": "[persona:default] [tag:code] hello"}
+    persona = _MiniPersona("default")
+    assert select_model(task, persona) == "qwen3-coder:480b-cloud"
+
+    task2 = {"title": "[persona:default] [tag:strategy] hello"}
+    assert select_model(task2, persona) == "deepseek-v3.2:cloud"
+
+    # No tag, no registry, no preferred -> hard default
+    persona_no_pref = _MiniPersona("default", preferred=None)
+    assert select_model({"title": "[persona:default] x"}, persona_no_pref) == "deepseek-v3.2:cloud"
+
+
+def test_select_model_registry_fallback_to_persona_preferred(monkeypatch, tmp_path):
+    """Mapped persona but registry returns None for the role => persona.preferred_model."""
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    # Registry path doesn't exist -> _pick_model_for_role returns None.
+    monkeypatch.setattr(
+        mr, "_DEFAULT_REGISTRY_PATHS",
+        [str(tmp_path / "x.yaml")],
+    )
+    monkeypatch.delenv("MODEL_REGISTRY_PATH", raising=False)
+    mr._reset_for_tests()
+
+    persona = _MiniPersona("alfred-coo-a", preferred="qwen3-coder:30b-a3b-q4_K_M")
+    task = {"title": "[persona:alfred-coo-a] hello"}
+    # No tag, no registry => fall back to persona.preferred_model.
+    assert select_model(task, persona) == "qwen3-coder:30b-a3b-q4_K_M"

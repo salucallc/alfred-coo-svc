@@ -4261,6 +4261,33 @@ class AutonomousBuildOrchestrator:
                     note=failure_note,
                     reason=failure_reason,
                 )
+                # Sub #62 (2026-04-27): record a hard-timeout against the
+                # builder role on silent_complete. Three in a row trips the
+                # auto-rollback to stable_baseline. Best-effort: registry
+                # mishaps must not break the existing failure path.
+                if failure_reason == "silent_complete":
+                    try:
+                        from .model_registry import record_hard_timeout
+                        crossed = record_hard_timeout("builder")
+                        if crossed:
+                            try:
+                                await self.cadence.post(
+                                    f":rotating_light: model-registry: "
+                                    f"builder role auto-rolled back to "
+                                    f"stable_baseline after 3 consecutive "
+                                    f"silent_complete failures (last ticket "
+                                    f"{ticket.identifier})."
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.exception(
+                                    "cadence.post(auto_rollback) failed; "
+                                    "continuing"
+                                )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "model_registry.record_hard_timeout failed; "
+                            "auto-rollback may be skipped"
+                        )
                 await self._update_linear_state(ticket, "Backlog")
                 updated.append(ticket)
 
@@ -5309,6 +5336,19 @@ class AutonomousBuildOrchestrator:
                     pr_url=ticket.pr_url,
                     sha=self.state.merged_pr_urls.get(ticket.id),
                 )
+                # Sub #62 (2026-04-27): green merge resets the
+                # consecutive-hard-timeout counter for the builder role.
+                # Auto-rollback set itself only clears on registry mtime
+                # change so a fluky-but-recovering primary can't
+                # re-promote without operator review.
+                try:
+                    from .model_registry import record_success
+                    record_success("builder")
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "model_registry.record_success failed; "
+                        "counter not reset"
+                    )
                 await self._update_linear_state(ticket, "Done")
             else:
                 ticket.status = TicketStatus.FAILED

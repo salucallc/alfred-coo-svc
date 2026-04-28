@@ -156,16 +156,132 @@ def iteration_cap_for_dispatch(
     return base
 
 
+# Sub #62 (2026-04-27) — model registry hot-swap.
+#
+# Selection precedence at dispatch time:
+#   1. Per-kickoff override: `task["model_routing"][<role>]` if the kickoff
+#      payload pinned a model for the role. Per-run escape hatch — registry
+#      does NOT win over an explicit operator override.
+#   2. Per-task tag: legacy `[tag:strategy]` / `[tag:code]` keep working
+#      (used by tests + ad-hoc kickoffs). Same as pre-registry behaviour.
+#   3. Model registry: load `Z:/_planning/model_registry/registry.yaml`
+#      (or the canonical Oracle path) and pick `roles.<role>.primary`,
+#      where `<role>` is derived from the persona name.
+#   4. Fallback: persona.preferred_model, then "deepseek-v3.2:cloud".
+#
+# Registry failures (file missing, schema-invalid, role unmapped) ALL fall
+# through to (4) without raising; a hot-swap edit cannot crash dispatch.
+
+# Persona-to-registry-role mapping. Anything not in this map falls through
+# to the legacy persona.preferred_model path (registry doesn't apply).
+_PERSONA_ROLE_MAP: dict[str, str] = {
+    "alfred-coo-a": "builder",
+    "autonomous-build-a": "builder",
+    "hawkman-qa-a": "qa",
+    "alfred-coo-orchestrator": "orchestrator",
+    # Docs role is currently unused by any persona; left in registry for
+    # forward compat with the planned docs-builder persona.
+}
+
+
+def _registry_role_for_persona(persona) -> str | None:
+    """Return the registry role for a persona, or None if unmapped."""
+    name = getattr(persona, "name", None) or ""
+    return _PERSONA_ROLE_MAP.get(name)
+
+
+def _peek_kickoff_model_override(task: dict, role: str) -> str | None:
+    """Return `task['model_routing'][role]` if set, else None.
+
+    The mesh task body (description) is the kickoff JSON for orchestrator
+    parents; for child tasks the override is propagated by the orchestrator
+    when it builds child task bodies. Best-effort — never raises.
+    """
+    # Direct dict path (orchestrator-injected on child task dicts in tests).
+    routing = task.get("model_routing") if isinstance(task, dict) else None
+    if isinstance(routing, dict):
+        v = routing.get(role)
+        if isinstance(v, str) and v:
+            return v
+    # JSON-payload path (kickoff parent).
+    desc = task.get("description") if isinstance(task, dict) else None
+    if isinstance(desc, str) and desc.strip().startswith("{"):
+        try:
+            payload = json.loads(desc)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            r2 = payload.get("model_routing")
+            if isinstance(r2, dict):
+                v = r2.get(role)
+                if isinstance(v, str) and v:
+                    return v
+    return None
+
+
 def select_model(task: dict, persona) -> str:
+    """Pick the model for `task` + `persona`.
+
+    See module-level "Sub #62" block for the full precedence ordering. The
+    legacy tag-based shortcuts are preserved verbatim so existing test
+    fixtures and one-off kickoffs keep working.
+    """
     title = task.get("title", "")
+
+    # (1) Per-kickoff override wins, if a role mapping exists.
+    role = _registry_role_for_persona(persona)
+    if role is not None:
+        override = _peek_kickoff_model_override(task, role)
+        if override:
+            logger.info(
+                "model picked: role=%s persona=%s model=%s "
+                "(source=kickoff_override)",
+                role, getattr(persona, "name", "?"), override,
+            )
+            return override
+
+    # (2) Legacy tag shortcuts.
     if "[tag:strategy]" in title:
         return "deepseek-v3.2:cloud"
-    elif "[tag:code]" in title:
+    if "[tag:code]" in title:
         return "qwen3-coder:480b-cloud"
-    elif persona.preferred_model:
+
+    # (3) Model registry.
+    if role is not None:
+        try:
+            from .autonomous_build.model_registry import _pick_model_for_role
+            registry_pick = _pick_model_for_role(role, attempt_n=0)
+        except Exception as e:  # noqa: BLE001 — registry failures must not crash dispatch
+            logger.warning(
+                "model_registry pick failed for role=%s: %s; "
+                "falling through to legacy selection",
+                role, e,
+            )
+            registry_pick = None
+        if registry_pick:
+            logger.info(
+                "model picked: role=%s persona=%s ticket=%s model=%s "
+                "(attempt 0, source=registry)",
+                role, getattr(persona, "name", "?"),
+                _peek_linear_ticket_for_log(task), registry_pick,
+            )
+            return registry_pick
+
+    # (4) Fallback to persona default.
+    if persona.preferred_model:
         return persona.preferred_model
-    else:
-        return "deepseek-v3.2:cloud"
+    return "deepseek-v3.2:cloud"
+
+
+# Tiny duplicate of _peek_linear_ticket from main.py — kept here to avoid an
+# import cycle (main.py imports dispatch). Pure best-effort log helper.
+_LINEAR_TICKET_RE_FALLBACK = __import__("re").compile(r"\b(SAL-\d{1,6})\b")
+
+
+def _peek_linear_ticket_for_log(task: dict) -> str:
+    title = task.get("title") or ""
+    m = _LINEAR_TICKET_RE_FALLBACK.search(title)
+    return m.group(1) if m else "-"
 
 
 @dataclass

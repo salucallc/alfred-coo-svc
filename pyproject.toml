@@ -26,6 +26,11 @@ dependencies = [
     "anthropic>=0.40.0",
     "python-json-logger>=2.0.7",
     "tenacity>=8.2.0",
+    # Sub #62 (2026-04-27): model registry hot-swap reads YAML at dispatch
+    # time. Schema validation falls back to last-known-good cache, so a
+    # missing PyYAML at runtime would silently disable hot-swap; pin as a
+    # real dep instead.
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
