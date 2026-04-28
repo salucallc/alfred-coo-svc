@@ -178,6 +178,33 @@ DEFAULT_RETRY_BUDGET = 2
 DEFAULT_RETRY_BACKOFF_SEC = 5 * 60  # 5 min
 DEFAULT_DEADLOCK_GRACE_SEC = 15 * 60  # 15 min
 
+# SAL-3070 / SAL-3038 phantom-loop circuit breakers (2026-04-28 incident).
+# At 02:00 UTC on 2026-04-28 the orchestrator was observed stuck for 2h+ in
+# a 60-90s loop on SAL-3038 (OPS-14D) + SAL-3070 (F19A) where AB-17-x's
+# phantom-child reconciler fired, SAL-2870's carve-out short-circuited
+# BACKED_OFF + retry-count-burn (correct for transient flakes), and the
+# next dispatch produced another phantom (silent-with-tools builder). PR
+# #149 design preserves retry budget on phantom cleanup, which is correct
+# for transient flakes but creates infinite loops when the builder is
+# genuinely silent-with-tools.
+#
+#   - PHANTOM_LOOP_WINDOW_SEC=600 (10 min) — sliding window over which we
+#     count consecutive phantom-cleanups for a single ticket.
+#   - PHANTOM_LOOP_MAX_IN_WINDOW=5 — 5 phantom-cleanups inside the window
+#     trips the circuit breaker: ticket is force-escalated to ESCALATED
+#     + Backlog + ``human-assigned`` label so a human can investigate
+#     instead of the orchestrator burning more cycles. Legitimate
+#     transient phantoms (1-3 in 10 min) still go through retry-budget-
+#     unchanged dispatch as before.
+#   - WAVE_STALL_FORCE_PASS_SEC=1800 (30 min) — if a wave's ``green_count``
+#     hasn't increased over a 30-min window, force-pass the wave: every
+#     non-terminal ticket in the wave is escalated for human review and
+#     the orchestrator moves on. A wave whose green_count is still rising
+#     is never force-passed — only stall-pass.
+PHANTOM_LOOP_WINDOW_SEC = 10 * 60  # 10 min
+PHANTOM_LOOP_MAX_IN_WINDOW = 5
+WAVE_STALL_FORCE_PASS_SEC = 30 * 60  # 30 min
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -2386,6 +2413,24 @@ class AutonomousBuildOrchestrator:
         self._repo_missing_tickets: set[str] = set()
         self._emitted_blocks: set[str] = set()
 
+        # SAL-3070 / SAL-3038 phantom-loop circuit breakers (2026-04-28).
+        # ``_consecutive_phantoms`` maps ticket UUID → list of monotonic
+        # timestamps when ``_reset_phantom_failure`` fired for that ticket.
+        # Pruned to the trailing ``PHANTOM_LOOP_WINDOW_SEC`` window on every
+        # phantom-cleanup; if the post-prune size hits
+        # ``PHANTOM_LOOP_MAX_IN_WINDOW`` the ticket is force-escalated.
+        # ``_wave_progress_history`` maps wave_n → list of
+        # (monotonic_ts, green_count) tuples, capped at the last 20 entries.
+        # Sampled from the dispatch loop on every tick. If the latest entry's
+        # green_count hasn't increased over the trailing
+        # ``WAVE_STALL_FORCE_PASS_SEC`` window the wave is force-passed and
+        # remaining non-terminal tickets are escalated for human review.
+        # Both reset on restart — the live-incident signal is
+        # within-process, the saved soul state already captures terminal
+        # transitions per-ticket.
+        self._consecutive_phantoms: Dict[str, List[float]] = {}
+        self._wave_progress_history: Dict[int, List[Tuple[float, int]]] = {}
+
         # AB-17-q · external cancel signal (SAL-2756, 2026-04-24).
         # An operator who PATCHes the kickoff task's lifecycle state to
         # ``failed`` (with ``result.cancel == True``, or just ``status ==
@@ -2947,6 +2992,20 @@ class AutonomousBuildOrchestrator:
             # ── snapshot + checkpoint ───────────────────────────────────
             self._snapshot_graph_into_state()
             await checkpoint(self.state, self.soul, self.task_id)
+
+            # ── SAL-3070 / SAL-3038 wave-stall force-pass (2026-04-28) ──
+            # Sample (monotonic_ts, green_count) for this wave on every
+            # tick. If the green_count hasn't increased over the trailing
+            # ``WAVE_STALL_FORCE_PASS_SEC`` window, force-pass the wave:
+            # escalate every remaining non-terminal ticket so the operator
+            # sees a clear "human-assigned" handoff and the orchestrator
+            # moves on rather than spinning indefinitely on un-mergeable
+            # work. A wave whose green_count is still rising is never
+            # force-passed — only stall-pass.
+            if await self._maybe_force_pass_stalled_wave(
+                wave_n, wave_tickets,
+            ):
+                break
 
             # ── exit condition ──────────────────────────────────────────
             if all(t.status in TERMINAL_STATES for t in wave_tickets):
@@ -3643,7 +3702,7 @@ class AutonomousBuildOrchestrator:
             # the carve-out only fires when there's other in-flight work
             # — a regression from the v7ab/v7ac live-burn scenario where
             # the whole wave entry IS orphans.
-            self._apply_phantom_carve_out(orphan_failed)
+            await self._apply_phantom_carve_out(orphan_failed)
             return list(orphan_failed)
 
         # AB-17-x: fetch all three lifecycle states in one pass so we have
@@ -3940,7 +3999,7 @@ class AutonomousBuildOrchestrator:
         # tickets short-circuit BACKED_OFF + retry-count, going straight
         # to PENDING for immediate re-dispatch. Same helper is invoked
         # by the orphan-only short-circuit above.
-        self._apply_phantom_carve_out(updated)
+        await self._apply_phantom_carve_out(updated)
 
         # SAL-2870: also bake in BACKED_OFF wake-ups + dep refreshes as
         # forward-progress markers so the deadlock-grace timer resets
@@ -4041,17 +4100,24 @@ class AutonomousBuildOrchestrator:
                 if not self._deps_satisfied(ticket):
                     ticket.status = TicketStatus.BLOCKED
 
-    def _apply_phantom_carve_out(self, tickets: List[Ticket]) -> None:
+    async def _apply_phantom_carve_out(self, tickets: List[Ticket]) -> None:
         """SAL-2870 retry-budget sweep + phantom-child carve-out
         (2026-04-26). For each ticket in ``tickets`` that currently sits
         in ``FAILED``:
 
         - If it was tagged ``phantom_child`` (AB-17-x) or
           ``no_child_task_id`` (AB-17-y) AND retry is enabled
-          (``retry_budget > 0``): short-circuit BACKED_OFF, route
-          straight to PENDING via ``_reset_phantom_failure``. Skips the
-          retry_count bump — phantom cleanup is bookkeeping, not a real
-          build attempt.
+          (``retry_budget > 0``): consult the per-ticket consecutive-
+          phantom circuit breaker (SAL-3070 / SAL-3038, 2026-04-28).
+          - If ≥``PHANTOM_LOOP_MAX_IN_WINDOW`` phantoms have fired for
+            this ticket inside the trailing ``PHANTOM_LOOP_WINDOW_SEC``
+            window, force-escalate (ESCALATED + Linear Backlog +
+            ``human-assigned`` label + audit comment) and break the
+            cycle. The ticket is still removed from any retry pressure.
+          - Otherwise (1-3 phantoms in 10 min — legitimate transient
+            flake): short-circuit BACKED_OFF, route straight to PENDING
+            via ``_reset_phantom_failure``. Skips the retry_count bump —
+            phantom cleanup is bookkeeping, not a real build attempt.
         - Otherwise (real failure with budget remaining): route through
           BACKED_OFF + retry_count++ via ``_back_off_ticket``.
         - Otherwise (real failure with budget exhausted, OR phantom
@@ -4061,6 +4127,12 @@ class AutonomousBuildOrchestrator:
         mesh-failed / review-changes) BACKED_OFF cooling semantics. The
         carve-out is gated on ``retry_budget > 0`` so legacy tests +
         operators that pin ``retry_budget=0`` keep terminal-FAILED.
+
+        Async because the SAL-3070 circuit-breaker escalation path
+        invokes ``_update_linear_state`` / ``_apply_linear_label`` /
+        ``_post_escalated_linear_comment`` which all hit the Linear API.
+        Both call sites in ``_poll_children`` are already in an async
+        context so the await is free.
         """
         for ticket in list(tickets):
             if ticket.status != TicketStatus.FAILED:
@@ -4070,11 +4142,232 @@ class AutonomousBuildOrchestrator:
                 ticket.retry_budget > 0
                 and ticket.last_failure_reason in PHANTOM_FAILURE_REASONS
             ):
+                # SAL-3070 / SAL-3038 (2026-04-28) consecutive-phantom
+                # circuit breaker. Track + prune BEFORE deciding whether
+                # to escalate so legitimate transient flakes (1-3 in
+                # 10 min) still go through the unchanged carve-out.
+                if self._phantom_loop_breaker_tripped(ticket):
+                    await self._escalate_phantom_loop(ticket)
+                    continue
                 self._reset_phantom_failure(ticket)
                 continue
             if ticket.retry_count >= ticket.retry_budget:
                 continue
             self._back_off_ticket(ticket)
+
+    def _phantom_loop_breaker_tripped(self, ticket: Ticket) -> bool:
+        """SAL-3070 / SAL-3038 (2026-04-28) consecutive-phantom circuit
+        breaker bookkeeping. Appends ``time.monotonic()`` to the per-
+        ticket history, prunes entries older than
+        ``PHANTOM_LOOP_WINDOW_SEC``, and returns True iff the post-prune
+        history size is ≥ ``PHANTOM_LOOP_MAX_IN_WINDOW`` — the trip
+        condition. Mutating method by design: every phantom-cleanup that
+        reaches the carve-out branch must record an entry, even when the
+        breaker doesn't trip, so the count is accurate on the next call.
+        """
+        now = time.monotonic()
+        history = self._consecutive_phantoms.setdefault(ticket.id, [])
+        history.append(now)
+        cutoff = now - PHANTOM_LOOP_WINDOW_SEC
+        # Prune in-place so future calls see only the trailing window.
+        pruned = [ts for ts in history if ts >= cutoff]
+        self._consecutive_phantoms[ticket.id] = pruned
+        return len(pruned) >= PHANTOM_LOOP_MAX_IN_WINDOW
+
+    async def _escalate_phantom_loop(self, ticket: Ticket) -> None:
+        """SAL-3070 / SAL-3038 (2026-04-28) circuit-breaker escalation.
+
+        Mirrors the SAL-2886 / SAL-2893 escalate-path exactly so an
+        operator handling a phantom-loop ticket sees the same Linear
+        state + label + comment as a grounding-gap escalation:
+
+          1. ``ticket.status = ESCALATED`` (terminal-non-failure;
+             wave-gate excludes from numerator + denominator).
+          2. Linear state → ``Backlog`` (escapes orphan-active sweep
+             without falsely claiming the ticket shipped).
+          3. Linear label → ``human-assigned`` (dispatch-gate excuses
+             the ticket on the next kickoff until a human resolves).
+          4. Linear comment via ``_post_escalated_linear_comment`` with
+             grounding_gap_ident=``"phantom-loop-circuit-breaker"`` so
+             the audit trail captures why this ticket was force-failed.
+          5. ``self._consecutive_phantoms[ticket.id]`` reset so re-entry
+             from a daemon restart starts fresh.
+          6. Skip the normal retry-fresh-dispatch — break out of the
+             cleanup branch.
+
+        Best-effort: if any Linear write raises the helpers themselves
+        log + swallow; the orchestrator's graph stays source of truth
+        and the ESCALATED status alone is enough to lift the wave-gate.
+        """
+        n_in_window = len(self._consecutive_phantoms.get(ticket.id, []))
+        ticket.status = TicketStatus.ESCALATED
+        # Clear in-flight bookkeeping so the next dispatch path (if any)
+        # cannot re-attach to a stale child. ESCALATED is terminal so
+        # this is mostly defensive.
+        ticket.child_task_id = None
+        ticket.last_failure_reason = None
+        logger.warning(
+            "phantom-loop circuit breaker: %s escalated after %d "
+            "consecutive phantoms in %dmin window",
+            ticket.identifier,
+            n_in_window,
+            PHANTOM_LOOP_WINDOW_SEC // 60,
+        )
+        self.state.record_event(
+            "ticket_escalated",
+            identifier=ticket.identifier,
+            grounding_gap="phantom-loop-circuit-breaker",
+            phantom_count=n_in_window,
+            window_sec=PHANTOM_LOOP_WINDOW_SEC,
+        )
+        # Idempotency guard mirrors the SAL-2893 escalate-path: skip the
+        # write + label + comment if Linear is already in a non-active
+        # state (operator already closed it manually, or this is re-
+        # entry from rehydrated state).
+        already_terminal = (ticket.linear_state or "").strip().lower() in (
+            "backlog",
+            "done", "merged", "released", "completed",
+            "canceled", "cancelled", "duplicate",
+        )
+        if not already_terminal:
+            await self._update_linear_state(ticket, "Backlog")
+            await self._apply_linear_label(ticket, "human-assigned")
+            await self._post_escalated_linear_comment(
+                ticket,
+                grounding_gap_ident="phantom-loop-circuit-breaker",
+            )
+            ticket.linear_state = "Backlog"
+        # Reset the counter so a future re-entry starts fresh. The
+        # ESCALATED terminal status already prevents re-dispatch on
+        # this run; clearing the history matters only if an operator
+        # reopens the ticket in Linear and the daemon picks it up
+        # again on a later kickoff.
+        self._consecutive_phantoms.pop(ticket.id, None)
+
+    async def _maybe_force_pass_stalled_wave(
+        self,
+        wave_n: int,
+        wave_tickets: List[Ticket],
+    ) -> bool:
+        """SAL-3070 / SAL-3038 wave-gate stall force-pass (2026-04-28).
+
+        Tracks per-wave ``(monotonic_ts, green_count)`` history bounded
+        to the last 20 entries. If the trailing
+        ``WAVE_STALL_FORCE_PASS_SEC`` window contains no increase in
+        ``green_count`` AND the window is fully populated (the earliest
+        entry inside the window is at least ``WAVE_STALL_FORCE_PASS_SEC``
+        old), force-pass the wave: every non-terminal ticket is escalated
+        with the same Linear-state + label + comment shape as the SAL-
+        3070 phantom-loop circuit breaker so an operator sees a clear
+        ``human-assigned`` handoff. Returns True iff the wave was force-
+        passed (caller breaks the dispatch loop); False if the wave is
+        still making progress or hasn't accumulated enough history yet.
+
+        A wave whose ``green_count`` is still rising is never force-
+        passed — the moment the latest sample exceeds the earliest
+        in-window sample, the timer is implicitly reset by the
+        comparison. Only genuine stall-passes fire the helper.
+        """
+        now = time.monotonic()
+        green_count = sum(
+            1 for t in wave_tickets if t.status == TicketStatus.MERGED_GREEN
+        )
+        history = self._wave_progress_history.setdefault(wave_n, [])
+        history.append((now, green_count))
+        # Cap at the last 20 entries.
+        if len(history) > 20:
+            del history[: len(history) - 20]
+
+        # Stall criterion: there exists a sample at or before
+        # ``now - WAVE_STALL_FORCE_PASS_SEC`` whose green_count is ≥
+        # the current green_count (and therefore equal, since later
+        # samples must be ≥ earlier ones in monotonic green-count
+        # accounting). Equivalently: somewhere ≥30min ago we observed
+        # the same green_count we have now → no progress in 30min.
+        #
+        # We DON'T prune samples older than the cutoff — we need them
+        # specifically to declare a stall. The 20-entry cap bounds
+        # memory; at a 45s poll cadence that's ~15min of history per
+        # wave, but combined with the earliest-old anchor it's enough
+        # to detect a flat 30-min span.
+        cutoff = now - WAVE_STALL_FORCE_PASS_SEC
+        # Find the youngest sample at-or-before the cutoff (i.e., the
+        # most recent sample that's ≥ WAVE_STALL_FORCE_PASS_SEC old).
+        # If no such sample exists we haven't observed enough history
+        # yet — early-tick noise must not trip the breaker.
+        anchor = None
+        for ts, gc in history:
+            if ts <= cutoff:
+                anchor = (ts, gc)  # keep latest such sample
+            else:
+                break
+        if anchor is None:
+            return False
+
+        anchor_gc = anchor[1]
+        # If green_count has risen since the anchor, the wave is making
+        # progress — let it continue naturally. (Strict >: equality is
+        # the stall signature; a single-step rise lifts the breaker.)
+        if green_count > anchor_gc:
+            return False
+
+        # Stall confirmed. Force-pass.
+        stalled_for_sec = int(now - anchor[0])
+        non_terminal = [
+            t for t in wave_tickets if t.status not in TERMINAL_STATES
+        ]
+        logger.warning(
+            "wave %d stalled: green_count=%d unchanged for %dmin; "
+            "force-passing wave",
+            wave_n, green_count,
+            WAVE_STALL_FORCE_PASS_SEC // 60,
+        )
+        self.state.record_event(
+            "wave_force_passed_stalled",
+            wave=wave_n,
+            green_count=green_count,
+            stalled_for_sec=stalled_for_sec,
+            escalated=[t.identifier for t in non_terminal],
+        )
+        for ticket in non_terminal:
+            await self._escalate_stalled_wave_ticket(ticket, wave_n)
+        # Reset the wave's history so a re-entry on the next kickoff
+        # doesn't immediately re-trip on stale entries.
+        self._wave_progress_history[wave_n] = []
+        return True
+
+    async def _escalate_stalled_wave_ticket(
+        self, ticket: Ticket, wave_n: int,
+    ) -> None:
+        """SAL-3070 / SAL-3038 wave-stall escalation (2026-04-28).
+
+        Mirrors ``_escalate_phantom_loop`` exactly except for the
+        ``grounding_gap_ident`` audit string. Kept as a sibling helper
+        so the two circuit-breaker paths can evolve independently
+        without fighting over a single super-helper's signature.
+        """
+        ticket.status = TicketStatus.ESCALATED
+        ticket.child_task_id = None
+        ticket.last_failure_reason = None
+        self.state.record_event(
+            "ticket_escalated",
+            identifier=ticket.identifier,
+            grounding_gap="wave-stall-force-pass",
+            wave=wave_n,
+        )
+        already_terminal = (ticket.linear_state or "").strip().lower() in (
+            "backlog",
+            "done", "merged", "released", "completed",
+            "canceled", "cancelled", "duplicate",
+        )
+        if not already_terminal:
+            await self._update_linear_state(ticket, "Backlog")
+            await self._apply_linear_label(ticket, "human-assigned")
+            await self._post_escalated_linear_comment(
+                ticket,
+                grounding_gap_ident="wave-stall-force-pass",
+            )
+            ticket.linear_state = "Backlog"
 
     def _back_off_ticket(self, ticket: Ticket) -> None:
         """SAL-2870 #1: route a FAILED ticket through BACKED_OFF when it
