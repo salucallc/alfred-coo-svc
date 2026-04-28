@@ -240,6 +240,75 @@ def _peek_kickoff_project_id(task: dict) -> Optional[str]:
     return str(pid)
 
 
+# SAL-3140 (2026-04-28): Builder propose_pr enforcement gate.
+#
+# Builders ([persona:alfred-coo-a] + [tag:code] in title) MUST invoke at least
+# one of these tools per dispatch — propose_pr (happy path), update_pr (fix
+# rounds), or linear_create_issue (escalate path). The persona prompt at
+# persona.py:60-66 already specifies this contract; this constant + the
+# `_builder_envelope_only_completion` helper enforce it in code.
+_BUILDER_REQUIRED_TOOLS: frozenset[str] = frozenset(
+    {"propose_pr", "update_pr", "linear_create_issue"}
+)
+
+
+def _extract_tool_call_names(result: dict) -> list[str]:
+    """Pull tool-call function names out of a dispatcher result dict.
+
+    Handles both shapes the dispatcher / OpenAI tool-calling protocol can
+    emit:
+
+      * `[{"name": "propose_pr", "arguments": "..."}]` — flat shape used by
+        `dispatch.call_with_tools`'s `tool_call_log`.
+      * `[{"function": {"name": "propose_pr", "arguments": "..."}}]` — raw
+        OpenAI tool_calls passthrough.
+
+    Returns an empty list for missing / malformed input. Never raises.
+    """
+    raw = result.get("tool_calls") or []
+    if not isinstance(raw, list):
+        return []
+    names: list[str] = []
+    for tc in raw:
+        if not isinstance(tc, dict):
+            continue
+        name = tc.get("name")
+        if not name:
+            fn = tc.get("function")
+            if isinstance(fn, dict):
+                name = fn.get("name")
+        if name:
+            names.append(name)
+    return names
+
+
+def _builder_envelope_only_completion(
+    *,
+    persona_name: str,
+    task_title: str,
+    result: dict,
+) -> tuple[bool, list[str]]:
+    """Decide whether `result` is a builder envelope-only completion.
+
+    Returns ``(is_envelope_only, observed_tool_names)``. ``is_envelope_only``
+    is ``True`` only when the dispatch is a builder run (persona in
+    ``_BUILDER_PERSONAS`` AND ``[tag:code]`` in title) AND no tool from
+    ``_BUILDER_REQUIRED_TOOLS`` appears in the observed tool calls.
+
+    Pure / synchronous so the poll-loop gate can call it once and the test
+    suite can assert behaviour without booting an asyncio event loop or
+    mocking soul-svc.
+    """
+    if persona_name not in _BUILDER_PERSONAS:
+        return False, []
+    if "[tag:code]" not in (task_title or ""):
+        return False, []
+    observed = _extract_tool_call_names(result)
+    if _BUILDER_REQUIRED_TOOLS.intersection(observed):
+        return False, observed
+    return True, observed
+
+
 def _peek_linear_ticket(task: dict) -> Optional[str]:
     """Best-effort extraction of a Linear ticket id (e.g. "SAL-2698") from
     the mesh task title or description. Returns None if no match.
@@ -726,6 +795,49 @@ async def main() -> None:
                     except Exception:
                         logger.exception("artifact write pass failed for task %s",
                                          task.get("id"))
+
+                # SAL-3140 (2026-04-28): Enforce builder contract — silent-completion
+                # bug where models emit envelope summaries claiming completion without
+                # actually calling propose_pr/update_pr/linear_create_issue. Without
+                # this gate, the orchestrator marks the task complete based on the
+                # envelope summary, no PR lands, ticket re-queues into the same loop.
+                # Pattern documented at persona.py:60-66 but not enforced until now.
+                _gate_failed, _observed = _builder_envelope_only_completion(
+                    persona_name=persona.name,
+                    task_title=task.get("title") or "",
+                    result=result,
+                )
+                if _gate_failed:
+                    _linear_ticket = _peek_linear_ticket(task)
+                    logger.warning(
+                        "builder rejected envelope-only completion task_id=%s "
+                        "linear_ticket=%s tools_observed=%s",
+                        task.get("id"),
+                        _linear_ticket,
+                        _observed,
+                    )
+                    try:
+                        await mesh.complete(
+                            task["id"],
+                            session_id=settings.soul_session_id,
+                            status="failed",
+                            result={
+                                "error": (
+                                    "builder envelope-only completion: "
+                                    "propose_pr/update_pr/linear_create_issue "
+                                    "not invoked"
+                                ),
+                                "tool_calls_observed": _observed,
+                                "persona": persona.name,
+                                "linear_ticket": _linear_ticket,
+                            },
+                        )
+                    except Exception:
+                        logger.exception(
+                            "builder gate: mesh.complete(failed) raised for task %s",
+                            task.get("id"),
+                        )
+                    continue
 
                 try:
                     complete_result: dict = {
