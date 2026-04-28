@@ -244,6 +244,23 @@ DEFAULT_BUILDER_FALLBACK_CHAIN: Tuple[str, ...] = (
     "qwen3-coder:480b-cloud",
 )
 
+# SAL-3038 PR-exists short-circuit (2026-04-28). The dispatch loop checks
+# whether the ticket already has an open PR awaiting Hawkman review before
+# spawning a builder. Three constants tune the check:
+#
+#   - PR_EXISTS_CACHE_TTL_SEC=300 (5 min) — re-query GitHub at most every
+#     5 min per ticket. Short enough that a Hawkman approval lands on the
+#     following dispatch tick; long enough to avoid hammering the Search
+#     API on a 16-ticket wave that's mostly idle.
+#   - PR_EXISTS_FRESH_PR_WINDOW_SEC=7d — PRs older than this are treated
+#     as "stale", and dispatch proceeds to open a fresh attempt rather
+#     than waiting indefinitely on a forgotten PR.
+#   - HAWKMAN_LOGIN — the GitHub user whose APPROVED review releases the
+#     short-circuit. Hardcoded to match the existing Hawkman QA persona.
+PR_EXISTS_CACHE_TTL_SEC = 5 * 60
+PR_EXISTS_FRESH_PR_WINDOW_SEC = 7 * 24 * 60 * 60
+HAWKMAN_LOGIN = "salucatiresias"
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -2516,6 +2533,33 @@ class AutonomousBuildOrchestrator:
         self._cancel_requested: bool = False
         self._cancel_reason: str = ""
 
+        # SAL-3038 PR-exists short-circuit (2026-04-28). Maps ticket
+        # identifier (e.g. "SAL-3038") -> (cached_at_ts, pr_number_or_None).
+        # Read by ``_ticket_has_open_pr_awaiting_review`` to skip GitHub
+        # round-trips on dispatch decisions that fire repeatedly within
+        # the cache window. SAL-3038 itself was re-dispatched 68 times in
+        # 7 days because the dispatch loop never checked whether an open
+        # PR awaiting Hawkman review already existed for the ticket; each
+        # cycle burned $0.50-2 producing nothing useful. Cache window is
+        # short enough (5 min) that a real Hawkman approval lands on the
+        # following dispatch tick at the latest.
+        self._pr_exists_cache: Dict[str, Tuple[float, Optional[int]]] = {}
+        # Process-local counter so an operator tailing logs / state events
+        # can distinguish "wave is genuinely idle" from "wave is short-
+        # circuiting on PRs awaiting review". Reset on restart.
+        self._pr_exists_skips: int = 0
+        # Test hook: setting ``_gh_pr_open_search_fn`` on the instance
+        # bypasses the live GitHub round-trip in
+        # ``_ticket_has_open_pr_awaiting_review``. Mirrors the
+        # ``_gh_pr_search_fn`` / ``_gh_pr_files_fn`` stubs already used by
+        # the stale-sweep helpers above. Stub signature:
+        #   async (ticket_ident: str) -> Optional[Dict[str, Any]]
+        # Returning a dict with at least {"number": int, "created_at":
+        # ISO-8601 str, "reviews": [{"user": {"login": str}, "state": str},
+        # ...]} satisfies the helper's parsing path; returning None means
+        # "no PR found".
+        self._gh_pr_open_search_fn = None
+
     # ── public entry point ─────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -3038,6 +3082,31 @@ class AutonomousBuildOrchestrator:
                         ticket.identifier,
                     )
                     ticket.status = TicketStatus.ESCALATED
+                    continue
+                # SAL-3038 (2026-04-28): if an open PR for this ticket is
+                # already awaiting Hawkman review, skip dispatch and let
+                # the review path drive the ticket forward. Closes the
+                # 68-redispatch-storm observed on SAL-3038 / PR #214.
+                # Returns None when no such PR exists, the PR is too old
+                # (>7 days), Hawkman has approved, or GitHub is
+                # unreachable — in all those cases dispatch proceeds.
+                existing_pr = await self._ticket_has_open_pr_awaiting_review(
+                    ticket.identifier,
+                )
+                if existing_pr is not None:
+                    self._pr_exists_skips += 1
+                    logger.info(
+                        "skipping dispatch: PR #%d exists for ticket %s, "
+                        "awaiting Hawkman review (skips=%d)",
+                        existing_pr, ticket.identifier,
+                        self._pr_exists_skips,
+                    )
+                    self.state.record_event(
+                        "pr_exists_skip",
+                        identifier=ticket.identifier,
+                        pr_number=existing_pr,
+                        skips_total=self._pr_exists_skips,
+                    )
                     continue
                 try:
                     await self._dispatch_child(ticket)
@@ -7305,6 +7374,219 @@ class AutonomousBuildOrchestrator:
             if "/pull/" in url:
                 urls.append(url)
         return urls
+
+    # ── SAL-3038 PR-exists short-circuit (2026-04-28) ───────────────────────
+
+    async def _ticket_has_open_pr_awaiting_review(
+        self, ticket_ident: str,
+    ) -> Optional[int]:
+        """Return the PR number if an open PR for ``ticket_ident`` exists
+        on ``salucallc/*`` and is awaiting Hawkman review; else None.
+
+        Background: SAL-3038 (PR #214) was re-dispatched 68 times in 7
+        days because the dispatch loop didn't check whether an open PR
+        already existed for the ticket. Each cycle burned $0.50-2 in
+        tokens producing nothing useful. This helper closes the gap by
+        querying the GitHub Search API for an open PR mentioning the
+        ticket identifier in title or body and inspecting its review
+        state.
+
+        Returns the PR number when ALL of:
+          - At least one open PR matches the ticket identifier search.
+          - The PR was created within ``PR_EXISTS_FRESH_PR_WINDOW_SEC``
+            (default 7 days). Older PRs are treated as stale; dispatch
+            proceeds to open a fresh attempt.
+          - The PR has NO APPROVED review from ``HAWKMAN_LOGIN``. Once
+            Hawkman approves, dispatch should proceed (the merge bot is
+            the next step, not another builder).
+
+        Returns None on any of:
+          - No matching open PR found.
+          - PR is too old (>7 days).
+          - Hawkman has already APPROVED.
+          - GitHub API failure (degrades to "dispatch as before"; the
+            existing dispatch idempotency + retry-budget paths still
+            cap the blast radius).
+
+        Results are cached per-ticket for ``PR_EXISTS_CACHE_TTL_SEC`` so
+        a 16-ticket wave doesn't fire 16+ Search calls every 45s tick.
+        Tests stub the network round-trip via
+        ``self._gh_pr_open_search_fn`` (signature documented at the
+        ledger field's __init__ docstring).
+        """
+        if not ticket_ident:
+            return None
+
+        # Test-environment guard: when the orchestrator is exercised under
+        # pytest WITHOUT an explicit ``_gh_pr_open_search_fn`` stub, the
+        # caller hasn't opted into the network round-trip. Returning None
+        # immediately keeps the live API out of the hot path of dispatch-
+        # loop tests that don't care about this short-circuit. Tests that
+        # DO care set the stub, which dominates the check below in
+        # ``_fetch_open_pr_awaiting_review``.
+        if (
+            self._gh_pr_open_search_fn is None
+            and os.environ.get("PYTEST_CURRENT_TEST")
+        ):
+            return None
+
+        now = time.time()
+        cached = self._pr_exists_cache.get(ticket_ident)
+        if cached is not None:
+            cached_at, cached_pr = cached
+            if now - cached_at < PR_EXISTS_CACHE_TTL_SEC:
+                return cached_pr
+
+        pr_number: Optional[int] = None
+        try:
+            pr_number = await self._fetch_open_pr_awaiting_review(
+                ticket_ident, now=now,
+            )
+        except Exception:
+            logger.exception(
+                "[pr-exists] check raised for %s; treating as no-PR "
+                "and proceeding with dispatch",
+                ticket_ident,
+            )
+            pr_number = None
+
+        self._pr_exists_cache[ticket_ident] = (now, pr_number)
+        return pr_number
+
+    async def _fetch_open_pr_awaiting_review(
+        self, ticket_ident: str, *, now: float,
+    ) -> Optional[int]:
+        """Inner half of ``_ticket_has_open_pr_awaiting_review``: do the
+        actual GitHub round-trip (or stub call) and apply the freshness +
+        APPROVED-review filters. Split out so the cache layer above stays
+        legible.
+        """
+        stub = self._gh_pr_open_search_fn
+        if stub is not None:
+            try:
+                payload = await stub(ticket_ident)
+            except Exception:
+                logger.exception(
+                    "[pr-exists] _gh_pr_open_search_fn stub raised for %s",
+                    ticket_ident,
+                )
+                return None
+            return self._evaluate_pr_payload(payload, now=now)
+
+        token = os.environ.get("GITHUB_TOKEN") or ""
+        if not token:
+            logger.debug(
+                "[pr-exists] GITHUB_TOKEN unset; skipping PR-exists "
+                "check for %s (dispatch will proceed)",
+                ticket_ident,
+            )
+            return None
+
+        # GitHub Search: open PRs in the salucallc org mentioning the
+        # ticket identifier in title or body. ``per_page=3`` is enough —
+        # we only need the most-recent match.
+        q = (
+            f"org:salucallc is:pr is:open in:title,body "
+            f"{ticket_ident}"
+        )
+        params = {
+            "q": q,
+            "per_page": "3",
+            "sort": "created",
+            "order": "desc",
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    "https://api.github.com/search/issues",
+                    params=params,
+                    headers=headers,
+                )
+                if r.status_code != 200:
+                    logger.warning(
+                        "[pr-exists] GitHub search returned %d for %s "
+                        "(body=%r)",
+                        r.status_code, ticket_ident, r.text[:300],
+                    )
+                    return None
+                items = (r.json() or {}).get("items") or []
+                if not items:
+                    return None
+                # Walk in created-desc order, returning the first PR that
+                # is fresh + unreviewed by Hawkman.
+                for item in items:
+                    pr_url = item.get("pull_request", {}).get("url") or ""
+                    if not pr_url:
+                        continue
+                    rr = await client.get(
+                        f"{pr_url}/reviews",
+                        headers=headers,
+                    )
+                    reviews: List[Dict[str, Any]] = []
+                    if rr.status_code == 200:
+                        reviews = rr.json() or []
+                    payload = {
+                        "number": item.get("number"),
+                        "created_at": item.get("created_at"),
+                        "reviews": reviews,
+                    }
+                    decision = self._evaluate_pr_payload(payload, now=now)
+                    if decision is not None:
+                        return decision
+        except Exception:
+            logger.exception(
+                "[pr-exists] GitHub search raised for %s", ticket_ident,
+            )
+            return None
+        return None
+
+    @staticmethod
+    def _evaluate_pr_payload(
+        payload: Optional[Dict[str, Any]], *, now: float,
+    ) -> Optional[int]:
+        """Apply the freshness + Hawkman-APPROVED filter to a single PR
+        payload (search-item + reviews). Returns the PR number when the
+        short-circuit should fire, or None to fall through.
+
+        Pulled out as a staticmethod so the live network branch and the
+        stub-driven test branch share the exact same decision logic.
+        """
+        if not payload:
+            return None
+        number = payload.get("number")
+        if not isinstance(number, int):
+            return None
+        created_raw = payload.get("created_at")
+        if isinstance(created_raw, str) and created_raw:
+            try:
+                # GitHub returns ISO-8601 with Z. Python <3.11 fromisoformat
+                # rejects Z; replace before parsing.
+                created_iso = created_raw.replace("Z", "+00:00")
+                from datetime import datetime
+                created_ts = datetime.fromisoformat(created_iso).timestamp()
+                if now - created_ts > PR_EXISTS_FRESH_PR_WINDOW_SEC:
+                    return None
+            except (ValueError, TypeError):
+                # Unparseable date — treat as stale rather than skip dispatch.
+                return None
+        reviews = payload.get("reviews") or []
+        for rev in reviews:
+            if not isinstance(rev, dict):
+                continue
+            user = (rev.get("user") or {}).get("login") or ""
+            state = (rev.get("state") or "").upper()
+            if user == HAWKMAN_LOGIN and state == "APPROVED":
+                # Hawkman approved → merge bot is the next step, not
+                # another builder. Proceed with dispatch (None) so the
+                # merge path runs.
+                return None
+        return number
 
     # ── kickoff termination ─────────────────────────────────────────────────
 
