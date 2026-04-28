@@ -359,9 +359,13 @@ async def test_wave_gate_fails_when_threshold_unmet(monkeypatch):
 
 
 async def test_wave_gate_exempts_human_assigned(monkeypatch):
-    """AB-17-w · 7 green / 3 failed (all human-assigned) → denominator 7 →
-    7/7=1.0 → passes without raise. The 3 failures are excused from BOTH
-    numerator and denominator, so the gate sees an all-green wave."""
+    """SAL-3072 (2026-04-28) — semantics flipped: 7 green / 3 failed-and-
+    human-assigned-excused → denominator = 10 (excused now counted),
+    ratio = 7/10 = 0.70 → below default 0.9 → raises. Pre-fix this passed
+    as wave_all_green because excused were dropped from BOTH numerator
+    and denominator. The new contract: excused tickets STILL drop from
+    the numerator (they didn't merge green) but DO count in the
+    denominator (work that was scoped to the wave but didn't ship)."""
     orch = _mk_orchestrator()
     orch.poll_sleep_sec = 0
     tickets = [
@@ -372,27 +376,28 @@ async def test_wave_gate_exempts_human_assigned(monkeypatch):
         t.status = TicketStatus.MERGED_GREEN
     for t in tickets[7:]:
         t.status = TicketStatus.FAILED
-        t.labels = ["human-assigned"]  # excuse from denominator
+        t.labels = ["human-assigned"]  # excused from numerator only
     _seed_graph(orch, tickets)
     await _patch_nosleep(monkeypatch)
 
-    # No raise.
-    await orch._wait_for_wave_gate(1)
-    # Should land on the all-green path (denominator = 7, ratio = 1.0),
-    # not soft-green (since `failed` after excusal is empty).
+    with pytest.raises(RuntimeError, match=r"green_ratio=0\.70"):
+        await orch._wait_for_wave_gate(1)
     events = orch.state.events
-    kinds = [e["kind"] for e in events]
-    assert "wave_all_green" in kinds
-    assert "wave_halt_below_soft_green" not in kinds
-    # Excused count should be reported on the all-green event for ops
-    # visibility (3 human-assigned tickets sat out this wave).
-    all_green_evt = next(e for e in events if e["kind"] == "wave_all_green")
-    assert all_green_evt.get("excused_count") == 3
+    halt = next(
+        e for e in events if e["kind"] == "wave_halt_below_soft_green"
+    )
+    assert halt.get("excused_count") == 3
+    assert halt.get("green_ratio") == pytest.approx(0.70, abs=1e-3)
 
 
-async def test_wave_gate_skips_when_all_excused(monkeypatch):
-    """AB-17-w · 0 green / 5 path_conflict (all excused) → denominator 0 →
-    skip green-ratio check entirely → passes."""
+async def test_wave_gate_fails_when_all_excused(monkeypatch):
+    """SAL-3072 (2026-04-28) — semantics flipped: 0 green / 5 path_conflict
+    (all excused) → denominator 5, ratio = 0/5 = 0.0 → below threshold →
+    raises. Pre-fix this was the canonical "force-pass" scenario the
+    mining sub flagged: 97% of wave-gate passes (83/86 in 7d) were waves
+    with 0 greens that were excused-dominant and reported as success.
+    Post-fix: an all-excused wave fails the gate (correctly flagging
+    that nothing shipped)."""
     orch = _mk_orchestrator()
     orch.poll_sleep_sec = 0
     tickets = [
@@ -416,15 +421,14 @@ async def test_wave_gate_skips_when_all_excused(monkeypatch):
     _seed_graph(orch, tickets)
     await _patch_nosleep(monkeypatch)
 
-    # No raise — wave is by-definition successful when every ticket is
-    # excused.
-    await orch._wait_for_wave_gate(1)
+    with pytest.raises(RuntimeError, match="nothing shipped"):
+        await orch._wait_for_wave_gate(1)
     events = orch.state.events
-    kinds = [e["kind"] for e in events]
-    assert "wave_all_excused" in kinds
-    assert "wave_halt_below_soft_green" not in kinds
-    evt = next(e for e in events if e["kind"] == "wave_all_excused")
-    assert evt.get("excused_count") == 5
+    halt = next(
+        e for e in events if e["kind"] == "wave_halt_below_soft_green"
+    )
+    assert halt.get("excused_count") == 5
+    assert halt.get("green_ratio") == pytest.approx(0.0)
 
 
 async def test_wave_gate_threshold_override(monkeypatch):
@@ -459,11 +463,11 @@ async def test_wave_gate_threshold_override(monkeypatch):
 
 
 async def test_wave_gate_combination(monkeypatch):
-    """AB-17-w · 7 green / 3 failed where 1 failure is human-assigned →
-    denominator = 9 (10 - 1 excused), green = 7, ratio = 7/9 ≈ 0.78 → below
-    default 0.9 → raises. Verifies excusal applies BEFORE the ratio test
-    (not after) — i.e. removing the excused ticket from the denominator,
-    not from the failed list alone."""
+    """SAL-3072 (2026-04-28) — 7 green / 3 failed where 1 failure is
+    human-assigned. Pre-fix: denominator=9 (excused dropped), ratio=7/9
+    ≈ 0.78. Post-fix: denominator=10 (excused counted), ratio=7/10=0.70.
+    Both below default 0.9 so it still raises, but the ratio surfaced in
+    the halt event reflects the new denominator semantics."""
     orch = _mk_orchestrator()
     orch.poll_sleep_sec = 0
     tickets = [
@@ -479,14 +483,14 @@ async def test_wave_gate_combination(monkeypatch):
     _seed_graph(orch, tickets)
     await _patch_nosleep(monkeypatch)
 
-    with pytest.raises(RuntimeError, match=r"green_ratio=0\.78"):
+    with pytest.raises(RuntimeError, match=r"green_ratio=0\.70"):
         await orch._wait_for_wave_gate(1)
     events = orch.state.events
     halt = next(
         e for e in events if e["kind"] == "wave_halt_below_soft_green"
     )
     assert halt.get("excused_count") == 1
-    assert halt.get("green_ratio") == pytest.approx(7 / 9, abs=1e-3)
+    assert halt.get("green_ratio") == pytest.approx(7 / 10, abs=1e-3)
 
 
 def test_parse_payload_threshold_default_and_override():

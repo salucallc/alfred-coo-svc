@@ -6051,17 +6051,26 @@ class AutonomousBuildOrchestrator:
     async def _wait_for_wave_gate(self, wave_n: int) -> None:
         """Block until every ticket in `wave_n` is terminal. Raise if a
         critical-path ticket failed; allow soft-green on non-critical
-        failures if ≥`self.wave_green_ratio_threshold` of the *scored*
-        wave merged green.
+        failures if ≥`self.wave_green_ratio_threshold` of the wave
+        merged green.
 
         AB-17-w (2026-04-25): the threshold is configurable per-kickoff
         (payload field ``wave_green_ratio_threshold``, default
         ``SOFT_GREEN_THRESHOLD``). Tickets bearing the ``human-assigned``
         label, plus tickets whose pre-dispatch hint verification returned
-        ``PATH_CONFLICT`` or ``NO_HINT``, are excused from both numerator
-        and denominator. If every ticket in the wave is excused
-        (denominator == 0), the wave passes without a green-ratio check.
-        See ``_is_wave_gate_excused`` for the exact predicate.
+        ``PATH_CONFLICT`` or ``NO_HINT``, are still excluded from the
+        numerator (they cannot count as green) but starting 2026-04-28
+        they are now COUNTED IN THE DENOMINATOR. See ``_is_wave_gate_excused``
+        for the exact excusal predicate.
+
+        SAL-3072 (2026-04-28): mining sub found 97% of wave-gate passes
+        (83/86 in 7d) were force-passes where most tickets were excused
+        but the gate reported ratio=1.00 (passed) because excused were
+        excluded from the denominator. Fix: include excused in the
+        denominator so a wave with 5 green + 9 excused reports
+        ratio=5/14≈0.36 (failed) instead of 5/5=1.00 (passed). Empty waves
+        and all-excused waves now fail the gate (ratio=0.0) instead of
+        silently passing. Threshold unchanged.
         """
         wave_tickets = self.graph.tickets_in_wave(wave_n)
         if not wave_tickets:
@@ -6135,8 +6144,10 @@ class AutonomousBuildOrchestrator:
         ]
         # AB-17-w · Plan AB-17-w — additional excusal axes on top of the
         # AB-17-d REPO_MISSING exclusion already applied above. These
-        # tickets are excluded from the green-ratio denominator because
-        # they were never an executable code path:
+        # tickets are excluded from the green-ratio NUMERATOR (they
+        # cannot count as green merges) but as of SAL-3072 (2026-04-28)
+        # they ARE counted in the DENOMINATOR — work that was scoped to
+        # the wave but didn't ship is still uncompleted work:
         #   1. ``human-assigned`` label — Cristian (or another human) is
         #      handling this out-of-band; the orchestrator never owned it.
         #   2. PATH_CONFLICT verification — the static target hint pointed
@@ -6147,8 +6158,10 @@ class AutonomousBuildOrchestrator:
         #      grounding gap; the orchestrator has no idea where this
         #      ticket's PR should land. Equivalent to "never had a
         #      TargetHint at all".
-        # Excused tickets are kept in `wave_tickets` for terminal-state
-        # tracking but removed from both numerator + denominator.
+        # Pre-SAL-3072 these were excluded from BOTH numerator and
+        # denominator, which produced the force-pass bug (5 green + 9
+        # excused → 5/5 = 1.00 → "passed" when really only 5/14 actually
+        # shipped). Post-fix: green / (green + failed + excused).
         excused = [
             t for t in effective
             if self._is_wave_gate_excused(t)
@@ -6160,16 +6173,22 @@ class AutonomousBuildOrchestrator:
         cp_failed = [t for t in failed if t.is_critical_path]
         green = [t for t in scored if t.status == TicketStatus.MERGED_GREEN]
         threshold = float(self.wave_green_ratio_threshold)
-        denominator = len(scored)
-        green_ratio = (len(green) / denominator) if denominator > 0 else 1.0
+        # SAL-3072: include excused in denominator (was len(scored)).
+        # Empty waves now report ratio=0.0 and fail the threshold instead
+        # of vacuously passing. All-excused waves likewise fail (correctly
+        # surfacing that the wave shipped nothing).
+        denominator = len(scored) + len(excused)
+        green_ratio = (len(green) / denominator) if denominator > 0 else 0.0
 
         # AB-17-w: structured wave-end log line. Always emitted, regardless
         # of decision, so an operator tailing logs sees the full math
         # (numerator, denominator, excused count, threshold, ratio,
         # decision) on one line.
+        # SAL-3072: removed "skipped_all_excused" decision — all-excused
+        # waves now flow through the normal threshold check (they fail
+        # at ratio=0.0).
         decision = (
             "halted_critical_path" if cp_failed
-            else "skipped_all_excused" if denominator <= 0
             else "passed" if green_ratio >= threshold
             else "failed_below_threshold"
         )
@@ -6190,23 +6209,59 @@ class AutonomousBuildOrchestrator:
                                     failed=[t.identifier for t in cp_failed])
             raise RuntimeError(msg)
 
-        # AB-17-w: if every ticket was excused (e.g. an entire wave is
-        # human-assigned scope), there is nothing for the orchestrator to
-        # gate on. Treat as a pass — the wave succeeded by definition.
-        if denominator <= 0:
-            logger.info(
-                "wave %d all-excused (n=%d); skipping green-ratio check",
-                wave_n, len(excused),
-            )
+        # SAL-3072 (2026-04-28): the AB-17-w "all-excused = pass" branch
+        # was removed. With excused now counted in the denominator, an
+        # all-excused wave reports ratio=0.0 and fails the threshold like
+        # any other wave that didn't ship work. The decision tree below is
+        # now gated purely on `green_ratio >= threshold`, not on the
+        # presence of FAILED tickets — pre-fix, an excused-only wave
+        # (failed=[], green=[]) fell through to the all-green branch and
+        # got logged as success. Now it raises with ratio=0.0 < threshold.
+
+        if green_ratio < threshold:
+            # Below threshold. Distinguish "real failures pulled the ratio
+            # down" from "nothing shipped (all excused, or empty post-
+            # repo-missing-filter)" for ops triage, but both raise.
+            if failed:
+                msg = (
+                    f"wave {wave_n} failed: green_ratio={green_ratio:.2f} < "
+                    f"{threshold:.2f} and {len(failed)} non-critical failure(s)"
+                )
+            elif denominator <= 0:
+                # All tickets were repo-missing-filtered. Pre-SAL-3072
+                # this would have been masked as a vacuous all-excused
+                # pass; now surfaced as a halt so ops sees the grounding
+                # gap.
+                msg = (
+                    f"wave {wave_n} failed: zero scoreable tickets "
+                    f"(all REPO_MISSING-filtered); orchestrator state "
+                    f"corrupt or grounding gap"
+                )
+            else:
+                # Excused-dominant wave: no failures, no greens, just
+                # tickets the orchestrator never owned. Pre-SAL-3072 this
+                # was the force-pass scenario the mining sub flagged.
+                msg = (
+                    f"wave {wave_n} failed: green_ratio={green_ratio:.2f} < "
+                    f"{threshold:.2f} (green={len(green)} excused="
+                    f"{len(excused)} of {denominator}); nothing shipped"
+                )
+            logger.error(msg)
             self.state.record_event(
-                "wave_all_excused",
+                "wave_halt_below_soft_green",
                 wave=wave_n,
+                failed=[t.identifier for t in failed],
                 excused=[t.identifier for t in excused],
                 excused_count=len(excused),
+                green_ratio=green_ratio,
+                threshold=threshold,
             )
-            return
+            raise RuntimeError(msg)
 
-        if failed and green_ratio >= threshold:
+        # green_ratio >= threshold. Either a true all-green wave (no
+        # failures) or a soft-green pass (some failures, but enough
+        # greens to clear the bar).
+        if failed:
             logger.warning(
                 "wave %d soft-green: %d/%d merged (%d excused), "
                 "non-critical failures: %s",
@@ -6224,23 +6279,6 @@ class AutonomousBuildOrchestrator:
             )
             return
 
-        if failed:
-            msg = (
-                f"wave {wave_n} failed: green_ratio={green_ratio:.2f} < "
-                f"{threshold:.2f} and {len(failed)} non-critical failure(s)"
-            )
-            logger.error(msg)
-            self.state.record_event(
-                "wave_halt_below_soft_green",
-                wave=wave_n,
-                failed=[t.identifier for t in failed],
-                excused=[t.identifier for t in excused],
-                excused_count=len(excused),
-                green_ratio=green_ratio,
-                threshold=threshold,
-            )
-            raise RuntimeError(msg)
-
         logger.info("wave %d all-green", wave_n)
         self.state.record_event(
             "wave_all_green",
@@ -6249,9 +6287,10 @@ class AutonomousBuildOrchestrator:
         )
         # Fix A: persist the pass record so a subsequent kickoff/restart
         # can short-circuit this wave via ``_should_skip_wave``. Only
-        # written on the *true* all-green branch (ratio == 1.00). The
-        # all-excused branch above explicitly does NOT cache: a 0/0 pass
-        # would let a future genuine wave skip with no real basis.
+        # written on the *true* all-green branch (no failures, ratio above
+        # threshold). The wave-skip cache key is the (project, wave_n)
+        # pair, so a soft-green pass should NOT poison the cache for a
+        # later run.
         try:
             await record_wave_pass(
                 self.soul,
