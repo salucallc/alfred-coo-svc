@@ -3,6 +3,9 @@ import base64  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 from typing import List
 import httpx  # noqa: F401  preserved for OPS-14c / OPS-14d scaffolding
 
+# New import for TTL validation
+from .ttl_validator import validate_iat, TokenExpiredError
+
 AUTHELIA_TOKEN_URL = os.getenv("AUTHELIA_TOKEN_URL", "http://localhost:9091/api/oauth2/token")
 
 def get_token(scopes: List[str]) -> str:
@@ -22,3 +25,11 @@ def get_token(scopes: List[str]) -> str:
     # resp = httpx.post(AUTHELIA_TOKEN_URL, data=data, headers=headers, timeout=10.0)
     # resp.raise_for_status()
     # return resp.json()["access_token"]
+
+# Example wrapper using TTL validation (could be integrated into token handling flow)
+def validate_token_iat(token_claims: dict) -> None:
+    """Validate IAT claim using ttl_validator logic.
+
+    Raises TokenExpiredError if token is missing iat or expired.
+    """
+    validate_iat(token_claims)
