@@ -205,6 +205,45 @@ PHANTOM_LOOP_WINDOW_SEC = 10 * 60  # 10 min
 PHANTOM_LOOP_MAX_IN_WINDOW = 5
 WAVE_STALL_FORCE_PASS_SEC = 30 * 60  # 30 min
 
+# Sequential-discipline bundle (2026-04-28 incident, post-PR #227). Three
+# layered fixes converting the autonomous-build pipeline from optimistic to
+# deadline-driven. The PR #227 circuit breakers fire AFTER 5 phantoms in
+# 10min — useful but downstream of the actual disease (silent-failing
+# builders + non-idempotent dispatches + single-model brittleness).
+#
+# Fix 1 — Builder hard-timeout w/ retry-consumed semantics. After a
+# successful ``_dispatch_child`` the ticket is stamped with
+# ``ticket.dispatched_at = time.time()``. If ``_poll_children`` observes
+# that more than ``BUILDER_HARD_TIMEOUT_SEC`` (default 600s = 10 min) has
+# elapsed without a terminal completion record, the ticket is force-failed
+# with ``last_failure_reason="builder_hard_timeout"``. Critically: this
+# tag is NOT in ``PHANTOM_FAILURE_REASONS`` so the SAL-2870 carve-out does
+# NOT short-circuit BACKED_OFF, and ``_back_off_ticket`` consumes a retry
+# slot. When budget is exhausted the ticket force-escalates to ESCALATED
+# + Backlog + ``human-assigned`` label so an operator can investigate.
+# Distinct from AB-17-x's STUCK_CHILD_FORCE_FAIL_SEC (30 min, gated on
+# the child being absent from mesh claimed/completed/failed): the new
+# bound is on dispatch wall-clock irrespective of mesh state, so a child
+# that's stuck in ``claimed`` forever (gpt-oss:120b silent-with-tools) is
+# also caught.
+BUILDER_HARD_TIMEOUT_SEC = 10 * 60  # 10 min
+
+# Fix 3 — Builder model fallback chain. The default first-attempt model
+# is gpt-oss:120b-cloud (matches the persona's preferred_model), with
+# qwen3-coder:480b-cloud as the fallback on retry. Per
+# ``reference_qwen_480b_cognition_failures.md`` qwen3-coder:480b has its
+# own failure modes (tool-output override, hallucinated absence) but a
+# much lower silent-with-tools rate than gpt-oss:120b — worth swapping
+# on retry. Override per-kickoff via the top-level ``builder_fallback_chain``
+# payload field. The chain is title-tag based: the orchestrator inserts
+# ``[tag:code]`` on retry-N dispatches when ``builder_fallback_chain[N]``
+# resolves to qwen3-coder:480b-cloud, which the existing
+# ``dispatch.select_model`` already routes to qwen.
+DEFAULT_BUILDER_FALLBACK_CHAIN: Tuple[str, ...] = (
+    "gpt-oss:120b-cloud",
+    "qwen3-coder:480b-cloud",
+)
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -2431,6 +2470,32 @@ class AutonomousBuildOrchestrator:
         self._consecutive_phantoms: Dict[str, List[float]] = {}
         self._wave_progress_history: Dict[int, List[Tuple[float, int]]] = {}
 
+        # Sequential-discipline Fix 2 (2026-04-28): per-ticket dispatch
+        # idempotency. Maps ticket UUID → child_task_id of the most
+        # recently-dispatched in-flight child. Used by ``_dispatch_child``
+        # to refuse a duplicate dispatch when an earlier one is still
+        # outstanding — prevents the "10+ pending tasks for SAL-3070"
+        # orphan storm observed 2026-04-28 when phantom-cleanup fired
+        # repeatedly on a still-running child. Cleared by
+        # ``_release_in_flight_dispatch`` on terminal transition (PR_OPEN,
+        # FAILED, ESCALATED, MERGED_GREEN) and by the hard-timeout
+        # branch in ``_poll_children``. Process-local — restored state
+        # rebuilds it lazily as live children re-enter the in-flight
+        # accounting.
+        self._in_flight_dispatches: Dict[str, str] = {}
+
+        # Sequential-discipline Fix 3 (2026-04-28): builder model fallback
+        # chain. Resolved from the kickoff payload's
+        # ``builder_fallback_chain`` field; falls back to the module-level
+        # ``DEFAULT_BUILDER_FALLBACK_CHAIN``. ``_dispatch_child`` reads
+        # ``ticket.dispatch_attempts % len(chain)`` to pick the model for
+        # the current dispatch and stamps a ``[tag:code]`` /
+        # ``[tag:strategy]`` marker on the child task title so
+        # ``dispatch.select_model`` routes correctly downstream.
+        self.builder_fallback_chain: Tuple[str, ...] = (
+            DEFAULT_BUILDER_FALLBACK_CHAIN
+        )
+
         # AB-17-q · external cancel signal (SAL-2756, 2026-04-24).
         # An operator who PATCHes the kickoff task's lifecycle state to
         # ``failed`` (with ``result.cancel == True``, or just ``status ==
@@ -2715,6 +2780,26 @@ class AutonomousBuildOrchestrator:
         wave_order = payload.get("wave_order")
         if isinstance(wave_order, list) and wave_order:
             self.wave_order = [int(w) for w in wave_order if isinstance(w, (int, str))]
+
+        # Sequential-discipline Fix 3 (2026-04-28): builder model fallback
+        # chain override. Accepts a list of model strings; non-list / empty
+        # values fall back to the module default with a WARN so a typo
+        # never crashes the run.
+        chain_override = payload.get("builder_fallback_chain")
+        if chain_override is not None:
+            if (
+                isinstance(chain_override, (list, tuple))
+                and chain_override
+                and all(isinstance(m, str) and m for m in chain_override)
+            ):
+                self.builder_fallback_chain = tuple(chain_override)
+            else:
+                logger.warning(
+                    "ignoring invalid builder_fallback_chain=%r; "
+                    "keeping default %r",
+                    chain_override, DEFAULT_BUILDER_FALLBACK_CHAIN,
+                )
+                self.builder_fallback_chain = DEFAULT_BUILDER_FALLBACK_CHAIN
 
         # AB-05: build the payload-configured tracker + cadence. Keep the
         # previously-constructed defaults if the payload omits a field so
@@ -3303,7 +3388,44 @@ class AutonomousBuildOrchestrator:
         in-place so ``_child_task_body`` reads fresh state. Failures here
         fall back to the cached entry (verification crashes mid-wave must
         not freeze dispatch — UNVERIFIED still dispatches by design).
+
+        Sequential-discipline (2026-04-28):
+          - Fix 2: per-ticket dispatch idempotency. Refuse to dispatch a
+            ticket that already has an in-flight child registered in
+            ``self._in_flight_dispatches``. Prevents the orphan storm
+            (10+ pending tasks for a single ticket) observed when
+            phantom-cleanup races a still-running child.
+          - Fix 3: builder model fallback chain. Pick
+            ``self.builder_fallback_chain[ticket.dispatch_attempts %
+            len(chain)]`` as the model for this dispatch, stamp a
+            corresponding ``[tag:code]`` / ``[tag:strategy]`` marker on
+            the title so ``dispatch.select_model`` routes correctly.
+            Increment ``ticket.dispatch_attempts`` after each successful
+            create_task.
+          - Fix 1: stamp ``ticket.dispatched_at`` so the hard-timeout
+            branch in ``_poll_children`` has a wall-clock anchor.
         """
+        # Sequential-discipline Fix 2: refuse duplicate in-flight dispatch.
+        # The orchestrator's existing wave-loop already guards via
+        # ``_in_flight_for_wave`` (status-based), but a phantom-cleanup
+        # tick can flip the ticket back to PENDING while the original
+        # child is still running on the mesh — at which point the next
+        # dispatch produces a sibling. The dispatch-id ledger here closes
+        # that race independent of status bookkeeping.
+        existing_child = self._in_flight_dispatches.get(ticket.id)
+        if existing_child is not None:
+            logger.warning(
+                "in-flight check: %s already has child %s; "
+                "skipping duplicate dispatch",
+                ticket.identifier, existing_child,
+            )
+            self.state.record_event(
+                "dispatch_idempotency_skip",
+                identifier=ticket.identifier,
+                existing_child_task_id=existing_child,
+            )
+            return
+
         code_key = (ticket.code or "").upper()
         if code_key:
             hint = _TARGET_HINTS.get(code_key)
@@ -3324,12 +3446,26 @@ class AutonomousBuildOrchestrator:
                         "falling back to wave-cached hint",
                         code_key,
                     )
-        title = self._child_task_title(ticket)
+        # Sequential-discipline Fix 3: pick the builder model for this
+        # attempt from the fallback chain. Title-tag based routing means
+        # the existing ``dispatch.select_model`` path resolves correctly
+        # downstream without a schema change to the mesh task envelope.
+        title = self._child_task_title(
+            ticket,
+            model_tag=self._builder_model_tag_for_attempt(
+                ticket.dispatch_attempts
+            ),
+        )
         body = self._child_task_body(ticket)
+        chosen_model = self.builder_fallback_chain[
+            ticket.dispatch_attempts % len(self.builder_fallback_chain)
+        ]
         logger.info(
-            "dispatching %s %s (wave %d, epic=%s, cp=%s)",
+            "dispatching %s %s (wave %d, epic=%s, cp=%s, "
+            "attempt=%d, model=%s)",
             ticket.identifier, ticket.code, ticket.wave,
             ticket.epic, ticket.is_critical_path,
+            ticket.dispatch_attempts, chosen_model,
         )
         resp = await self.mesh.create_task(
             title=title,
@@ -3340,10 +3476,24 @@ class AutonomousBuildOrchestrator:
             raise RuntimeError(f"mesh create_task returned no id: {resp!r}")
         ticket.child_task_id = resp["id"]
         ticket.status = TicketStatus.DISPATCHED
+        # Sequential-discipline Fix 1: stamp the dispatch wall-clock so
+        # ``_poll_children``'s hard-timeout branch can fire. Use
+        # ``time.time()`` (wall-clock) not ``time.monotonic()`` so a
+        # restored-state ticket from a prior daemon process can compare
+        # against ``ticket.dispatched_at`` consistently.
+        ticket.dispatched_at = time.time()
+        # Sequential-discipline Fix 2: register the in-flight child so a
+        # subsequent dispatch attempt (from any code path) is refused.
+        self._in_flight_dispatches[ticket.id] = ticket.child_task_id
+        # Sequential-discipline Fix 3: increment the attempt counter so
+        # the next dispatch (if any) lands on the next model in the chain.
+        ticket.dispatch_attempts += 1
         self.state.record_event(
             "ticket_dispatched",
             identifier=ticket.identifier,
             child_task_id=ticket.child_task_id,
+            attempt=ticket.dispatch_attempts,
+            model=chosen_model,
         )
         # AB-17-p: successful dispatch = forward progress.
         self._last_progress_ts = time.time()
@@ -3353,13 +3503,57 @@ class AutonomousBuildOrchestrator:
         # truth; Linear state is a convenience mirror.
         await self._update_linear_state(ticket, "In Progress")
 
-    def _child_task_title(self, ticket: Ticket) -> str:
+    def _builder_model_tag_for_attempt(self, attempt: int) -> Optional[str]:
+        """Sequential-discipline Fix 3: map a dispatch attempt index to
+        a ``[tag:*]`` marker that ``dispatch.select_model`` understands.
+
+        ``select_model`` reads three patterns:
+          - ``[tag:strategy]`` → ``deepseek-v3.2:cloud``
+          - ``[tag:code]``     → ``qwen3-coder:480b-cloud``
+          - else               → persona.preferred_model (gpt-oss:120b-cloud)
+
+        Returns the matching tag for the model the fallback chain
+        resolves to, or ``None`` when the resolved model matches the
+        persona default (no override needed).
+        """
+        if not self.builder_fallback_chain:
+            return None
+        chosen = self.builder_fallback_chain[
+            attempt % len(self.builder_fallback_chain)
+        ]
+        if chosen == "qwen3-coder:480b-cloud":
+            return "[tag:code]"
+        if chosen == "deepseek-v3.2:cloud":
+            return "[tag:strategy]"
+        return None
+
+    def _release_in_flight_dispatch(self, ticket: Ticket) -> None:
+        """Sequential-discipline Fix 2: clear the in-flight dispatch
+        ledger entry for ``ticket`` once it has reached a terminal-or-
+        post-build state (PR_OPEN, REVIEWING, FAILED, ESCALATED,
+        MERGED_GREEN). Idempotent: a missing entry is a no-op so this
+        helper is safe to call from every state-transition site.
+
+        Called by ``_poll_children`` on every transition out of an
+        active state, and by the hard-timeout branch when force-failing
+        a still-active ticket.
+        """
+        self._in_flight_dispatches.pop(ticket.id, None)
+
+    def _child_task_title(
+        self, ticket: Ticket, model_tag: Optional[str] = None,
+    ) -> str:
         # Truncate the Linear title so the full tag stays readable.
         short = (ticket.title or "")[:80].rstrip()
         code = f" {ticket.code}" if ticket.code else ""
+        # Sequential-discipline Fix 3: optional model-routing tag inserted
+        # before the persona tag so ``dispatch.select_model`` picks the
+        # fallback chain's resolved model. ``None`` (default) preserves
+        # legacy title shape exactly.
+        model_prefix = f"{model_tag} " if model_tag else ""
         return (
-            f"[persona:alfred-coo-a] [wave-{ticket.wave}] [{ticket.epic}] "
-            f"{ticket.identifier}{code} — {short}"
+            f"{model_prefix}[persona:alfred-coo-a] [wave-{ticket.wave}] "
+            f"[{ticket.epic}] {ticket.identifier}{code} — {short}"
         )
 
     def _child_task_body(self, ticket: Ticket) -> str:
@@ -3772,6 +3966,94 @@ class AutonomousBuildOrchestrator:
             # merges completed + failed.
             rec = terminal_by_id.get(ticket.child_task_id)
             if rec is None:
+                # Sequential-discipline Fix 1 (2026-04-28): builder hard
+                # timeout. Fires INDEPENDENT of mesh-claimed status — a
+                # child that's stuck in ``claimed`` forever (gpt-oss:120b
+                # silent-with-tools) is just as broken as a child that
+                # vanished, and the only safe response is to force-fail
+                # the ticket so the retry sweep can either back-off-and-
+                # try-again on a different model or escalate to a human.
+                # Distinct from AB-17-x's STUCK_CHILD_FORCE_FAIL_SEC
+                # (gated on absence from claimed/completed/failed): the
+                # hard-timeout uses dispatch wall-clock as its only
+                # anchor, so silent-with-tools is caught.
+                #
+                # Tag with ``builder_hard_timeout`` (NOT in
+                # ``PHANTOM_FAILURE_REASONS``) so ``_apply_phantom_carve_out``
+                # routes through ``_back_off_ticket`` (consumes retry).
+                # When budget is exhausted, escalate via
+                # ``_escalate_builder_hard_timeout`` (mirrors the SAL-3070
+                # circuit-breaker shape: ESCALATED + Backlog +
+                # ``human-assigned`` + audit comment).
+                if (
+                    ticket.dispatched_at is not None
+                    and (now - ticket.dispatched_at) > BUILDER_HARD_TIMEOUT_SEC
+                ):
+                    elapsed = now - ticket.dispatched_at
+                    if ticket.retry_count + 1 >= ticket.retry_budget:
+                        # Retry budget exhausted on this hard-timeout —
+                        # escalate directly so a human gets the ticket
+                        # instead of letting it land in terminal FAILED
+                        # (which the wave-gate would then have to time-
+                        # out separately on).
+                        logger.warning(
+                            "builder hard-timeout: %s dispatched %.0fs "
+                            "ago with no completion; force-failing "
+                            "(retry %d/%d exhausted → ESCALATED)",
+                            ticket.identifier, elapsed,
+                            ticket.retry_count, ticket.retry_budget,
+                        )
+                        ticket.status = TicketStatus.FAILED
+                        ticket.last_failure_reason = "builder_hard_timeout"
+                        # Consume the final retry slot so retry_count
+                        # accounting matches the "retry consumed"
+                        # contract. This brings retry_count up to budget,
+                        # at which point _apply_phantom_carve_out's
+                        # exhaustion guard would normally leave the
+                        # ticket terminal-FAILED — but we route to
+                        # ESCALATED instead via the dedicated helper so
+                        # operators see the same Linear shape as a
+                        # phantom-loop circuit-breaker fire.
+                        ticket.retry_count += 1
+                        self.state.record_event(
+                            "ticket_failed",
+                            identifier=ticket.identifier,
+                            note=(
+                                f"builder_hard_timeout: dispatched "
+                                f"{int(elapsed)}s ago with no completion "
+                                f"(retry {ticket.retry_count}/"
+                                f"{ticket.retry_budget} exhausted)"
+                            ),
+                            reason="builder_hard_timeout",
+                        )
+                        await self._escalate_builder_hard_timeout(ticket)
+                        self._release_in_flight_dispatch(ticket)
+                        updated.append(ticket)
+                        continue
+                    # Budget remaining — force-fail and let the carve-out
+                    # sweep route through _back_off_ticket (consume retry,
+                    # transition to BACKED_OFF, schedule fresh dispatch).
+                    logger.warning(
+                        "builder hard-timeout: %s dispatched %.0fs ago "
+                        "with no completion; force-failing "
+                        "(retry consumed)",
+                        ticket.identifier, elapsed,
+                    )
+                    ticket.status = TicketStatus.FAILED
+                    ticket.last_failure_reason = "builder_hard_timeout"
+                    self.state.record_event(
+                        "ticket_failed",
+                        identifier=ticket.identifier,
+                        note=(
+                            f"builder_hard_timeout: dispatched "
+                            f"{int(elapsed)}s ago with no completion"
+                        ),
+                        reason="builder_hard_timeout",
+                    )
+                    await self._update_linear_state(ticket, "Backlog")
+                    self._release_in_flight_dispatch(ticket)
+                    updated.append(ticket)
+                    continue
                 # Not in completed or failed. Could be:
                 #   (a) still running (in mesh ``claimed``) — normal.
                 #   (b) just vanished — phantom. Force-fail after
@@ -3916,6 +4198,10 @@ class AutonomousBuildOrchestrator:
             if pr_url:
                 ticket.pr_url = pr_url
                 ticket.status = TicketStatus.PR_OPEN
+                # Sequential-discipline Fix 1: build phase is done; clear
+                # the dispatch wall-clock so a hypothetical fix-round
+                # dispatch starts with a fresh hard-timeout window.
+                ticket.dispatched_at = None
                 self.state.record_event(
                     "ticket_pr_open",
                     identifier=ticket.identifier,
@@ -4012,6 +4298,26 @@ class AutonomousBuildOrchestrator:
         # exit keeps this cheap and covers every branch above.
         if updated:
             self._last_progress_ts = time.time()
+
+        # Sequential-discipline Fix 2 (2026-04-28): garbage-collect the
+        # in-flight dispatch ledger. The ledger guards the BUILD phase
+        # (DISPATCHED + IN_PROGRESS); any ticket whose status has moved
+        # past those — to PR_OPEN, REVIEWING, MERGE_REQUESTED, FAILED,
+        # ESCALATED, BACKED_OFF, PENDING, or terminal MERGED_GREEN — has
+        # its dispatch slot released so a future re-dispatch (after
+        # retry / phantom-cleanup / wake-from-backoff / fix-round) is
+        # not blocked by a stale ledger entry. Run as a sweep at
+        # end-of-poll so every transition branch above — current and
+        # future — is automatically covered without each branch having
+        # to remember to call ``_release_in_flight_dispatch`` manually.
+        _BUILD_PHASE = frozenset({
+            TicketStatus.DISPATCHED,
+            TicketStatus.IN_PROGRESS,
+        })
+        for tid in list(self._in_flight_dispatches.keys()):
+            t = self.graph.nodes.get(tid)
+            if t is None or t.status not in _BUILD_PHASE:
+                self._in_flight_dispatches.pop(tid, None)
         return updated
 
     def _wake_backed_off_tickets(self) -> List[Ticket]:
@@ -4244,6 +4550,48 @@ class AutonomousBuildOrchestrator:
         # again on a later kickoff.
         self._consecutive_phantoms.pop(ticket.id, None)
 
+    async def _escalate_builder_hard_timeout(self, ticket: Ticket) -> None:
+        """Sequential-discipline Fix 1 (2026-04-28). Force-escalate a
+        ticket whose builder hard-timeout fired with retry budget already
+        exhausted. Mirrors ``_escalate_phantom_loop`` shape so an
+        operator handling a hard-timeout sees the same Linear surface as
+        a phantom-loop or wave-stall escalation:
+
+          1. ``ticket.status = ESCALATED`` (terminal-non-failure).
+          2. Linear → ``Backlog`` (escapes orphan-active sweep without
+             falsely claiming the ticket shipped).
+          3. Linear label → ``human-assigned`` (dispatch-gate excuses
+             the ticket on the next kickoff).
+          4. Linear comment with grounding_gap_ident=
+             ``"builder-hard-timeout"`` so the audit trail captures
+             *why* the ticket was force-failed (distinct from the
+             phantom-loop and wave-stall idents).
+
+        Idempotency guard mirrors the SAL-2893 escalate-path: skip the
+        write + label + comment if Linear is already in a non-active
+        state (operator already closed it manually, or this is re-entry
+        from rehydrated state).
+        """
+        ticket.status = TicketStatus.ESCALATED
+        ticket.last_failure_reason = None
+        # Drop child task id since we're abandoning the dispatch entirely;
+        # ESCALATED is terminal so re-attach is impossible on this run.
+        ticket.child_task_id = None
+        ticket.dispatched_at = None
+        already_terminal = (ticket.linear_state or "").strip().lower() in (
+            "backlog",
+            "done", "merged", "released", "completed",
+            "canceled", "cancelled", "duplicate",
+        )
+        if not already_terminal:
+            await self._update_linear_state(ticket, "Backlog")
+            await self._apply_linear_label(ticket, "human-assigned")
+            await self._post_escalated_linear_comment(
+                ticket,
+                grounding_gap_ident="builder-hard-timeout",
+            )
+            ticket.linear_state = "Backlog"
+
     async def _maybe_force_pass_stalled_wave(
         self,
         wave_n: int,
@@ -4384,6 +4732,12 @@ class AutonomousBuildOrchestrator:
         # forward across retries (a fix-round dispatch may legitimately
         # update the same PR rather than open a new one).
         ticket.child_task_id = None
+        # Sequential-discipline Fix 1 + Fix 2 (2026-04-28): clear the
+        # dispatch wall-clock + release the in-flight dispatch ledger so
+        # the next dispatch starts cleanly with a fresh ``dispatched_at``
+        # and the idempotency guard accepts the new attempt.
+        ticket.dispatched_at = None
+        self._release_in_flight_dispatch(ticket)
         # SAL-2870 phantom-child carve-out (2026-04-26): ensure the
         # phantom tag doesn't leak into a real BACKED_OFF cycle. The
         # carve-out path in the sweep already routes phantom-tagged
@@ -4439,6 +4793,15 @@ class AutonomousBuildOrchestrator:
         # child. Mirrors _back_off_ticket so the dispatch path can't see
         # a stale id and re-trip phantom detection on the next tick.
         ticket.child_task_id = None
+        # Sequential-discipline Fix 1 + Fix 2 (2026-04-28): also clear
+        # ``dispatched_at`` and release the in-flight ledger so the
+        # immediate fresh dispatch the carve-out enables is not blocked
+        # by either guard. ``dispatch_attempts`` is intentionally NOT
+        # reset — the fallback chain should still rotate on the next
+        # attempt even after a phantom-cleanup, since the phantom may
+        # itself be a symptom of the model the previous attempt used.
+        ticket.dispatched_at = None
+        self._release_in_flight_dispatch(ticket)
         reason = ticket.last_failure_reason
         ticket.last_failure_reason = None
         logger.warning(

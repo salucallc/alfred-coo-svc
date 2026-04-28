@@ -154,11 +154,28 @@ class Ticket:
     # review_changes) still pass through the BACKED_OFF cooling window.
     # Cleared by the sweep once handled so it doesn't leak across rounds.
     # Values currently emitted by orchestrator: ``"phantom_child"`` (AB-17-x
-    # force-fail) + ``"no_child_task_id"`` (AB-17-y orphan-active force-fail).
+    # force-fail) + ``"no_child_task_id"`` (AB-17-y orphan-active force-fail) +
+    # ``"builder_hard_timeout"`` (sequential-discipline Fix 1: dispatched but
+    # silent for >BUILDER_HARD_TIMEOUT_SEC; consumes retry budget).
     # ``None`` when the ticket has never failed in this run.
     last_failure_reason: Optional[str] = None
     # Raw Linear state name for debugging / resume logic.
     linear_state: str = ""
+    # sequential-discipline Fix 1 (2026-04-28). Wall-clock when the most
+    # recent ``_dispatch_child`` succeeded; consumed by ``_poll_children``'s
+    # builder hard-timeout branch (force-fail w/ retry consumed when a
+    # builder is dispatched but produces no completion within
+    # ``BUILDER_HARD_TIMEOUT_SEC``). Cleared on terminal transition out of
+    # an active state. ``None`` when no live dispatch is outstanding.
+    dispatched_at: Optional[float] = None
+    # sequential-discipline Fix 3 (2026-04-28). Monotonic counter of
+    # ``_dispatch_child`` calls for this ticket across the run. Read by the
+    # builder fallback chain in ``_dispatch_child`` to round-robin through
+    # ``builder_fallback_chain``: attempt 0 → first model in chain, attempt
+    # 1 → second, etc. Distinct from ``retry_count`` (which counts
+    # BACKED_OFF cycles, NOT dispatches): a single retry can produce
+    # multiple dispatches if a phantom-cleanup short-circuits BACKED_OFF.
+    dispatch_attempts: int = 0
 
 
 @dataclass
