@@ -243,8 +243,6 @@ def select_model(task: dict, persona) -> str:
     # (2) Legacy tag shortcuts.
     if "[tag:strategy]" in title:
         return "deepseek-v3.2:cloud"
-    if "[tag:code]" in title:
-        return "qwen3-coder:480b-cloud"
 
     # (3) Model registry.
     if role is not None:
