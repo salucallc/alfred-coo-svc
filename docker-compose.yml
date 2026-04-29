@@ -44,7 +44,14 @@ services:
       SOUL_NODE_ID: ${SOUL_NODE_ID:-oracle}
       SOUL_HARNESS: ${SOUL_HARNESS:-alfred-coo-svc}
       SOUL_API_URL: ${SOUL_API_URL:-http://100.105.27.63:8080}
-      SOUL_API_URLS: ${SOUL_API_URLS:-http://100.105.27.63:8080,https://soul-svc-1006583428928.us-central1.run.app}
+      # NOTE: SOUL_API_URLS is intentionally NOT set here. pydantic-settings
+      # 2.x parses list-typed env vars as JSON before our @field_validator
+      # split-by-comma runs, so a comma-separated default like
+      # "http://a,https://b" trips JSONDecodeError on boot. Letting the env
+      # var be unset means the daemon falls back to the Python field
+      # default in src/alfred_coo/config.py:Settings.soul_api_urls (already
+      # the canonical [Oracle, Cloud Run] chain). To override, put a JSON
+      # array in .env: SOUL_API_URLS=["http://...", "https://..."]
 
     # State persistence. The daemon writes artifacts + workspaces +
     # cron state under /var/lib/alfred-coo. Match the host layout used
