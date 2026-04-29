@@ -1,49 +1,94 @@
-# docker-compose.yml — single-service compose for alfred-coo-svc.
+# Saluca cockpit bundle: alfred-coo-svc + soul-svc + alfred-portal (cockpit)
 #
-# Two intended use cases:
+# Daily-driver install:
 #
-#   1. Oracle sidecar deploy. The systemd unit `alfred-coo.service` (venv
-#      install at /opt/alfred-coo) keeps running as the canonical instance
-#      while this compose stands the GHCR image up alongside it on a
-#      different host port (8091 -> 8090) and a different container name
-#      so the two never collide on /var/lib/alfred-coo or port 8090.
-#      Cutover from systemd -> container is a follow-up, not this PR.
+#   git clone https://github.com/salucallc/alfred-coo-svc
+#   cd alfred-coo-svc
+#   cp alfred-coo.env.example alfred-coo.env
+#   cp soul-svc.env.example  soul-svc.env
+#   # ...edit both .env files, fill in secrets...
+#   docker compose up -d
 #
-#   2. Cristian's local daily-driver cockpit. Boots the daemon against a
-#      remote soul-svc (Oracle primary, Cloud Run fallback) so the COO
-#      agent fleet runs from his laptop with shared mesh state.
+# Brings up three services on the host:
+#   - http://localhost:3000    cockpit        (alfred-portal Next.js UI)
+#   - http://localhost:8091    alfred-coo     (FastAPI daemon, /healthz)
+#   - http://localhost:8080    soul-svc       (FastAPI memory graph, /health)
 #
-# For the full multi-service appliance bundle (Caddy + alfred-portal +
-# soul-svc + MCP services + open-webui + postgres) see
-# deploy/appliance/docker-compose.yml.
+# State is persisted to ./state/alfred-coo (alfred-coo daemon) and a docker
+# volume for soul-svc. `docker compose down` stops the stack without
+# clobbering that state; `docker compose down -v` wipes the soul volume too.
+#
+# Update path: `docker compose pull && docker compose up -d`.
+
+x-defaults: &defaults
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
 
 services:
-  alfred-coo-svc:
-    image: ghcr.io/salucallc/alfred-coo-svc:${ALFRED_COO_TAG:-latest}
-    container_name: alfred-coo-svc
-    restart: unless-stopped
-
-    # Sidecar mode: bind to a different host port than the systemd
-    # instance (systemd owns 8090). HEALTH_PORT inside the container
-    # stays 8090; only the host-side mapping shifts.
+  soul-svc:
+    <<: *defaults
+    image: ghcr.io/salucallc/soul-svc:${SOUL_SVC_TAG:-latest}
+    container_name: soul-svc
     ports:
-      - "${ALFRED_COO_HEALTH_PORT_HOST:-8091}:8090"
-
-    # Pull every secret + URL from .env. The full required set lives in
-    # /etc/alfred-coo/.env on Oracle; locally Cristian copies that file
-    # to ./.env. pydantic-settings reads it in either case.
+      - "${SOUL_PORT:-8080}:8080"
     env_file:
-      - .env
+      # Per-service env file is the canonical source. Optional so a
+      # bare `docker compose up` doesn't error out when running on the
+      # Oracle deploy host (which uses /opt/alfred-coo/.env for legacy
+      # systemd compatibility — see the alfred-coo block below).
+      - path: ./soul-svc.env
+        required: false
+      - path: ./.env
+        required: false
+    volumes:
+      - soul-svc-state:/var/lib/soul-svc
+    healthcheck:
+      # soul-svc exposes /health (not /healthz). The image base
+      # (python:3.12-slim) does not include curl, so we use the bundled
+      # python interpreter for the probe instead.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
-    # Belt-and-suspenders: even if .env is missing a key, give the
-    # daemon enough to boot in degraded mode and surface the error.
+  alfred-coo:
+    <<: *defaults
+    image: ghcr.io/salucallc/alfred-coo-svc:${ALFRED_COO_TAG:-latest}
+    container_name: alfred-coo
+    depends_on:
+      soul-svc:
+        condition: service_healthy
+    ports:
+      # Container always serves on 8090; the host-side mapping is 8091 by
+      # default so this never collides with a systemd-managed instance on
+      # 8090. Override with ALFRED_COO_PORT in alfred-coo.env if you want
+      # a different host port.
+      - "${ALFRED_COO_PORT:-8091}:8090"
+    env_file:
+      # alfred-coo.env is the canonical bundle file; .env is the legacy
+      # path used by the Oracle systemd deploy (PR #295). Both optional
+      # so the stack boots in any host environment, with .env winning
+      # when both exist (Compose merges in order, last-write-wins).
+      - path: ./alfred-coo.env
+        required: false
+      - path: ./.env
+        required: false
     environment:
+      # Belt-and-suspenders: even if the env file is missing a key, give
+      # the daemon enough to boot in degraded mode and surface the error.
       LOG_FORMAT: ${LOG_FORMAT:-json}
       HEALTH_PORT: "8090"
       SOUL_SESSION_ID: ${SOUL_SESSION_ID:-alfred-coo}
-      SOUL_NODE_ID: ${SOUL_NODE_ID:-oracle}
+      SOUL_NODE_ID: ${SOUL_NODE_ID:-local}
       SOUL_HARNESS: ${SOUL_HARNESS:-alfred-coo-svc}
-      SOUL_API_URL: ${SOUL_API_URL:-http://100.105.27.63:8080}
+      # Pin the daemon to the in-stack soul-svc by default. The .env
+      # file can still override via SOUL_API_URL.
+      SOUL_API_URL: ${SOUL_API_URL:-http://soul-svc:8080}
       # NOTE: SOUL_API_URLS is intentionally NOT set here. pydantic-settings
       # 2.x parses list-typed env vars as JSON before our @field_validator
       # split-by-comma runs, so a comma-separated default like
@@ -52,14 +97,13 @@ services:
       # default in src/alfred_coo/config.py:Settings.soul_api_urls (already
       # the canonical [Oracle, Cloud Run] chain). To override, put a JSON
       # array in .env: SOUL_API_URLS=["http://...", "https://..."]
-
-    # State persistence. The daemon writes artifacts + workspaces +
-    # cron state under /var/lib/alfred-coo. Match the host layout used
-    # by the systemd unit so a future cutover is a `docker stop` away.
     volumes:
-      - ${ALFRED_COO_STATE_DIR:-./state}:/var/lib/alfred-coo
-
-    # Healthcheck hits the FastAPI health server on port 8090 inside.
+      # State persistence. Defaults to ./state/alfred-coo on a
+      # bundle-style local install (one subdir per service under the
+      # shared ./state/). The Oracle runner deploy overrides this to
+      # /var/lib/alfred-coo so it lines up with the systemd unit's
+      # state path and a future cutover is a `docker stop` away.
+      - ${ALFRED_COO_STATE_DIR:-./state/alfred-coo}:/var/lib/alfred-coo
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).status == 200 else 1)"]
       interval: 30s
@@ -67,11 +111,22 @@ services:
       retries: 5
       start_period: 30s
 
-    # Logs go to journald via the docker daemon's default driver. Cap
-    # the json-file driver if it falls back so a runaway loop doesn't
-    # eat the boot disk.
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+  cockpit:
+    <<: *defaults
+    image: ghcr.io/salucallc/alfred-portal:${COCKPIT_TAG:-latest}
+    container_name: cockpit
+    depends_on:
+      alfred-coo:
+        condition: service_healthy
+    ports:
+      - "${COCKPIT_PORT:-3000}:3000"
+    environment:
+      # Cockpit runs in the user's browser, so the API URL must be
+      # reachable from the host (not from inside the docker network).
+      NEXT_PUBLIC_ALFRED_COO_URL: ${NEXT_PUBLIC_ALFRED_COO_URL:-http://localhost:${ALFRED_COO_PORT:-8091}}
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+
+volumes:
+  soul-svc-state:
