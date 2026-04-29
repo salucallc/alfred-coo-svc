@@ -3595,12 +3595,30 @@ class AutonomousBuildOrchestrator:
                 )
                 if existing_pr is not None:
                     self._pr_exists_skips += 1
-                    logger.info(
-                        "skipping dispatch: PR #%d exists for ticket %s, "
-                        "awaiting Hawkman review (skips=%d)",
-                        existing_pr, ticket.identifier,
-                        self._pr_exists_skips,
+                    # Inherited-PR review-fire (Gap 2, 2026-04-29): when an
+                    # orchestrator inherits open PRs from a prior run, the
+                    # builder->PR transition path in `_poll_children` never
+                    # fires for them, so `_dispatch_review` was never called
+                    # and the PRs sat forever in this skip loop. The helper
+                    # registers an existing Hawkman QA task or fires a fresh
+                    # one as appropriate; idempotent on `state.review_task_ids`.
+                    review_task_id = await self._fire_review_for_inherited_pr(
+                        ticket, existing_pr=existing_pr,
                     )
+                    if review_task_id:
+                        logger.info(
+                            "PR #%d exists for %s; review task %s "
+                            "registered, awaiting verdict (skips=%d)",
+                            existing_pr, ticket.identifier,
+                            review_task_id, self._pr_exists_skips,
+                        )
+                    else:
+                        logger.info(
+                            "skipping dispatch: PR #%d exists for ticket %s, "
+                            "awaiting Hawkman review (skips=%d)",
+                            existing_pr, ticket.identifier,
+                            self._pr_exists_skips,
+                        )
                     self.state.record_event(
                         "pr_exists_skip",
                         identifier=ticket.identifier,
@@ -8098,6 +8116,115 @@ class AutonomousBuildOrchestrator:
             if "/pull/" in url:
                 urls.append(url)
         return urls
+
+    # ── Inherited-PR review-fire (Gap 2, 2026-04-29) ────────────────────────
+
+    async def _find_review_task_for_ticket(
+        self, ticket_ident: str,
+    ) -> Optional[str]:
+        """Return the mesh-task id of an open Hawkman QA review task whose
+        title mentions ``ticket_ident``, else None.
+
+        Used by the inherited-open-PR branch of ``_dispatch_wave`` to avoid
+        firing a duplicate review when one is already pending or claimed
+        on the mesh (e.g. a prior orchestrator run dispatched a review and
+        we just inherited the open PR). Walks ``pending`` then ``claimed``
+        and returns the first match. Failures bubble up — the caller
+        wraps the call in try/except and degrades gracefully.
+        """
+        if not ticket_ident:
+            return None
+        for status in ("pending", "claimed"):
+            tasks = await self.mesh.list_tasks(status=status, limit=200)
+            if not tasks:
+                continue
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                title = (task.get("title") or "")
+                if "[persona:hawkman-qa-a]" not in title:
+                    continue
+                if ticket_ident not in title:
+                    continue
+                tid = task.get("id")
+                if tid:
+                    return str(tid)
+        return None
+
+    async def _fire_review_for_inherited_pr(
+        self, ticket: Ticket, *, existing_pr: int,
+    ) -> Optional[str]:
+        """Ensure a Hawkman QA review task exists for ``ticket`` and is
+        registered in ``state.review_task_ids``.
+
+        Resolution order:
+          1. If ``state.review_task_ids[ticket.id]`` is already set, the
+             current run already registered a review — return that id as
+             a no-op (idempotent).
+          2. Otherwise look up the mesh for an open Hawkman QA task
+             matching the ticket identifier. If found, register it.
+          3. Otherwise fire a fresh ``_dispatch_review`` and let it
+             populate ``state.review_task_ids`` itself.
+
+        Returns the registered review task id, or None on failure (mesh
+        outage, dispatch raise) — the caller falls back to the original
+        skip-only log line in that case.
+        """
+        existing = self.state.review_task_ids.get(ticket.id)
+        if existing:
+            return str(existing)
+
+        review_task_id: Optional[str] = None
+        try:
+            review_task_id = await self._find_review_task_for_ticket(
+                ticket.identifier,
+            )
+        except Exception:
+            logger.exception(
+                "[inherited-pr] mesh lookup failed for %s",
+                ticket.identifier,
+            )
+            review_task_id = None
+
+        if review_task_id:
+            ticket.review_task_id = str(review_task_id)
+            self.state.review_task_ids[ticket.id] = str(review_task_id)
+            self.state.record_event(
+                "inherited_review_registered",
+                identifier=ticket.identifier,
+                review_task_id=str(review_task_id),
+                pr_number=existing_pr,
+            )
+            return str(review_task_id)
+
+        # No existing review on the mesh — fire one. Synthesize a
+        # placeholder pr_url if the ticket lacks one (typical for a
+        # rehydrated ticket whose prior orchestrator run never persisted
+        # `state.pr_urls` for this PR); `_dispatch_review` interpolates
+        # this string into the review-task body.
+        if not ticket.pr_url:
+            ticket.pr_url = (
+                f"https://github.com/salucallc/_/pull/{existing_pr}"
+            )
+        try:
+            await self._dispatch_review(ticket)
+        except Exception:
+            logger.exception(
+                "[inherited-pr] _dispatch_review failed for %s; "
+                "retaining skip behaviour",
+                ticket.identifier,
+            )
+            return None
+
+        fired_id = self.state.review_task_ids.get(ticket.id)
+        if fired_id:
+            self.state.record_event(
+                "inherited_review_fired",
+                identifier=ticket.identifier,
+                review_task_id=fired_id,
+                pr_number=existing_pr,
+            )
+        return fired_id
 
     # ── SAL-3038 PR-exists short-circuit (2026-04-28) ───────────────────────
 
