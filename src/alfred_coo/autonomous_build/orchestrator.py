@@ -3424,6 +3424,25 @@ class AutonomousBuildOrchestrator:
         if hasattr(self.state, "no_progress_since"):
             self._no_progress_since = self.state.no_progress_since
 
+        # Phantom-child fix (2026-04-29): ``_in_flight_dispatches`` is a
+        # process-local idempotency ledger keyed by ticket.id. It is NEVER
+        # persisted, so a daemon restart leaves it empty even though
+        # ``state.dispatched_child_tasks`` rehydrated live ``child_task_id``
+        # values onto the graph above. The wave-cadence log still counts
+        # those tickets as ``in_flight`` (status-based) — the result is the
+        # observed phantom: ``in_flight=N spend=$0.00`` with no visible
+        # mesh activity, sitting until ``STUCK_CHILD_FORCE_FAIL_SEC`` (30
+        # min) fires the AB-17-y orphan-active sweep. Rebuild the ledger
+        # from the rehydrated graph so the next dispatch tick sees a
+        # consistent in-flight view.
+        for node in self.graph.nodes.values():
+            if node.child_task_id and node.id not in self._in_flight_dispatches:
+                self._in_flight_dispatches[node.id] = node.child_task_id
+        logger.info(
+            "[hydrate] rebuilt _in_flight_dispatches: %d entries",
+            len(self._in_flight_dispatches),
+        )
+
     def _snapshot_graph_into_state(self) -> None:
         """Copy current ticket statuses + child ids onto `self.state` before
         we checkpoint. Also bumps `_ticket_transition_ts` for tickets whose
@@ -4024,7 +4043,17 @@ class AutonomousBuildOrchestrator:
         )
         if not isinstance(resp, dict) or not resp.get("id"):
             raise RuntimeError(f"mesh create_task returned no id: {resp!r}")
-        ticket.child_task_id = resp["id"]
+        # Phantom-child fix (2026-04-29): register the in-flight child
+        # IMMEDIATELY after id-validation, BEFORE writing it onto the
+        # ticket. Defense-in-depth: if any subsequent assignment in this
+        # block raises (e.g. the outer ``_run_dispatch_loop`` handler has
+        # historically swallowed silently), the ledger still reflects the
+        # dispatched mesh task and the next dispatch tick refuses a
+        # duplicate. The hydrate-rebuild loop in ``_apply_restored_status``
+        # closes the restart-time gap; this close the in-process gap.
+        new_child_task_id = resp["id"]
+        self._in_flight_dispatches[ticket.id] = new_child_task_id
+        ticket.child_task_id = new_child_task_id
         ticket.status = TicketStatus.DISPATCHED
         # Sequential-discipline Fix 1: stamp the dispatch wall-clock so
         # ``_poll_children``'s hard-timeout branch can fire. Use
@@ -4032,9 +4061,6 @@ class AutonomousBuildOrchestrator:
         # restored-state ticket from a prior daemon process can compare
         # against ``ticket.dispatched_at`` consistently.
         ticket.dispatched_at = time.time()
-        # Sequential-discipline Fix 2: register the in-flight child so a
-        # subsequent dispatch attempt (from any code path) is refused.
-        self._in_flight_dispatches[ticket.id] = ticket.child_task_id
         # Sequential-discipline Fix 3: increment the attempt counter so
         # the next dispatch (if any) lands on the next model in the chain.
         ticket.dispatch_attempts += 1
