@@ -4813,17 +4813,52 @@ class AutonomousBuildOrchestrator:
                 #       but no PR URL — model called the wrong tool, or
                 #       summarised work without committing it.
                 if self._envelope_is_silent_complete(result):
+                    # silent_with_tools recovery (2026-04-29): rather than
+                    # marking the ticket FAILED on the first empty envelope,
+                    # walk the builder.fallback_chain and re-dispatch with
+                    # the next model. gpt-oss:120b-cloud's silent-with-tools
+                    # rate is ~16% baseline and 50%+ under load; rolling to
+                    # the next chain entry recovers the ticket without
+                    # burning the 2-slot retry budget on a model-specific
+                    # cognition failure. Hard cap at 4 attempts (primary +
+                    # 3 fallbacks) so an entire chain of broken models
+                    # eventually lands in terminal FAILED.
+                    next_model = self._pick_next_fallback_model(
+                        "builder", attempt=ticket.dispatch_attempts,
+                    )
+                    if next_model and ticket.dispatch_attempts < 4:
+                        await self._redispatch_child_with_model(ticket, next_model)
+                        logger.info(
+                            "silent_with_tools: re-dispatched %s with %s "
+                            "(attempt %d/4)",
+                            ticket.identifier,
+                            next_model,
+                            ticket.dispatch_attempts + 1,
+                        )
+                        updated.append(ticket)
+                        continue
+                    # Chain exhausted (or no next model resolvable) — fall
+                    # through to terminal FAILED so the wave-gate sees the
+                    # ticket and operators get the audit trail. Keep the
+                    # legacy ``silent_complete`` event-reason so existing
+                    # ops dashboards + greps remain valid; the explicit
+                    # ``silent_with_tools_chain_exhausted`` shape is stamped
+                    # on ``ticket.last_failure_reason`` for callers that
+                    # need to distinguish first-shot silent from
+                    # chain-end silent.
                     failure_reason = "silent_complete"
                     failure_note = (
                         "envelope rejected: silent-complete shape "
                         "(empty summary + no PR + no follow-up). "
-                        "Likely tool-loop hit MAX_TOOL_ITERATIONS or "
-                        "model returned without calling propose_pr."
+                        "silent_with_tools chain exhausted after "
+                        f"{ticket.dispatch_attempts} attempts."
                     )
+                    ticket.last_failure_reason = "silent_with_tools_chain_exhausted"
                     logger.error(
-                        "SAL-2978: %s envelope rejected as silent_complete; "
+                        "SAL-2978: %s envelope rejected as silent_complete "
+                        "(silent_with_tools chain exhausted after %d attempts); "
                         "result_keys=%s truncated=%s",
-                        ticket.identifier,
+                        ticket.identifier, ticket.dispatch_attempts,
                         list(result.keys()) if isinstance(result, dict) else "non-dict",
                         result.get("truncated") if isinstance(result, dict) else None,
                     )
@@ -5587,6 +5622,97 @@ class AutonomousBuildOrchestrator:
             if isinstance(out, dict) and out.get("identifier"):
                 return str(out["identifier"])
         return None
+
+    def _pick_next_fallback_model(
+        self, role: str, attempt: int,
+    ) -> Optional[str]:
+        """Return the model name at chain index ``attempt`` (0-indexed) for
+        ``role``, or ``None`` once the chain is exhausted.
+
+        Consults the on-disk ``model_registry.yaml`` first via
+        ``_pick_model_for_role`` so the registry's ``primary`` /
+        ``fallback_chain`` / ``last_resort`` shape (and any active
+        ``stable_baseline`` auto-rollback) is honoured. Falls back to the
+        in-memory ``self.builder_fallback_chain`` when the registry is
+        absent or doesn't define the role.
+
+        Hard cap: returns ``None`` once ``attempt`` reaches ``len(chain)``
+        on either source so callers can bound the silent_with_tools retry
+        loop at exactly N attempts (primary + N-1 fallbacks).
+        """
+        # Registry path. ``_pick_model_for_role`` interprets attempt_n=0
+        # as primary, n=1 as fallback_chain[0], etc. The chain end returns
+        # ``last_resort``; we treat every well-defined slot as valid up to
+        # the documented chain length to enforce the hard cap on the caller.
+        try:
+            from .model_registry import _pick_model_for_role, _load_model_registry
+            reg = _load_model_registry()
+        except Exception:  # noqa: BLE001
+            reg = None
+        if reg is not None:
+            roles = reg.get("roles") or {}
+            role_block = roles.get(role)
+            if isinstance(role_block, dict):
+                chain = list(role_block.get("fallback_chain") or [])
+                # Total slots = primary (1) + fallback_chain entries.
+                total_slots = 1 + len(chain)
+                if attempt >= total_slots:
+                    return None
+                try:
+                    return _pick_model_for_role(role, attempt_n=attempt, registry=reg)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "model_registry pick failed for role=%s attempt=%d; "
+                        "falling through to in-memory chain",
+                        role, attempt,
+                    )
+
+        # In-memory fallback chain path. Used when no registry is on disk
+        # or the registry doesn't define the requested role.
+        if role != "builder":
+            return None
+        chain_mem = self.builder_fallback_chain
+        if not chain_mem or attempt < 0 or attempt >= len(chain_mem):
+            return None
+        return chain_mem[attempt]
+
+    async def _redispatch_child_with_model(
+        self, ticket: Ticket, next_model: str,
+    ) -> None:
+        """Re-queue ``ticket`` for dispatch on the next ``_dispatch_wave``
+        tick after a silent_with_tools completion. Mirrors the lightweight
+        no-penalty re-dispatch path used by ``_reset_phantom_failure``:
+
+        - status flips to PENDING so the dispatch loop picks it up next
+          tick. A subsequent wave-tick calls ``_dispatch_child`` which
+          reads the next model from ``builder_fallback_chain`` via the
+          already-incremented ``dispatch_attempts`` counter.
+        - ``child_task_id`` and ``dispatched_at`` are cleared so the next
+          dispatch starts cleanly with a fresh wall-clock + child id.
+        - in-flight dispatch ledger entry is released so the idempotency
+          guard in ``_dispatch_child`` accepts the new attempt.
+        - ``retry_count`` is NOT incremented. silent_with_tools is a
+          model-specific failure mode, not a real build failure; the
+          per-ticket retry budget is reserved for genuine build/review
+          loops. Cap is enforced separately by the caller via the
+          ``dispatch_attempts < 4`` gate.
+
+        ``next_model`` is recorded on the audit trail via
+        ``state.record_event`` so operators can grep the chain progression
+        without inspecting orchestrator memory.
+        """
+        prior_child = ticket.child_task_id
+        ticket.status = TicketStatus.PENDING
+        ticket.child_task_id = None
+        ticket.dispatched_at = None
+        self._release_in_flight_dispatch(ticket)
+        self.state.record_event(
+            "ticket_silent_with_tools_redispatch",
+            identifier=ticket.identifier,
+            attempt=ticket.dispatch_attempts,
+            next_model=next_model,
+            prior_child_task_id=prior_child,
+        )
 
     async def _dispatch_review(self, ticket: Ticket) -> None:
         """Fire a `[persona:hawkman-qa-a]` child task to review the PR.
