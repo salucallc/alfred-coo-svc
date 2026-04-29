@@ -207,6 +207,30 @@ def test_parse_code_underscore_normalised_to_dash() -> None:
     assert _parse_code("C_26: legacy underscore") == "C-26"
 
 
+@pytest.mark.parametrize(
+    "title, expected",
+    [
+        # Hint-batch-2: alfred-doctor children use a letters-only suffix
+        # (`AD-a` … `AD-h`, no digits). Without the second alternation
+        # branch in _CODE_RE these fell into no_hint_no_code and stalled
+        # on wave-3 (SAL-3281..3288).
+        ("[AD-a] Ingest service + SQLite timeseries schema", "AD-A"),
+        ("[AD-h] Dashboard integration (v8-doctor route)", "AD-H"),
+        ("AD_d underscore variant", "AD-D"),
+        # Out-of-range suffix must NOT match — only a..h are valid for the
+        # alfred-doctor epic. Anything else falls through to the standard
+        # alternation (which requires digits → empty).
+        ("AD-i should not match", ""),
+        ("AD-z also no match", ""),
+    ],
+)
+def test_parse_code_alfred_doctor_letter_suffix(title: str, expected: str) -> None:
+    """Hint-batch-2: _CODE_RE recognises AD-[a-h] (letters only, no
+    digits) so the alfred-doctor children resolve to a real plan-doc
+    code and pick up their _TARGET_HINTS entry."""
+    assert _parse_code(title) == expected
+
+
 def test_parse_code_empty_title_returns_empty() -> None:
     """Empty-title guard: no crash, empty string, orchestrator fallback
     emits the escalate line."""

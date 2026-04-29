@@ -88,8 +88,17 @@ KNOWN_EPICS: frozenset[str] = frozenset(
 # "F08: soul-lite service..." parsed to an empty code, leaving the child
 # with no grep anchor (→ scope fabrication; live-run regression on
 # SAL-2616, 2026-04-23).
+#
+# Hint-batch-2 (SAL-3281..3288): added a letters-only branch for the
+# alfred-doctor children, whose plan-doc codes are `AD-a` … `AD-h` (no
+# digits — pure letter suffix). The standard `\d{1,3}[A-Za-z]?` form
+# requires at least one digit and so previously skipped them, leaving 8
+# wave-3 tickets in the no_hint_no_code bucket.
 _CODE_RE = re.compile(
-    r"\b(TIR|ALT|FLEET|OPS|SS|AB|MC|SG|C|D|E|F|H)[-_]?(\d{1,3}[A-Za-z]?)\b",
+    r"\b("
+    r"(?:TIR|ALT|FLEET|OPS|SS|AB|MC|SG|C|D|E|F|H)[-_]?\d{1,3}[A-Za-z]?"
+    r"|AD[-_][a-h]"
+    r")\b",
     re.IGNORECASE,
 )
 
