@@ -76,6 +76,13 @@ jobs:
           set -euo pipefail
           cd /opt/alfred-coo
 
+          # /opt/alfred-coo is owned by alfredcoo (uid 999); the runner
+          # container executes as root, so git's dubious-ownership guard
+          # blocks fetch/checkout. Mark the dir safe for this user so
+          # git ops succeed. Idempotent: --add against a duplicate value
+          # is a no-op on git >= 2.31.
+          git config --global --add safe.directory /opt/alfred-coo
+
           # Pull the docker-compose.yml that landed on main (PR #296+).
           # Use fetch + checkout-from-FETCH_HEAD so we don't disturb any
           # local working state in the alfredcoo-owned checkout.
