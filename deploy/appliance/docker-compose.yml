@@ -89,6 +89,19 @@ services:
     depends_on:
       soul-svc:
         condition: service_healthy
+    # State persistence — artifacts.py and tools.py hardcode
+    # /var/lib/alfred-coo as the artifact + workspace root. Mounting a
+    # named volume keeps cron_state.json + workspaces/ + artifacts/
+    # across container restarts and matches the layout of the systemd
+    # canonical instance, so cutover is a no-op data-wise.
+    volumes:
+      - alfred_coo_state:/var/lib/alfred-coo
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - mc-internal
       - mc-egress
@@ -208,6 +221,7 @@ volumes:
   prometheus_data:
   loki_data:
   restic_data:
+  alfred_coo_state:
 
 networks:
   appliance:
