@@ -107,20 +107,38 @@ jobs:
           # Recreate (or no-op) the container with the resolved tag.
           docker compose up -d --remove-orphans
 
-          # Wait up to ~30s for the container to report healthy on the
-          # host-side port (8091). Container-side healthcheck hits 8090
-          # internally, so docker's own status is the source of truth;
-          # the curl is a belt-and-suspenders check.
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            if curl -fsS http://localhost:8091/healthz > /dev/null 2>&1; then
+          # Wait up to ~75s for the container to report healthy. The
+          # runner runs inside its own container with isolated loopback,
+          # so `curl http://localhost:8091/...` from this shell would
+          # resolve to the RUNNER's loopback (no listener), not the
+          # host port. Instead, query docker directly through the
+          # mounted host socket and read the container's healthcheck
+          # state. Compose healthcheck has start_period=30s + first
+          # interval=30s, so the first healthy mark typically lands
+          # ~60s in.
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            # `docker inspect -f '{{.State.Health.Status}}'` returns
+            # one of: starting | healthy | unhealthy. If the container
+            # has no healthcheck defined the format spits "<no value>"
+            # and we treat that as a fallback success on State.Running.
+            health=$(docker inspect -f '{{.State.Health.Status}}' alfred-coo-svc 2>/dev/null || echo "missing")
+            running=$(docker inspect -f '{{.State.Running}}' alfred-coo-svc 2>/dev/null || echo "false")
+            echo "attempt ${i}: health=${health} running=${running}"
+            if [ "$health" = "healthy" ]; then
               echo "container healthy on attempt ${i}"
               docker compose ps
               exit 0
             fi
-            sleep 3
+            if [ "$health" = "unhealthy" ]; then
+              echo "::error::container reported unhealthy on attempt ${i}"
+              docker compose ps
+              docker compose logs --tail=80 alfred-coo-svc
+              exit 1
+            fi
+            sleep 5
           done
 
-          echo "::error::container failed to become healthy on :8091 within ~30s"
+          echo "::error::container failed to become healthy within ~75s"
           docker compose ps
           docker compose logs --tail=80 alfred-coo-svc
           exit 1
