@@ -1009,6 +1009,12 @@ async def test_envelope_validator_rejects_silent_complete(monkeypatch, caplog):
     t.status = TicketStatus.DISPATCHED
     t.child_task_id = "child-silent-1"
     t.retry_budget = 0  # pin terminal-FAILED behaviour for the assertion
+    # silent_with_tools recovery (2026-04-29): the silent-complete branch
+    # now redispatches with the next chain model unless dispatch_attempts
+    # has hit the 4-attempt hard cap. Pin attempts past the cap so this
+    # legacy regression test still asserts the terminal-FAILED shape on
+    # the chain-exhausted exit.
+    t.dispatch_attempts = 4
     _seed_graph(orch, [t])
 
     linear_calls = []
