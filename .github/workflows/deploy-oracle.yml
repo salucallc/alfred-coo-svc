@@ -1,0 +1,65 @@
+name: Deploy to Oracle
+
+# Self-hosted runner version (replaces the HMAC webhook flow that PR #292
+# proposed on feature/deploy-automation). PR #292 should be superseded by
+# this PR.
+#
+# NOTE — alfred-coo on Oracle currently runs as a venv + systemd unit
+# (alfred-coo.service), not via docker compose. The publish.yml workflow
+# does build an image to ghcr.io/salucallc/alfred-coo-svc, but until
+# /opt/alfred-coo gets a docker-compose.yml that references it, the deploy
+# step here is a no-op placeholder. Workflow shape is correct so we can
+# flip the deploy logic in a follow-up the moment containerization lands
+# (target: SAL-XXXX, container-as-primary-interface track).
+#
+# Trigger: workflow_run on the publish workflow, mirroring the soul-svc
+# pattern. workflow_dispatch is supported for manual smoke tests.
+on:
+  workflow_run:
+    workflows: ["Publish daemon image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA to deploy (defaults to current HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Pull image + restart alfred-coo on Oracle
+    runs-on: [self-hosted, oracle]
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - name: Resolve target SHA
+        id: sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          elif [ -n "${{ inputs.sha }}" ]; then
+            FULL_SHA="${{ inputs.sha }}"
+          else
+            FULL_SHA="${{ github.sha }}"
+          fi
+          SHORT_SHA="${FULL_SHA:0:7}"
+          echo "full=${FULL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved SHA: full=${FULL_SHA} short=${SHORT_SHA}"
+
+      # TODO: alfred-coo-svc is not yet containerized on Oracle. The
+      # publish workflow builds an image to ghcr.io/salucallc/alfred-coo-svc
+      # but the runtime is venv + systemd (alfred-coo.service). Once
+      # /opt/alfred-coo/docker-compose.yml exists and references the GHCR
+      # image, replace this step with the soul-svc-style pull + tag + up.
+      - name: Deploy (placeholder until containerized)
+        run: |
+          echo "alfred-coo-svc not yet containerized on Oracle; deploy is a no-op."
+          echo "Image was published to ghcr.io/salucallc/alfred-coo-svc:sha-${{ steps.sha.outputs.short }}"
+          echo "TODO: switch /opt/alfred-coo to docker compose, then enable pull + restart steps."
