@@ -397,11 +397,13 @@ async def test_silent_review_retries_once(monkeypatch):
 
     monkeypatch.setattr(orch, "_dispatch_review", _counting_dispatch)
 
-    # First poll: silent → retry fires, counter=1, status stays REVIEWING.
+    # First poll: silent → retry fires, counter=1, status moves to
+    # AWAITING_REVIEW (Gap 3 2026-04-29: silent-retry lands in
+    # AWAITING_REVIEW so deadlock-grace counter excludes it).
     await orch._poll_reviews()
     assert ticket.silent_review_retries == 1
     assert redispatch_count["n"] == 1
-    assert ticket.status == TicketStatus.REVIEWING
+    assert ticket.status == TicketStatus.AWAITING_REVIEW
     events1 = [e["kind"] for e in orch.state.events]
     assert "review_silent_retry" in events1
 

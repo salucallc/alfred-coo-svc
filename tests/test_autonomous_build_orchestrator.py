@@ -1121,10 +1121,12 @@ async def test_envelope_validator_accepts_valid_envelope(monkeypatch):
 
     await orch._poll_children()
 
-    # Valid envelope → REVIEWING (PR_OPEN → REVIEWING transition fires
-    # immediately because `_dispatch_review` is stubbed).
-    assert t.status == TicketStatus.REVIEWING, (
-        f"expected REVIEWING for valid envelope, got {t.status}"
+    # Valid envelope → AWAITING_REVIEW (PR_OPEN → AWAITING_REVIEW
+    # transition fires immediately because `_dispatch_review` is stubbed).
+    # Gap 3 (2026-04-29) renamed the post-dispatch state from REVIEWING
+    # to AWAITING_REVIEW so deadlock-grace counter excludes it.
+    assert t.status == TicketStatus.AWAITING_REVIEW, (
+        f"expected AWAITING_REVIEW for valid envelope, got {t.status}"
     )
     assert t.pr_url == "https://github.com/salucallc/alfred-coo-svc/pull/123"
     # No silent_complete event recorded.
