@@ -1832,22 +1832,25 @@ def test_target_hints_keys_are_uppercase():
 # ── AB-17-a · new result types (HintStatus / PathResult / VerificationResult)
 
 
-def test_hint_status_enum_has_six_values():
-    """Plan I §2.2: exactly six terminal states — OK, REPO_MISSING,
-    PATH_MISSING, PATH_CONFLICT, UNVERIFIED, NO_HINT."""
+def test_hint_status_enum_has_seven_values():
+    """Plan I §2.2 + SAL-3281: seven terminal states — OK, REPO_MISSING,
+    PATH_MISSING, PATH_CONFLICT, NEW_PATHS_COLLISION (split out from
+    PATH_CONFLICT for partial-collision rendering), UNVERIFIED, NO_HINT."""
     values = {m.value for m in HintStatus}
     assert values == {
         "ok",
         "repo_missing",
         "path_missing",
         "path_conflict",
+        "new_paths_collision",
         "unverified",
         "no_hint",
     }
-    assert len(HintStatus) == 6
+    assert len(HintStatus) == 7
     # HintStatus is a str-Enum so JSON / soul-memory serialisation works.
     assert HintStatus.OK == "ok"
     assert isinstance(HintStatus.REPO_MISSING.value, str)
+    assert HintStatus.NEW_PATHS_COLLISION == "new_paths_collision"
 
 
 def test_path_result_dataclass_constructs():
@@ -2704,6 +2707,199 @@ def test_render_target_block_vr_none_unknown_code_matches_legacy_unresolved():
         "linear_create_issue per Step 0 of your persona protocol)\n"
     )
     assert block == expected
+
+
+# ── SAL-3281 · NEW_PATHS_COLLISION semantics (paths-must-exist vs ─────────
+# new_paths-must-not-exist split). The verifier must distinguish a
+# "scaffold pre-authored" partial collision (some new_paths already exist
+# but other new_paths are still absent) from a "work fully shipped"
+# collision (every new_paths already exists). The renderer must NOT emit
+# "STOP and escalate" for the partial case, otherwise builders for tickets
+# like AD-A (where plans/v1-ga/AD-a.md was authored by the hint sub but
+# src/alfred_coo/doctor/ingest.py is still absent) all grounding-gap
+# escalate and the wave never ships its first PR.
+
+
+async def test_verify_hint_partial_new_paths_collision_status_new_paths_collision(
+    monkeypatch,
+):
+    """SAL-3281 H4: hint with paths all-exist + new_paths split (one
+    pre-existing scaffold + several still-absent files) must aggregate to
+    NEW_PATHS_COLLISION, NOT PATH_CONFLICT. AD-A is the canonical case:
+    plan-doc scaffold present, implementation files absent."""
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/doctor/ingest.py",      # absent — real CREATE work
+            "src/alfred_coo/doctor/__init__.py",    # absent — real CREATE work
+            "plans/v1-ga/AD-a.md",                  # exists — scaffold authored
+        ),
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {})],
+        ("contents/src/alfred_coo/__init__.py", "main"): [_FakeResp(200, {})],
+        ("contents/src/alfred_coo/doctor/ingest.py", "main"): [_FakeResp(404)],
+        ("contents/src/alfred_coo/doctor/__init__.py", "main"): [_FakeResp(404)],
+        ("contents/plans/v1-ga/AD-a.md", "main"): [_FakeResp(200, {})],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("AD-A", hint)
+
+    # Partial collision → NEW_PATHS_COLLISION, NOT PATH_CONFLICT.
+    assert vr.status is HintStatus.NEW_PATHS_COLLISION, (
+        f"expected NEW_PATHS_COLLISION, got {vr.status}; "
+        f"error={vr.error!r}"
+    )
+    assert vr.repo_exists is True
+    # path_results carry the granular per-file outcome.
+    by_path = {pr.path: pr for pr in vr.path_results}
+    assert by_path["plans/v1-ga/AD-a.md"].observed == "exist"
+    assert by_path["plans/v1-ga/AD-a.md"].ok is False
+    assert by_path["src/alfred_coo/doctor/ingest.py"].observed == "absent"
+    assert by_path["src/alfred_coo/doctor/ingest.py"].ok is True
+    # Error string explains what's still actionable.
+    assert vr.error is not None
+    assert "scaffold pre-authored" in vr.error
+    assert "still absent" in vr.error
+
+
+async def test_verify_hint_full_new_paths_collision_keeps_path_conflict(
+    monkeypatch,
+):
+    """SAL-3281: when EVERY new_paths entry already exists (ticket truly
+    shipped in an earlier wave), the legacy PATH_CONFLICT status is
+    preserved. The persona must still grounding-gap escalate this case.
+    """
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=(
+            "deploy/appliance/IMAGE_PINS.md",
+            "deploy/appliance/RUNBOOK.md",
+        ),
+    )
+    script = {
+        ("repos/salucallc/alfred-coo-svc", None): [_FakeResp(200, {})],
+        ("contents/deploy/appliance/docker-compose.yml", "main"): [
+            _FakeResp(200, {})
+        ],
+        ("contents/deploy/appliance/IMAGE_PINS.md", "main"): [_FakeResp(200, {})],
+        ("contents/deploy/appliance/RUNBOOK.md", "main"): [_FakeResp(200, {})],
+    }
+    _install_fake_client(monkeypatch, script)
+
+    orch = _mk_orchestrator()
+    vr = await orch._verify_hint("OPS-02", hint)
+
+    assert vr.status is HintStatus.PATH_CONFLICT
+    # No absent new_paths → not the partial-collision case.
+    absent_new = [
+        pr for pr in vr.path_results
+        if pr.expected == "absent" and pr.observed == "absent"
+    ]
+    assert absent_new == []
+
+
+def test_render_target_block_new_paths_collision_marks_scaffold_benign():
+    """SAL-3281: NEW_PATHS_COLLISION render must NOT contain a
+    "STOP and escalate" line. The pre-existing scaffold gets a benign
+    "scaffold already exists" annotation; the absent siblings keep their
+    "you will CREATE this file" line so the persona builds them."""
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/doctor/ingest.py",
+            "plans/v1-ga/AD-a.md",
+        ),
+        base_branch="main",
+    )
+    vr = VerificationResult(
+        code="AD-A",
+        hint=hint,
+        status=HintStatus.NEW_PATHS_COLLISION,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="src/alfred_coo/__init__.py",
+                       expected="exist", observed="exist", ok=True),
+            PathResult(path="src/alfred_coo/doctor/ingest.py",
+                       expected="absent", observed="absent", ok=True),
+            PathResult(path="plans/v1-ga/AD-a.md",
+                       expected="absent", observed="exist", ok=False),
+        ),
+        error="one or more new_paths already exist on main "
+              "(scaffold pre-authored); 1 new_paths still absent — "
+              "ticket remains actionable",
+    )
+    block = _render_target_block("AD-A", vr=vr)
+
+    # Critical: the persona-facing escalate trigger must be ABSENT.
+    assert "STOP and escalate" not in block
+    assert "(conflict — file" not in block
+    # Both sections rendered.
+    assert "paths:" in block
+    assert "new_paths:" in block
+    # Scaffold line is benign.
+    assert "scaffold already exists" in block
+    assert "plans/v1-ga/AD-a.md" in block
+    # Still-absent file gets the standard CREATE-this-file annotation.
+    assert "you will CREATE this file" in block
+    assert "src/alfred_coo/doctor/ingest.py" in block
+
+
+def test_render_target_block_full_path_conflict_still_emits_stop_and_escalate():
+    """SAL-3281 regression-guard: PATH_CONFLICT (full collision — every
+    new_paths file exists, no absent siblings) still emits the "STOP and
+    escalate" wording. This is the legitimate "ticket shipped earlier"
+    case; the persona must grounding-gap, not silently re-build."""
+    hint = TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("deploy/appliance/docker-compose.yml",),
+        new_paths=("deploy/appliance/IMAGE_PINS.md",),
+        base_branch="main",
+    )
+    vr = VerificationResult(
+        code="OPS-02",
+        hint=hint,
+        status=HintStatus.PATH_CONFLICT,
+        repo_exists=True,
+        path_results=(
+            PathResult(path="deploy/appliance/docker-compose.yml",
+                       expected="exist", observed="exist", ok=True),
+            PathResult(path="deploy/appliance/IMAGE_PINS.md",
+                       expected="absent", observed="exist", ok=False),
+        ),
+        error="one or more new_paths already exist",
+    )
+    block = _render_target_block("OPS-02", vr=vr)
+    assert "STOP and escalate" in block
+    assert "(conflict — file" in block
+
+
+def test_is_wave_gate_excused_excuses_new_paths_collision():
+    """SAL-3281: NEW_PATHS_COLLISION mirrors PATH_CONFLICT for wave-gate
+    accounting (excused — counted in denominator only). Keeps green-ratio
+    semantics stable while the new render text drives dispatch."""
+    orch = _mk_orchestrator()
+    ticket = _t("u-ad-a", "SAL-3281", "AD-A", 3, "fleet", size="M")
+    _seed_graph(orch, [ticket])
+
+    orch._verified_hints["AD-A"] = VerificationResult(
+        code="AD-A",
+        hint=_TARGET_HINTS.get("AD-A"),
+        status=HintStatus.NEW_PATHS_COLLISION,
+        repo_exists=True,
+        path_results=(),
+        error="scaffold pre-authored",
+    )
+    assert orch._is_wave_gate_excused(ticket) is True
 
 
 # ── AB-17-f · _mark_repo_missing_tickets integration (Plan I §1.4 + §2.3) ──
