@@ -1,0 +1,93 @@
+name: Deploy to Oracle
+
+# Triggers AFTER the publish workflow completes successfully on main, so the
+# image at ghcr.io/salucallc/alfred-coo-svc:<sha> is guaranteed present
+# before we POST to the Oracle webhook. Spec called this "trigger on push to
+# main"; chaining via workflow_run prevents the race where the Action POSTs
+# before the image finishes pushing.
+on:
+  workflow_run:
+    workflows: ["Publish daemon image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA to deploy (defaults to current HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  notify-oracle:
+    name: Notify Oracle deploy webhook
+    runs-on: ubuntu-latest
+    # Skip if the upstream publish job failed.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - name: Resolve target SHA
+        id: sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.sha }}" ]; then
+            echo "sha=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: POST to Oracle webhook with HMAC + retry
+        env:
+          ORACLE_DEPLOY_SECRET: ${{ secrets.ORACLE_DEPLOY_SECRET }}
+          ORACLE_WEBHOOK_URL: ${{ vars.ORACLE_WEBHOOK_URL || 'http://100.105.27.63:8090/deploy' }}
+          REPO_NAME: alfred-coo-svc
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ORACLE_DEPLOY_SECRET:-}" ]; then
+            echo "ORACLE_DEPLOY_SECRET secret not set; cannot sign payload" >&2
+            exit 1
+          fi
+          PAYLOAD=$(printf '{"repo":"%s","sha":"%s","tag":"main"}' "$REPO_NAME" "$SHA")
+          SIG="sha256=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$ORACLE_DEPLOY_SECRET" | awk '{print $2}')"
+          echo "Posting deploy: repo=$REPO_NAME sha=$SHA -> $ORACLE_WEBHOOK_URL"
+
+          # Exponential backoff retry: 0s, 5s, 30s, 120s. Exit 0 on first 2xx.
+          ATTEMPT=0
+          MAX_ATTEMPTS=4
+          DELAYS=(0 5 30 120)
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            sleep "${DELAYS[$ATTEMPT]}"
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "::group::Attempt $ATTEMPT of $MAX_ATTEMPTS"
+            HTTP_CODE=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+              -X POST "$ORACLE_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Hub-Signature-256: $SIG" \
+              --data "$PAYLOAD" \
+              --max-time 240 || echo "000")
+            echo "HTTP $HTTP_CODE"
+            cat /tmp/resp.json || true
+            echo
+            echo "::endgroup::"
+            case "$HTTP_CODE" in
+              2*)
+                echo "Deploy succeeded on attempt $ATTEMPT"
+                exit 0
+                ;;
+              401|404|400)
+                echo "Non-retryable status $HTTP_CODE; aborting" >&2
+                exit 1
+                ;;
+              *)
+                echo "Retryable status $HTTP_CODE"
+                ;;
+            esac
+          done
+          echo "All $MAX_ATTEMPTS attempts failed" >&2
+          exit 1
