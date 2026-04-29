@@ -2424,6 +2424,184 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="AB-25 + SAL-3243; orchestrator auto-writes plans/v1-ga/<child>.md on decomposition; APE/V: synthetic decomposition produces a plan-doc commit alongside the child Linear issue",
     ),
 
+    # ── Epic alfred-doctor (parent SAL-3280) ────────────────────────────
+    # Hint-batch-2 (PR #270): 8 wave-3 children. Codes ``AD-a`` … ``AD-h``
+    # required widening _CODE_RE in graph.py to recognise the letters-only
+    # plan-doc prefix (no digits in the code). All 8 entries point into a
+    # new ``src/alfred_coo/doctor/`` subpackage that the children will
+    # create wholesale; one shared ``__init__.py`` is listed under
+    # ``paths=`` so the builder reads it as the package anchor.
+
+    "AD-A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=("src/alfred_coo/__init__.py",),
+        new_paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/ingest.py",
+            "tests/doctor/__init__.py",
+            "tests/doctor/test_ingest.py",
+            "plans/v1-ga/AD-a.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-a-ingest-sqlite-schema",
+        notes="alfred-doctor seed ticket; new doctor/ subpackage + tests/doctor/ pytest tree; SQLite timeseries schema (events table, indices on (ts, severity)); APE/V: ingest 100 synthetic events → SELECT count(*) round-trips",
+    ),
+
+    "AD-B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/ingest.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/doctor/surveillance.py",
+            "src/alfred_coo/doctor/heuristics.py",
+            "tests/doctor/test_surveillance.py",
+            "plans/v1-ga/AD-b.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-b-surveillance-loop",
+        notes="surveillance loop driven by claude-haiku; 12-pattern heuristic library (heuristics.py) + scanner over the AD-a SQLite store; APE/V: 12 synthetic events covering each pattern → surveillance flags ≥10/12 within one tick",
+    ),
+
+    "AD-C": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/surveillance.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/doctor/slack_alerts.py",
+            "tests/doctor/test_slack_alerts.py",
+            "plans/v1-ga/AD-c.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-c-slack-alerts",
+        notes="Slack integration for Tier-2 alerts; reuse SLACK_BOT_TOKEN_ALFRED + #batcave conventions; APE/V: synthetic Tier-2 finding from AD-b → mocked Slack POST asserted with rendered body",
+    ),
+
+    "AD-D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/surveillance.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/doctor/investigator.py",
+            "tests/doctor/test_investigator.py",
+            "plans/v1-ga/AD-d.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-d-investigation-loop",
+        notes="investigation loop powered by claude-opus; consumes surveillance findings → produces structured root-cause hypotheses; APE/V: canned surveillance hit → investigator returns ≥1 hypothesis with cause + evidence",
+    ),
+
+    "AD-E": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/investigator.py",
+            "src/alfred_coo/doctor/slack_alerts.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/doctor/actions.py",
+            "tests/doctor/test_actions.py",
+            "plans/v1-ga/AD-e.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-e-action-layer",
+        notes="action layer; Tier-1 = automatic remediation, Tier-2 = Slack hand-off; gated by hypothesis confidence + allowlist; APE/V: Tier-1 fixture executes auto-action, Tier-2 fixture posts to Slack only",
+    ),
+
+    "AD-F": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/investigator.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/doctor/hypothesis_tree.py",
+            "tests/doctor/test_hypothesis_tree.py",
+            "plans/v1-ga/AD-f.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-f-hypothesis-tree",
+        notes="hypothesis tree + recursion; depth-4 cap with explicit MAX_DEPTH constant; APE/V: synthetic seed expands to depth 4 then halts; depth-5 expansion attempt raises/short-circuits",
+    ),
+
+    "AD-G": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/actions.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/doctor/learning.py",
+            "tests/doctor/test_learning.py",
+            "plans/v1-ga/AD-g.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-g-learning-subsystem",
+        notes="learning subsystem; runbook table (sqlite, separate file from AD-a events) + weekly summary generator; APE/V: 7 days of synthetic actions → weekly_summary() returns top-N runbook entries with hit counts",
+    ),
+
+    "AD-H": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/doctor/__init__.py",
+            "src/alfred_coo/doctor/surveillance.py",
+            "src/alfred_coo/doctor/learning.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/doctor/dashboard_route.py",
+            "tests/doctor/test_dashboard_route.py",
+            "plans/v1-ga/AD-h.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ad-h-v8-doctor-dashboard-route",
+        notes="dashboard integration for v8-doctor; route defined in src/alfred_coo/doctor/dashboard_route.py for unit-test isolation, mounted later in /opt/v7-dashboard/dashboard.py via separate ops PR (out of scope here per Cristian's brief); APE/V: route returns 200 + JSON shape with surveillance + learning summary fields",
+    ),
+
+    # ── Epic OPS-14d (parent SAL-3038) ─────────────────────────────────
+    # Hint-batch-2 (PR #270): 4 wave-3 children — `OPS-14d-{a,b,c,d}` —
+    # all collapse to the single parsed code ``OPS-14D`` because
+    # _CODE_RE captures only one trailing letter. Following the AB-22
+    # umbrella precedent: one shared hint entry whose paths union covers
+    # the whole subtree. Children read this hint, then write their own
+    # PRs against the specific subset of files they own.
+
+    "OPS-14D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/auth/__init__.py",
+            "src/alfred_coo/auth/scope_middleware.py",
+        ),
+        new_paths=(
+            "src/alfred_coo/auth/ttl_constants.py",
+            "src/alfred_coo/auth/ttl_validator.py",
+            "tests/test_jwt_iat_shape.py",
+            "tests/test_ttl_validator.py",
+            "tests/e2e/__init__.py",
+            "tests/e2e/test_ttl_end_to_end.py",
+            "plans/v1-ga/OPS-14d-a.md",
+            "plans/v1-ga/OPS-14d-b.md",
+            "plans/v1-ga/OPS-14d-c.md",
+            "plans/v1-ga/OPS-14d-d.md",
+        ),
+        base_branch="main",
+        branch_hint="feature/ops-14d-scoped-token-ttl",
+        notes="umbrella hint — _CODE_RE collapses OPS-14d-{a,b,c,d} all to OPS-14D; child must Step-2 verify against its own subset. AD-a = TTL constant + iat shape (ttl_constants.py + test_jwt_iat_shape.py). AD-b = validator + boundary tests (ttl_validator.py + test_ttl_validator.py). AD-c = wire validator into scope_middleware.py (modify) + targeted unit test. AD-d = end-to-end (tests/e2e/test_ttl_end_to_end.py: token at iat=now-25h → 401 via real middleware).",
+    ),
+
 }
 
 
