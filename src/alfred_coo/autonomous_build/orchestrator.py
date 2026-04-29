@@ -351,7 +351,20 @@ class HintStatus(str, Enum):
     OK = "ok"                         # repo + all paths verified
     REPO_MISSING = "repo_missing"     # fatal — block dispatch
     PATH_MISSING = "path_missing"     # informative — render diagnostic
-    PATH_CONFLICT = "path_conflict"   # informative — render diagnostic
+    PATH_CONFLICT = "path_conflict"   # informative — paths missing AND new_paths
+                                      # collide (mixed-failure tiebreak); also
+                                      # the "every new_paths file already
+                                      # exists" case (work was already merged).
+    NEW_PATHS_COLLISION = "new_paths_collision"
+    # SAL-3281 (2026-04-28): emitted when the ONLY non-OK condition is one or
+    # more `new_paths` entries that already exist on main, AND at least one
+    # `new_paths` entry is still absent (i.e. the ticket has real CREATE work
+    # left). The classic example is a plan-doc scaffold (``plans/v1-ga/<X>.md``)
+    # authored by the hint-batching sub before the implementation child runs.
+    # Distinct from PATH_CONFLICT so the renderer can emit a benign
+    # "scaffold already exists — extend or leave it" line instead of a
+    # "STOP and escalate" line, unblocking dispatch of partially-staged
+    # tickets. Wave-gate treats this the same as PATH_CONFLICT (excused).
     UNVERIFIED = "unverified"         # transient — render banner, dispatch
     NO_HINT = "no_hint"               # code not in _TARGET_HINTS (pre-existing)
 
@@ -2738,6 +2751,20 @@ def _render_target_block(
                 f"# verified absent @ {hint.base_branch} — you will CREATE this file"
             )
         if pr.observed == "exist":
+            # SAL-3281: NEW_PATHS_COLLISION → scaffold already exists but
+            # other new_paths are still absent. Render a benign "scaffold
+            # already exists" line so the persona does NOT escalate; the
+            # ticket has real work left on the absent siblings. Reserve the
+            # "STOP and escalate" wording for the legacy PATH_CONFLICT case
+            # where the entire new_paths set already shipped (i.e. the
+            # ticket's work was merged in an earlier wave/run and the
+            # persona should grounding-gap escalate).
+            if vr.status == HintStatus.NEW_PATHS_COLLISION:
+                return (
+                    f"  - {pr.path}{_pad(pr.path)}"
+                    f"# scaffold already exists @ {hint.base_branch} — "
+                    f"leave existing content; build the absent siblings"
+                )
             return (
                 f"  - (conflict — file {pr.path} already exists in "
                 f"{hint.owner}/{hint.repo}@{hint.base_branch}; "
@@ -6906,8 +6933,15 @@ class AutonomousBuildOrchestrator:
         code_key = (ticket.code or "").upper()
         if code_key:
             vr = self._verified_hints.get(code_key)
+            # SAL-3281: NEW_PATHS_COLLISION mirrors PATH_CONFLICT for the
+            # wave-gate denominator — scaffold-only collisions are not the
+            # ticket's fault; the renderer treats them as benign and the
+            # builder still ships a PR. Keeping them excused preserves the
+            # green-ratio semantics (these tickets are bonus shipping, not
+            # required work for the wave threshold).
             if vr is not None and vr.status in (
                 HintStatus.PATH_CONFLICT,
+                HintStatus.NEW_PATHS_COLLISION,
                 HintStatus.NO_HINT,
             ):
                 return True
@@ -8546,9 +8580,39 @@ class AutonomousBuildOrchestrator:
                     any_unknown = True
 
             # 3. Status aggregation.
+            #
+            # SAL-3281 (2026-04-28): split NEW_PATHS_COLLISION out of
+            # PATH_CONFLICT. The collision arm fires when the *only* problem
+            # is that one or more ``new_paths`` entries already exist AND at
+            # least one ``new_paths`` entry is still absent (i.e. the ticket
+            # has real CREATE work left — the typical case is a plan-doc
+            # scaffold pre-authored by the hint-batching sub). Mixed
+            # collisions + path-missing keep the legacy PATH_CONFLICT
+            # tiebreak. Full-collision (every new_paths exists, paths all
+            # OK) also stays PATH_CONFLICT — that's the genuine "work was
+            # already merged in an earlier wave" case where the persona
+            # SHOULD escalate via grounding-gap.
+            absent_new_paths_count = sum(
+                1 for pr in path_results
+                if pr.expected == "absent" and pr.observed == "absent"
+            )
+            new_paths_collision_only = (
+                any_conflict_in_new_paths
+                and not any_missing_in_paths
+                and not any_unknown
+                and absent_new_paths_count > 0
+            )
             if all(pr.ok for pr in path_results):
                 status = HintStatus.OK
                 error: Optional[str] = None
+            elif new_paths_collision_only:
+                status = HintStatus.NEW_PATHS_COLLISION
+                error = (
+                    "one or more new_paths already exist on main "
+                    "(scaffold pre-authored); "
+                    f"{absent_new_paths_count} new_paths still absent — "
+                    "ticket remains actionable"
+                )
             elif any_conflict_in_new_paths:
                 status = HintStatus.PATH_CONFLICT
                 error = "one or more new_paths already exist"
