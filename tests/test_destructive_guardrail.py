@@ -354,7 +354,12 @@ async def test_layer_2_verdict_override_flips_approve_to_request_changes(
     monkeypatch,
 ):
     """Layer 2: hawkman APPROVEs a destructive PR; orchestrator
-    overrides to REQUEST_CHANGES. The merge does NOT fire."""
+    overrides to REQUEST_CHANGES. The merge does NOT fire.
+
+    The behavioral-apev Layer 2 check is disarmed so we isolate the
+    destructive override path; behavioral coverage lives in
+    tests/test_hawkman_behavioral_apev.py.
+    """
     orch = _mk_orchestrator()
     ticket = _mk_reviewing_ticket()
     _seed_graph(orch, [ticket])
@@ -369,9 +374,19 @@ async def test_layer_2_verdict_override_flips_approve_to_request_changes(
         orch, "_fetch_pr_files_for_guardrail", _fake_fetch
     )
     from alfred_coo.autonomous_build import destructive_guardrail as dg
+    from alfred_coo.autonomous_build.behavioral_apev import (
+        BehavioralGuardrailResult,
+    )
 
     monkeypatch.setattr(
         dg, "_fetch_original_file_loc", lambda *_a, **_k: 1000
+    )
+
+    async def _no_behav(t):
+        return BehavioralGuardrailResult(tripped=False)
+
+    monkeypatch.setattr(
+        orch, "_check_behavioral_apev_for_ticket", _no_behav
     )
 
     merge_calls: List[str] = []
@@ -408,7 +423,12 @@ async def test_layer_3_pre_merge_static_check_refuses_destructive_pr(
     monkeypatch,
 ):
     """Layer 3: even if the verdict slips through, _merge_pr runs the
-    same guardrail and refuses."""
+    same guardrail and refuses.
+
+    The behavioral-apev Layer 3 check is disarmed so we isolate the
+    destructive Layer 3 trip path; behavioral coverage lives in
+    tests/test_hawkman_behavioral_apev.py.
+    """
     orch = _mk_orchestrator()
     ticket = _mk_reviewing_ticket()
     _seed_graph(orch, [ticket])
@@ -420,9 +440,19 @@ async def test_layer_3_pre_merge_static_check_refuses_destructive_pr(
         orch, "_fetch_pr_files_for_guardrail", _fake_fetch
     )
     from alfred_coo.autonomous_build import destructive_guardrail as dg
+    from alfred_coo.autonomous_build.behavioral_apev import (
+        BehavioralGuardrailResult,
+    )
 
     monkeypatch.setattr(
         dg, "_fetch_original_file_loc", lambda *_a, **_k: 1000
+    )
+
+    async def _no_behav(t):
+        return BehavioralGuardrailResult(tripped=False)
+
+    monkeypatch.setattr(
+        orch, "_check_behavioral_apev_for_ticket", _no_behav
     )
 
     linear_calls: List[tuple] = []
@@ -482,20 +512,37 @@ async def test_layer_3_static_check_via_handle_review_verdict_marks_failed(
     call_log: List[str] = []
 
     async def _selective_fetch(t):
-        # First call comes from Layer 2 (in _handle_review_verdict).
-        # Second call comes from Layer 3 (in _merge_pr).
+        # Layer 2 destructive call (1) -> None (fail-open).
+        # Layer 3 destructive call (2) -> _DESTRUCTIVE_PR_FILES (arm).
+        # The behavioral guardrail's Layer 2 + Layer 3 checks are
+        # disarmed below via _check_behavioral_apev_for_ticket
+        # monkeypatch so they never reach this fetch; we isolate
+        # the destructive Layer 3 trip path.
         call_log.append("called")
         if len(call_log) == 1:
-            return None  # disarm Layer 2 (fail-open on None)
-        return _DESTRUCTIVE_PR_FILES  # arm Layer 3
+            return None
+        return _DESTRUCTIVE_PR_FILES
 
     monkeypatch.setattr(
         orch, "_fetch_pr_files_for_guardrail", _selective_fetch
     )
     from alfred_coo.autonomous_build import destructive_guardrail as dg
+    from alfred_coo.autonomous_build.behavioral_apev import (
+        BehavioralGuardrailResult,
+    )
 
     monkeypatch.setattr(
         dg, "_fetch_original_file_loc", lambda *_a, **_k: 1000
+    )
+
+    # Disarm the behavioral-apev Layer 2 + Layer 3 checks so this test
+    # isolates the destructive guardrail Layer 3 trip path. The
+    # behavioral check is exercised in tests/test_hawkman_behavioral_apev.py.
+    async def _no_behav(t):
+        return BehavioralGuardrailResult(tripped=False)
+
+    monkeypatch.setattr(
+        orch, "_check_behavioral_apev_for_ticket", _no_behav
     )
 
     linear_calls: List[tuple] = []

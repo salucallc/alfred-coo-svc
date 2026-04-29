@@ -36,6 +36,10 @@ import httpx
 
 from .budget import BudgetTracker, make_tracker
 from .cadence import SlackCadence
+from .behavioral_apev import (
+    BehavioralGuardrailResult,
+    compute_behavioral_apev,
+)
 from .destructive_guardrail import (
     GuardrailResult,
     compute_destructive_guardrails,
@@ -6195,6 +6199,54 @@ class AutonomousBuildOrchestrator:
                         existing_summary + override_note
                     )
 
+        # Behavioral APE/V Layer 2 — plan-only / tests-don't-cover /
+        # surface-no-e2e-test override. Mirrors the destructive-guardrail
+        # override pattern: if hawkman APPROVED a PR that fails any
+        # behavioral gate, flip to REQUEST_CHANGES and surface the
+        # specific gate name to the respawn body. Fail-open on infra
+        # error.
+        if verdict == "APPROVE":
+            try:
+                behav = await self._check_behavioral_apev_for_ticket(ticket)
+            except Exception:
+                logger.exception(
+                    "behavioral_apev: override-pass raised for %s; "
+                    "letting verdict stand as APPROVE",
+                    ticket.identifier,
+                )
+                behav = BehavioralGuardrailResult(tripped=False)
+
+            if behav.tripped:
+                citations_str = (
+                    "; ".join(behav.citations) or "(no citations)"
+                )
+                logger.warning(
+                    "[behavioral-apev-override] PR %s tripped %s: %s | %s",
+                    ticket.pr_url, behav.layer, behav.reason, citations_str,
+                )
+                self.state.record_event(
+                    "verdict_overridden_behavioral_apev",
+                    identifier=ticket.identifier,
+                    pr_url=ticket.pr_url,
+                    layer=behav.layer,
+                    reason=behav.reason,
+                    citations=list(behav.citations),
+                )
+                verdict = "REQUEST_CHANGES"
+                self.state.review_verdicts[ticket.id] = verdict
+                if isinstance(rec, dict) and isinstance(
+                    rec.get("result"), dict
+                ):
+                    existing_summary = rec["result"].get("summary") or ""
+                    override_note = (
+                        f"\n\n[behavioral APE/V guardrail override "
+                        f"({behav.layer})] {behav.reason} | "
+                        f"citations: {citations_str}"
+                    )
+                    rec["result"]["summary"] = (
+                        existing_summary + override_note
+                    )
+
         if verdict == "APPROVE":
             ticket.status = TicketStatus.MERGE_REQUESTED
             merged = await self._merge_pr(ticket)
@@ -6501,6 +6553,70 @@ class AutonomousBuildOrchestrator:
             base_ref=base_ref,
         )
 
+    async def _check_behavioral_apev_for_ticket(
+        self, ticket: Ticket
+    ) -> BehavioralGuardrailResult:
+        """Run the behavioral APE/V gates against ticket's PR.
+
+        Three gates run in order (B1 → B2 → B3); first-trip wins.
+        Best-effort only: any transport / lookup failure returns a
+        non-tripped result so the caller proceeds (fail-open on infra
+        flakiness, fail-closed on a confirmed gate trip).
+
+        Reuses ``_fetch_pr_files_for_guardrail`` so we hit GitHub once
+        per ticket per verdict tick (the destructive guardrail and the
+        behavioral guardrail share the same diff fetch). The
+        ``patch`` field is required for B2/B3 symbol extraction; the
+        GitHub /pulls/{N}/files endpoint includes it by default.
+        """
+        pr_files = await self._fetch_pr_files_for_guardrail(ticket)
+        if pr_files is None:
+            return BehavioralGuardrailResult(tripped=False)
+        return compute_behavioral_apev(pr_files)
+
+    async def _post_behavioral_apev_linear_comment(
+        self, ticket: Ticket, behav: BehavioralGuardrailResult
+    ) -> None:
+        """Post a Linear comment when behavioral APE/V blocks a merge.
+
+        Best-effort. Mirrors ``_post_destructive_guardrail_linear_comment``.
+        Skipped silently if linear_add_comment is not in BUILTIN_TOOLS.
+        """
+        try:
+            from alfred_coo.tools import BUILTIN_TOOLS
+        except Exception:
+            logger.debug(
+                "tools not importable; skipping behavioral apev comment"
+            )
+            return
+        spec = BUILTIN_TOOLS.get("linear_add_comment")
+        if spec is None:
+            return
+        body_lines = [
+            f"## Behavioral APE/V guardrail tripped ({behav.layer})",
+            "",
+            f"**Reason:** {behav.reason}",
+            "",
+            "**Citations:**",
+        ]
+        for c in behav.citations:
+            body_lines.append(f"- {c}")
+        body_lines.extend([
+            "",
+            f"PR `{ticket.pr_url}` was REFUSED by the orchestrator's "
+            "pre-merge behavioral check. Status: FAILED. Linear state "
+            "moved to Backlog. Ship implementation + tests, not just "
+            "plan docs.",
+        ])
+        body = "\n".join(body_lines)
+        try:
+            await spec.handler(issue_id=ticket.id, body=body)
+        except Exception:
+            logger.exception(
+                "linear_add_comment raised for behavioral apev trip on %s",
+                ticket.identifier,
+            )
+
     async def _post_destructive_guardrail_linear_comment(
         self, ticket: Ticket, guardrail: GuardrailResult
     ) -> None:
@@ -6684,6 +6800,46 @@ class AutonomousBuildOrchestrator:
             await self._post_destructive_guardrail_linear_comment(
                 ticket, guardrail
             )
+            return False
+
+        # Behavioral APE/V Layer 3 - pre-merge static check.
+        # Belt-and-braces: same gates that ran in Layer 2 run again here
+        # in case hawkman approved blind, the orchestrator was
+        # restart-resumed past the verdict tick, or a manual operator
+        # merge bypassed the verdict path entirely. Fail-open on any
+        # infra error so flaky GitHub doesn't wedge legitimate merges.
+        try:
+            behav = await self._check_behavioral_apev_for_ticket(ticket)
+        except Exception:
+            logger.exception(
+                "behavioral_apev: pre-merge check raised for %s; "
+                "proceeding with merge (fail-open on infra error)",
+                ticket.identifier,
+            )
+            behav = BehavioralGuardrailResult(tripped=False)
+
+        if behav.tripped:
+            citations_str = (
+                "; ".join(behav.citations) or "(no citations)"
+            )
+            logger.error(
+                "[merge-block] PR %s tripped behavioral APE/V "
+                "(layer=%s): %s | citations: %s",
+                ticket.pr_url,
+                behav.layer,
+                behav.reason,
+                citations_str,
+            )
+            self.state.record_event(
+                "merge_blocked_behavioral_apev",
+                identifier=ticket.identifier,
+                pr_url=ticket.pr_url,
+                layer=behav.layer,
+                reason=behav.reason,
+                citations=list(behav.citations),
+            )
+            await self._update_linear_state(ticket, "Backlog")
+            await self._post_behavioral_apev_linear_comment(ticket, behav)
             return False
 
         m = _PR_URL_RE.search(ticket.pr_url)
