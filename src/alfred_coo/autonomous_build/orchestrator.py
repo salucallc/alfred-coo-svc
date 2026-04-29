@@ -2425,14 +2425,88 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="plan E §5.1 S-05 + SAL-2666; smoke every mcp__alfred__soul_* tool against a running soul-svc; matrix-test fixture with expected response shapes; APE/V: pytest tests/test_mcp_compat_smoke.py green; covers ≥10 MCP soul-* tools",
     ),
 
+    # ── Epic AB-22 (Plan J · embedded Tiresias proxy) ──────────────────
+    # _CODE_RE collapses AB-22-{a..g} all to ``AB-22`` (regex requires
+    # digits then at most one trailing letter; the dash-letter suffix is
+    # stripped). Following the OPS-14D umbrella precedent: one shared
+    # entry whose new_paths union covers the whole subtree, so each
+    # child reads a hint listing real implementation files (not just the
+    # plan-doc) and produces merge-worthy code instead of a plan-only
+    # PR. Per-child scope is documented in ``notes`` so the builder can
+    # Step-2 verify against its own subset; Hawkman's APE/V check then
+    # accepts a child PR that ships the file(s) for that child only.
+    #
+    # Pre-fix behaviour (PRs #272 #275 #276 #277 #287 #288 #289):
+    # children inherited new_paths=("plans/v1-ga/AB-22.md",) and shipped
+    # plan-only PRs that Hawkman correctly REQUEST_CHANGES — no real
+    # implementation file was listed as new_paths, so the builder had
+    # nowhere to put production code. This entry fixes that.
+
     "AB-22": TargetHint(
         owner="salucallc",
         repo="alfred-coo-svc",
-        paths=("src/alfred_coo/__init__.py",),
-        new_paths=("plans/v1-ga/AB-22.md",),
+        paths=(
+            "src/alfred_coo/__init__.py",
+            "Dockerfile",
+            "pyproject.toml",
+            "deploy/appliance/docker-compose.yml",
+        ),
+        new_paths=(
+            # AB-22-a (SAL-2738) — trace storage + schema + retention
+            "src/alfred_coo/tiresias_proxy/__init__.py",
+            "src/alfred_coo/tiresias_proxy/storage.py",
+            "tests/tiresias_proxy/__init__.py",
+            "tests/tiresias_proxy/test_storage.py",
+            # AB-22-b (SAL-2739) — provider routing + OpenAI↔Anthropic shim
+            "src/alfred_coo/tiresias_proxy/providers.py",
+            "tests/tiresias_proxy/test_providers.py",
+            # AB-22-c (SAL-2740) — FastAPI app + routes + middleware
+            "src/alfred_coo/tiresias_proxy/app.py",
+            "src/alfred_coo/tiresias_proxy/routes.py",
+            "src/alfred_coo/tiresias_proxy/middleware.py",
+            "src/alfred_coo/tiresias_proxy/schemas.py",
+            "src/alfred_coo/tiresias_proxy/config.py",
+            "tests/tiresias_proxy/test_app.py",
+            # AB-22-d (SAL-2741) — Soulkey registry + bootstrap + consumers.yaml
+            "src/alfred_coo/tiresias_proxy/soulkeys.py",
+            "deploy/appliance/consumers.yaml",
+            "tests/tiresias_proxy/test_soulkeys.py",
+            # AB-22-e (SAL-2742) — entrypoint + Dockerfile + compose flip
+            "src/alfred_coo/tiresias_proxy/__main__.py",
+            # AB-22-f (SAL-2743) — query CLI + import-linter contract + smoke
+            "src/alfred_coo/tiresias_proxy/cli.py",
+            "importlinter.cfg",
+            "tests/tiresias_proxy/test_smoke.py",
+            # AB-22-g (SAL-2760) — native POST /v1/messages passthrough
+            # ships as additional handler logic inside AB-22-c's routes.py
+            # (no new file); pinned here as a test artifact.
+            "tests/tiresias_proxy/test_messages_passthrough.py",
+            # Umbrella plan doc (every child writes one — the first
+            # child to land creates the file, later children's writes
+            # collide harmlessly via NEW_PATHS_COLLISION semantics).
+            "plans/v1-ga/AB-22.md",
+        ),
         base_branch="main",
         branch_hint="feature/ab-22-umbrella",
-        notes="Umbrella AB-22 hint — parser maps AB-22-{a..g} all to AB-22. Children dispatch with this hint; child must Step-2 verify and write its own paths into a sub-ticket-specific PR. Plan: deploy/appliance + tracing module split.",
+        notes=(
+            "umbrella hint — _CODE_RE collapses AB-22-{a..g} all to AB-22; "
+            "child must Step-2 verify against its own subset. "
+            "AB-22-a (SAL-2738) = TraceStore + schema + retention "
+            "(tiresias_proxy/storage.py + tests/tiresias_proxy/test_storage.py). "
+            "AB-22-b (SAL-2739) = provider router + OpenAI↔Anthropic shim "
+            "(tiresias_proxy/providers.py + tests/tiresias_proxy/test_providers.py). "
+            "AB-22-c (SAL-2740) = FastAPI app + middleware "
+            "(tiresias_proxy/app.py + routes.py + middleware.py + schemas.py + config.py + tests/tiresias_proxy/test_app.py). "
+            "AB-22-d (SAL-2741) = SoulkeyRegistry + bootstrap + consumers.yaml "
+            "(tiresias_proxy/soulkeys.py + deploy/appliance/consumers.yaml + tests/tiresias_proxy/test_soulkeys.py). "
+            "AB-22-e (SAL-2742) = entrypoint + Dockerfile + compose flip "
+            "(tiresias_proxy/__main__.py + Dockerfile modify + deploy/appliance/docker-compose.yml modify). "
+            "AB-22-f (SAL-2743) = query CLI + import-linter + smoke "
+            "(tiresias_proxy/cli.py + importlinter.cfg + tests/tiresias_proxy/test_smoke.py). "
+            "AB-22-g (SAL-2760) = native POST /v1/messages passthrough "
+            "(extends AB-22-c routes.py + tests/tiresias_proxy/test_messages_passthrough.py). "
+            "Plan: Z:/_planning/v1-ga/J_embedded_tiresias_proxy.md."
+        ),
     ),
 
     "AB-25": TargetHint(
