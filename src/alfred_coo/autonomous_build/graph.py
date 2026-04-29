@@ -42,6 +42,17 @@ class TicketStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     PR_OPEN = "pr_open"
     REVIEWING = "reviewing"
+    # Gap 3 (2026-04-29): a ticket whose PR has been handed off to a
+    # Hawkman QA review task and is now waiting on the verdict. Distinct
+    # from REVIEWING (which counts as in-flight for builder hard-timeout +
+    # active-state reconciles): AWAITING_REVIEW is excluded from
+    # ``ACTIVE_TICKET_STATES`` AND from ``_select_ready`` so the
+    # deadlock-grace counter (in_flight + ready) can reach zero when a
+    # wave is purely PR-pending. Set after ``_dispatch_review`` lands or
+    # ``_fire_review_for_inherited_pr`` registers a review; transitions
+    # back to either MERGED_GREEN (APPROVE) or DISPATCHED (REQUEST_CHANGES
+    # respawn) via ``_handle_review_verdict``.
+    AWAITING_REVIEW = "awaiting_review"
     MERGE_REQUESTED = "merge_requested"
     MERGED_GREEN = "merged_green"
     FAILED = "failed"

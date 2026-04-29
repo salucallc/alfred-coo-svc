@@ -4552,6 +4552,7 @@ class AutonomousBuildOrchestrator:
             # SAL-2634 got 15+ review tasks in 7 minutes before the patch.
             if ticket.status in (
                 TicketStatus.REVIEWING,
+                TicketStatus.AWAITING_REVIEW,
                 TicketStatus.MERGE_REQUESTED,
             ):
                 continue
@@ -4802,9 +4803,14 @@ class AutonomousBuildOrchestrator:
                     pr_url=pr_url,
                 )
                 # Fire a hawkman-qa-a review task asynchronously.
+                # Gap 3 (2026-04-29): land in AWAITING_REVIEW (not
+                # REVIEWING) so the ticket is excluded from both the
+                # ready bucket AND the in_flight bucket — wave
+                # deadlock-grace can then arm when a wave is purely
+                # awaiting Hawkman verdicts.
                 try:
                     await self._dispatch_review(ticket)
-                    ticket.status = TicketStatus.REVIEWING
+                    ticket.status = TicketStatus.AWAITING_REVIEW
                 except Exception:
                     logger.exception(
                         "failed to dispatch review for %s",
@@ -5951,9 +5957,16 @@ class AutonomousBuildOrchestrator:
         tests + cadence diffing).
         """
         by_id = self._last_completed_by_id or {}
+        # Gap 3 (2026-04-29): poll AWAITING_REVIEW alongside REVIEWING so a
+        # rehydrated state from prior daemon versions (which used
+        # REVIEWING for both in-flight builder→PR and inherited-PR cases)
+        # still surfaces verdicts here.
         reviewing = [
             t for t in self.graph.nodes.values()
-            if t.status == TicketStatus.REVIEWING and t.review_task_id
+            if t.status in (
+                TicketStatus.AWAITING_REVIEW,
+                TicketStatus.REVIEWING,
+            ) and t.review_task_id
         ]
         if not reviewing:
             return []
@@ -6179,9 +6192,11 @@ class AutonomousBuildOrchestrator:
         self.state.review_task_ids.pop(ticket.id, None)
         try:
             await self._dispatch_review(ticket)
-            # _dispatch_review doesn't flip status; keep it REVIEWING so
-            # the next tick sees the new review_task_id and re-checks.
-            ticket.status = TicketStatus.REVIEWING
+            # _dispatch_review doesn't flip status. Gap 3 (2026-04-29):
+            # keep the ticket in AWAITING_REVIEW so the next tick sees
+            # the new review_task_id and re-checks — and so the dispatch
+            # ready+in_flight buckets stay excluded.
+            ticket.status = TicketStatus.AWAITING_REVIEW
         except Exception:
             logger.exception(
                 "silent-retry _dispatch_review failed for %s",
@@ -7178,9 +7193,21 @@ class AutonomousBuildOrchestrator:
         green = sum(1 for t in wave_tickets if t.status == TicketStatus.MERGED_GREEN)
         total = len(wave_tickets)
         in_flight = len(self._in_flight_for_wave(wave))
+        # Gap 3 (2026-04-29): surface AWAITING_REVIEW separately so the
+        # operator can distinguish wave-stuck-on-Hawkman from genuine
+        # ready+in-flight stalls. Excluded from the in_flight + ready
+        # counters so deadlock-grace logic remains accurate.
+        awaiting_review = sum(
+            1 for t in wave_tickets
+            if t.status == TicketStatus.AWAITING_REVIEW
+        )
+        ready_count = len(
+            self._select_ready(wave_tickets, self._in_flight_for_wave(wave))
+        )
         logger.info(
-            "[cadence] wave=%d tickets=%d/%d in_flight=%d spend=$%.2f/$%.2f",
-            wave, green, total, in_flight,
+            "[cadence] wave=%d tickets=%d/%d ready=%d "
+            "awaiting_review=%d in_flight=%d spend=$%.2f/$%.2f",
+            wave, green, total, ready_count, awaiting_review, in_flight,
             self.state.cumulative_spend_usd,
             self.budget_usd,
         )
@@ -7291,6 +7318,7 @@ class AutonomousBuildOrchestrator:
             TicketStatus.IN_PROGRESS,
             TicketStatus.PR_OPEN,
             TicketStatus.REVIEWING,
+            TicketStatus.AWAITING_REVIEW,
             TicketStatus.MERGE_REQUESTED,
         }
         threshold = max(60, int(self.stall_threshold_sec))
@@ -8189,6 +8217,10 @@ class AutonomousBuildOrchestrator:
         if review_task_id:
             ticket.review_task_id = str(review_task_id)
             self.state.review_task_ids[ticket.id] = str(review_task_id)
+            # Gap 3 (2026-04-29): drop the ticket out of the dispatch
+            # ready+in_flight buckets so wave deadlock-grace can arm
+            # cleanly when a wave is purely awaiting Hawkman.
+            ticket.status = TicketStatus.AWAITING_REVIEW
             self.state.record_event(
                 "inherited_review_registered",
                 identifier=ticket.identifier,
@@ -8218,6 +8250,10 @@ class AutonomousBuildOrchestrator:
 
         fired_id = self.state.review_task_ids.get(ticket.id)
         if fired_id:
+            # Gap 3 (2026-04-29): newly-fired review → AWAITING_REVIEW so
+            # the dispatch ready+in_flight buckets exclude this ticket
+            # while Hawkman works.
+            ticket.status = TicketStatus.AWAITING_REVIEW
             self.state.record_event(
                 "inherited_review_fired",
                 identifier=ticket.identifier,
