@@ -1,0 +1,119 @@
+name: Deploy to Oracle
+
+# Self-hosted runner version (replaces the HMAC webhook flow that PR #292
+# proposed on feature/deploy-automation). PR #292 was superseded by this
+# workflow.
+#
+# Sidecar deploy: stands the published GHCR image up alongside the
+# canonical systemd alfred-coo.service. systemd keeps owning host port
+# 8090; the container binds to host port 8091 -> container 8090. State
+# dir is shared at /var/lib/alfred-coo so a future systemd -> container
+# cutover is just `systemctl stop` + `docker compose up`. State migration
+# is intentionally out of scope until that cutover lands.
+#
+# One-time host provisioning required (NOT done by this workflow):
+#   sudo cp /etc/alfred-coo/.env /opt/alfred-coo/.env
+#   sudo chown alfredcoo:alfredcoo /opt/alfred-coo/.env
+#   sudo chmod 640 /opt/alfred-coo/.env
+# The workflow fails loud if /opt/alfred-coo/.env is missing.
+#
+# Trigger: workflow_run on the publish workflow, mirroring the soul-svc
+# pattern. workflow_dispatch is supported for manual smoke tests.
+on:
+  workflow_run:
+    workflows: ["Publish daemon image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA to deploy (defaults to current HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Pull image + restart alfred-coo on Oracle
+    runs-on: [self-hosted, oracle]
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - name: Resolve target SHA
+        id: sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          elif [ -n "${{ inputs.sha }}" ]; then
+            FULL_SHA="${{ inputs.sha }}"
+          else
+            FULL_SHA="${{ github.sha }}"
+          fi
+          SHORT_SHA="${FULL_SHA:0:7}"
+          echo "full=${FULL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved SHA: full=${FULL_SHA} short=${SHORT_SHA}"
+
+      # Sidecar deploy: stand up the GHCR image alongside the existing
+      # systemd alfred-coo.service. systemd owns host port 8090; the
+      # container binds to host port 8091 -> container 8090. State dir is
+      # shared at /var/lib/alfred-coo so a future systemd -> container
+      # cutover is just `systemctl stop` + `docker compose up`.
+      #
+      # Idempotent on the same SHA: docker compose pull is a no-op if the
+      # tag's already local, and `up -d` only recreates if config or
+      # image digest changed. State migration is out of scope.
+      - name: Deploy alfred-coo-svc container (sidecar on :8091)
+        env:
+          ALFRED_COO_TAG: sha-${{ steps.sha.outputs.short }}
+          ALFRED_COO_STATE_DIR: /var/lib/alfred-coo
+          ALFRED_COO_HEALTH_PORT_HOST: "8091"
+        run: |
+          set -euo pipefail
+          cd /opt/alfred-coo
+
+          # Pull the docker-compose.yml that landed on main (PR #296+).
+          # Use fetch + checkout-from-FETCH_HEAD so we don't disturb any
+          # local working state in the alfredcoo-owned checkout.
+          git fetch origin main
+          git checkout FETCH_HEAD -- docker-compose.yml
+
+          # Compose reads .env from the same dir as docker-compose.yml.
+          # The runner container does not mount /etc/alfred-coo (where the
+          # canonical secret bundle lives), so /opt/alfred-coo/.env must
+          # be pre-provisioned on the host. Fail loud if it's missing.
+          if [ ! -e .env ]; then
+            echo "::error::/opt/alfred-coo/.env is missing on the host."
+            echo "::error::Provision once: sudo cp /etc/alfred-coo/.env /opt/alfred-coo/.env && sudo chown alfredcoo:alfredcoo /opt/alfred-coo/.env && sudo chmod 640 /opt/alfred-coo/.env"
+            exit 1
+          fi
+
+          # Pull the published image for this SHA. metadata-action
+          # tags with type=sha,prefix=sha-,format=short so the tag
+          # matches our resolved SHORT_SHA above.
+          docker compose pull
+
+          # Recreate (or no-op) the container with the resolved tag.
+          docker compose up -d --remove-orphans
+
+          # Wait up to ~30s for the container to report healthy on the
+          # host-side port (8091). Container-side healthcheck hits 8090
+          # internally, so docker's own status is the source of truth;
+          # the curl is a belt-and-suspenders check.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://localhost:8091/healthz > /dev/null 2>&1; then
+              echo "container healthy on attempt ${i}"
+              docker compose ps
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "::error::container failed to become healthy on :8091 within ~30s"
+          docker compose ps
+          docker compose logs --tail=80 alfred-coo-svc
+          exit 1
