@@ -22,6 +22,7 @@ from typing import Optional
 import uvicorn
 
 from . import config, log, dispatch, health
+from . import cockpit_router
 from .mesh import MeshClient, parse_persona_tag
 from .soul import SoulClient
 from .persona import Persona, get_persona
@@ -525,6 +526,10 @@ async def _spawn_long_running_handler(
         orch.run(), name=f"orchestrator-{handler_name}-{task_id}"
     )
     _running_orchestrators[task_id] = orch_task
+    # Stream B (2026-04-29): register the live orchestrator instance so the
+    # cockpit `/v1/cockpit/state` rollup can read its wave + ticket counts
+    # without poking through asyncio.Task internals. Pruned on done below.
+    cockpit_router.register_orchestrator(task_id, orch)
     if project_id:
         # Clear the project slot when the orchestrator task finishes (any
         # terminal state: success, exception, or cancellation). Scoped to
@@ -553,6 +558,10 @@ async def _spawn_long_running_handler(
         tid: str = task_id,
         sid: str = settings.soul_session_id,
     ) -> None:
+        # Stream B: prune the cockpit registry on terminal state regardless
+        # of success/failure so the rollup doesn't keep reporting a finished
+        # orchestrator as "active".
+        cockpit_router.deregister_orchestrator(tid)
         try:
             exc = t.exception()
         except asyncio.CancelledError:
@@ -645,6 +654,14 @@ async def main() -> None:
 
     # Health endpoint in a background task.
     app = health.make_app()
+    # Stream B (2026-04-29): mount the cockpit rollup endpoint on the same
+    # FastAPI app so alfred-portal can fetch `/v1/cockpit/state` from the
+    # daemon's existing port without standing up a second uvicorn server.
+    cockpit_router.attach_cockpit(
+        app,
+        soul_api_url=settings.soul_api_url,
+        soul_api_key=settings.soul_api_key,
+    )
     asyncio.create_task(_run_health_server(app, settings.health_port))
     health.mark_alive()
 
