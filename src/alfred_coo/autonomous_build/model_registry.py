@@ -256,6 +256,101 @@ def _load_model_registry(force: bool = False) -> Optional[Dict[str, Any]]:
     return _cache.parsed
 
 
+# ── Plan M benchmark-score opt-in hook ────────────────────────────────────
+
+
+# Role → (persona, task_type) mapping for the benchmark-pick hook. Add new
+# rows as new roles are introduced. The fallback path is unchanged when a
+# row is missing (returns None → static chain).
+_ROLE_TO_PERSONA_TASK = {
+    "build": ("alfred-coo-a", "builder"),
+    "builder": ("alfred-coo-a", "builder"),
+    "qa": ("hawkman-qa-a", "qa"),
+    "review": ("hawkman-qa-a", "qa"),
+    "kickoff": ("alfred-coo-a", "orchestrator"),
+    "decompose": ("alfred-coo-a", "orchestrator"),
+}
+
+
+def _role_to_persona_task(role: str):
+    pair = _ROLE_TO_PERSONA_TASK.get(role)
+    if pair is None:
+        return None, None
+    return pair
+
+
+def _benchmark_pick(role: str) -> Optional[str]:
+    """Plan M selector hook — opt-in via ``USE_BENCHMARK_SCORES`` env var.
+
+    When the flag is truthy, attempt to pick the best model for ``role``
+    from the most recent benchmark scores in soul-svc memory. Failure
+    cases (no env, no scores, no eligible model, soul-svc unreachable,
+    asyncio surprises) all return None so the caller falls through to
+    the static registry-based selection — Plan M §4.3 "warn before
+    enforce" discipline.
+
+    Role → (persona, task_type) mapping uses a small heuristic table; if
+    callers want richer routing they pass the explicit pair through the
+    kickoff payload and we never reach this hook. Keeping the mapping
+    here means registry-only callers get one-line opt-in.
+    """
+    if os.environ.get("USE_BENCHMARK_SCORES", "").lower() not in {"1", "true", "yes"}:
+        return None
+    persona, task_type = _role_to_persona_task(role)
+    if persona is None:
+        return None
+    try:  # everything below is best-effort
+        import asyncio as _asyncio
+        from alfred_coo.benchmark.selector import (  # local import
+            NoEligibleModel,
+            pick_best_model,
+        )
+        from alfred_coo.benchmark.storage import load_latest_scores  # local import
+        from alfred_coo.soul import SoulClient  # local import
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[benchmark-pick] import failed: %s", e)
+        return None
+
+    base_url = os.environ.get("SOUL_API_URL")
+    api_key = os.environ.get("SOUL_API_KEY") or os.environ.get("SOUL_API_TOKEN")
+    if not base_url or not api_key:
+        logger.debug("[benchmark-pick] no soul-svc env; skipping")
+        return None
+
+    async def _go():
+        client = SoulClient(
+            base_url=base_url,
+            api_key=api_key,
+            session_id=os.environ.get("SOUL_SESSION_ID", "alfred-coo-benchmark"),
+        )
+        try:
+            scores = await load_latest_scores(
+                client, persona=persona, task_type=task_type, limit=50,
+            )
+        finally:
+            await client.close()
+        if not scores:
+            return None
+        try:
+            return pick_best_model(persona, task_type, scores)
+        except NoEligibleModel:
+            return None
+
+    try:
+        # Don't fight an existing event loop; if one is running, bail.
+        _asyncio.get_running_loop()
+        logger.debug("[benchmark-pick] running inside event loop; skipping")
+        return None
+    except RuntimeError:
+        pass
+
+    try:
+        return _asyncio.run(_go())
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[benchmark-pick] runtime failure: %s", e)
+        return None
+
+
 def _pick_model_for_role(
     role: str,
     attempt_n: int = 0,
@@ -275,11 +370,26 @@ def _pick_model_for_role(
     The caller is expected to fall back to its legacy selection path on
     None (kickoff-payload model_routing or persona.preferred_model).
 
+    Plan M opt-in: when ``USE_BENCHMARK_SCORES`` is set AND ``attempt_n=0``
+    AND benchmark scores exist for the resolved (persona, task_type),
+    return the score-winning model instead of the static primary. The
+    static chain still serves attempts 1..N so a flaky benchmark-picked
+    model can degrade through the regular fallback.
+
     Auto-rollback path: if `role` is currently in `auto_rollback_active`
     (3 consecutive hard-timeouts on its primary), this returns the
     `stable_baseline.<role>` regardless of `attempt_n` — until the next
     registry mtime change clears the rollback.
     """
+    if attempt_n <= 0:
+        bench_pick = _benchmark_pick(role)
+        if bench_pick:
+            logger.info(
+                "[benchmark-pick] role=%s using score-winning model=%s",
+                role, bench_pick,
+            )
+            return bench_pick
+
     reg = registry if registry is not None else _load_model_registry()
     if reg is None:
         return None
