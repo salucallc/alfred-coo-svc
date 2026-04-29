@@ -261,6 +261,17 @@ PR_EXISTS_CACHE_TTL_SEC = 5 * 60
 PR_EXISTS_FRESH_PR_WINDOW_SEC = 7 * 24 * 60 * 60
 HAWKMAN_LOGIN = "salucatiresias"
 
+# Gap 4 (2026-04-29) — already-merged PR pre-flight. Before the dispatch
+# loop fires a builder for a ticket, search GitHub for a merged PR
+# mentioning the identifier; if one exists the ticket has already shipped
+# and we mark MERGED_GREEN + skip dispatch. Eliminates the wasted
+# re-dispatch observed at 06:01:30 UTC 2026-04-29 (SAL-3037 builder fired
+# despite PR #283 having merged 25 min earlier). Cache TTL mirrors
+# PR_EXISTS_CACHE_TTL_SEC — short enough that a fresh merge lands on the
+# next dispatch tick at the latest, long enough that a 16-ticket wave
+# doesn't spam the GitHub Search API every 45s.
+MERGED_PR_CACHE_TTL_SEC = 5 * 60
+
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
@@ -3025,6 +3036,22 @@ class AutonomousBuildOrchestrator:
         # "no PR found".
         self._gh_pr_open_search_fn = None
 
+        # Gap 4 (2026-04-29) builder-skip-already-merged. Maps ticket
+        # identifier (e.g. "SAL-3037") -> (cached_at_ts, pr_url_or_None).
+        # Read by ``_ticket_has_merged_pr`` to skip the GitHub round-trip
+        # on dispatch decisions that fire repeatedly within the cache
+        # window. The orchestrator was observed firing a builder for
+        # SAL-3037 at 06:01:30 UTC despite PR #283 having merged at
+        # 05:36:36 — 25 min earlier. Cache window matches
+        # PR_EXISTS_CACHE_TTL_SEC (5 min): short enough that a fresh merge
+        # is observed by the next tick, long enough to keep a 16-ticket
+        # wave from spamming GitHub Search every 45s.
+        self._merged_pr_cache: Dict[str, Tuple[float, Optional[str]]] = {}
+        # Process-local counter so an operator tailing logs / state events
+        # can distinguish "wave is genuinely idle" from "dispatch is
+        # short-circuiting on already-merged tickets". Reset on restart.
+        self._merged_pr_skips: int = 0
+
     # ── public entry point ─────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -3582,6 +3609,42 @@ class AutonomousBuildOrchestrator:
                         ticket.identifier, _gate_reason,
                     )
                     ticket.status = TicketStatus.ESCALATED
+                    continue
+                # Gap 4 (2026-04-29): if a merged PR already exists for
+                # this ticket, the work has shipped — mark MERGED_GREEN
+                # and skip dispatch. Closes the wasted re-dispatch
+                # observed at 06:01:30 UTC tonight (SAL-3037 builder
+                # fired despite PR #283 having merged 25 min earlier).
+                # Runs BEFORE the open-PR-awaiting-review check below
+                # because a merged PR is strictly stronger evidence:
+                # we want to terminate, not park the ticket in
+                # AWAITING_REVIEW. Cache TTL is 5 min so a 16-ticket
+                # wave doesn't spam GitHub Search every 45s tick.
+                merged_pr_url = await self._ticket_has_merged_pr(
+                    ticket.identifier,
+                )
+                if merged_pr_url is not None:
+                    self._merged_pr_skips += 1
+                    logger.info(
+                        "skipping dispatch: %s already has merged PR %s; "
+                        "marking MERGED_GREEN (skips=%d)",
+                        ticket.identifier, merged_pr_url,
+                        self._merged_pr_skips,
+                    )
+                    ticket.status = TicketStatus.MERGED_GREEN
+                    if not ticket.pr_url:
+                        ticket.pr_url = merged_pr_url
+                    self.state.record_event(
+                        "merged_pr_skip",
+                        identifier=ticket.identifier,
+                        pr_url=merged_pr_url,
+                        skips_total=self._merged_pr_skips,
+                    )
+                    # Best-effort Linear sync. Failure is logged inside
+                    # ``_update_linear_state`` and swallowed — the local
+                    # graph remains source of truth, and the stale-sweep
+                    # / restore paths reconcile on the next run.
+                    await self._update_linear_state(ticket, "Done")
                     continue
                 # SAL-3038 (2026-04-28): if an open PR for this ticket is
                 # already awaiting Hawkman review, skip dispatch and let
@@ -8144,6 +8207,72 @@ class AutonomousBuildOrchestrator:
             if "/pull/" in url:
                 urls.append(url)
         return urls
+
+    # ── Gap 4 (2026-04-29) builder-skip-already-merged ──────────────────────
+
+    async def _ticket_has_merged_pr(
+        self, ticket_ident: str,
+    ) -> Optional[str]:
+        """Return the URL of a merged PR mentioning ``ticket_ident`` in
+        title or body within the lookback window, else None.
+
+        Pre-flight check used by the dispatch loop in ``_dispatch_wave``:
+        if a builder is about to be fired for a ticket whose PR has
+        already merged, we mark the ticket MERGED_GREEN and skip dispatch
+        instead of wasting a build cycle. Reuses the existing
+        ``_search_recent_merged_pr_urls`` helper (the looser raw search
+        also driven by the test-only ``_gh_pr_search_fn`` stub) so we do
+        not maintain a parallel GitHub-search code path.
+
+        Note: this deliberately does NOT layer on the file-overlap
+        intersection check ``_find_recent_merged_pr_for`` applies — that
+        check is a *stale-sweep* tightening rule (PRs that only edit
+        ``_TARGET_HINTS`` are not evidence of implementation). For
+        pre-flight builder-skip we trust a merged-PR-mention as enough
+        signal: the merge bot already gated on Hawkman APPROVE before
+        merging, so the ticket has shipped by definition.
+
+        Results are cached per-ticket for ``MERGED_PR_CACHE_TTL_SEC`` so
+        a 16-ticket wave doesn't fire 16 Search calls every 45s tick.
+        Tests stub the round-trip via ``self._gh_pr_search_fn`` (shared
+        with the stale-sweep helpers).
+        """
+        if not ticket_ident:
+            return None
+
+        # Test-environment guard: when the orchestrator runs under pytest
+        # WITHOUT an explicit ``_gh_pr_search_fn`` stub, the caller hasn't
+        # opted into the network round-trip. Returning None immediately
+        # keeps the live API out of the hot path of dispatch-loop tests
+        # that don't care about this short-circuit. Tests that DO care
+        # set the stub, which dominates the search call below.
+        if (
+            getattr(self, "_gh_pr_search_fn", None) is None
+            and os.environ.get("PYTEST_CURRENT_TEST")
+        ):
+            return None
+
+        now = time.time()
+        cached = self._merged_pr_cache.get(ticket_ident)
+        if cached is not None:
+            cached_at, cached_url = cached
+            if now - cached_at < MERGED_PR_CACHE_TTL_SEC:
+                return cached_url
+
+        url: Optional[str] = None
+        try:
+            urls = await self._search_recent_merged_pr_urls(ticket_ident)
+            url = urls[0] if urls else None
+        except Exception:
+            logger.exception(
+                "[merged-skip] PR search raised for %s; treating as "
+                "no-merged-PR and proceeding with dispatch",
+                ticket_ident,
+            )
+            url = None
+
+        self._merged_pr_cache[ticket_ident] = (now, url)
+        return url
 
     # ── Inherited-PR review-fire (Gap 2, 2026-04-29) ────────────────────────
 
