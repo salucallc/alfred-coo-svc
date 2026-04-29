@@ -102,10 +102,18 @@ jobs:
           # Pull the published image for this SHA. metadata-action
           # tags with type=sha,prefix=sha-,format=short so the tag
           # matches our resolved SHORT_SHA above.
-          docker compose pull
+          #
+          # The repo-root compose now defines three services for the
+          # local cockpit bundle (alfred-coo + soul-svc + cockpit). The
+          # Oracle sidecar deploy only owns the alfred-coo container —
+          # soul-svc has its own systemd unit on this host, and cockpit
+          # is not part of the production deploy. Scope pull + up to the
+          # alfred-coo service only so the sibling services stay
+          # untouched.
+          docker compose pull alfred-coo
 
           # Recreate (or no-op) the container with the resolved tag.
-          docker compose up -d --remove-orphans
+          docker compose up -d --remove-orphans alfred-coo
 
           # Wait up to ~75s for the container to report healthy. The
           # runner runs inside its own container with isolated loopback,
@@ -121,8 +129,8 @@ jobs:
             # one of: starting | healthy | unhealthy. If the container
             # has no healthcheck defined the format spits "<no value>"
             # and we treat that as a fallback success on State.Running.
-            health=$(docker inspect -f '{{.State.Health.Status}}' alfred-coo-svc 2>/dev/null || echo "missing")
-            running=$(docker inspect -f '{{.State.Running}}' alfred-coo-svc 2>/dev/null || echo "false")
+            health=$(docker inspect -f '{{.State.Health.Status}}' alfred-coo 2>/dev/null || echo "missing")
+            running=$(docker inspect -f '{{.State.Running}}' alfred-coo 2>/dev/null || echo "false")
             echo "attempt ${i}: health=${health} running=${running}"
             if [ "$health" = "healthy" ]; then
               echo "container healthy on attempt ${i}"
@@ -132,7 +140,7 @@ jobs:
             if [ "$health" = "unhealthy" ]; then
               echo "::error::container reported unhealthy on attempt ${i}"
               docker compose ps
-              docker compose logs --tail=80 alfred-coo-svc
+              docker compose logs --tail=80 alfred-coo
               exit 1
             fi
             sleep 5
@@ -140,5 +148,5 @@ jobs:
 
           echo "::error::container failed to become healthy within ~75s"
           docker compose ps
-          docker compose logs --tail=80 alfred-coo-svc
+          docker compose logs --tail=80 alfred-coo
           exit 1
