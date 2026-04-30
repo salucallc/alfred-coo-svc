@@ -8181,36 +8181,137 @@ class AutonomousBuildOrchestrator:
 
     # ── on-all-green actions ────────────────────────────────────────────────
 
+    # SAL-3713: action pattern matchers for in-process execution. The
+    # previous mesh-dispatch approach orphaned tasks under the
+    # ``[v1-ga-finalize]`` persona tag, which had no executor anywhere
+    # in the codebase, so v7af forced a manual rc.6 tag.
+    _ON_ALL_GREEN_TAG_RE = re.compile(
+        r"^tag\s+(?P<name>[A-Za-z0-9._\-]+)"
+        r"(?:\s+on\s+(?P<repo>[\w./\-]+))?\s*$"
+    )
+
     async def _run_on_all_green_actions(self) -> None:
+        """Execute release-finalization actions when all waves go green.
+
+        SAL-3713: actions are now dispatched in-process via direct
+        GitHub API calls instead of mesh tasks under a phantom persona
+        tag. Recognised patterns:
+
+        * ``tag <name> [on <owner/repo>]`` — create a GitHub release
+          via the Releases API. Tag points at the default branch HEAD
+          on the target repo (defaults to ``salucallc/alfred-coo-svc``).
+          Pre-release flag auto-set when name contains ``rc.``,
+          ``alpha``, ``beta``, or ``preview``.
+
+        Unknown patterns log and record
+        ``on_all_green_skipped_unknown`` for operator visibility.
+        Failures record ``on_all_green_failed`` and continue with
+        the next action so a single broken action doesn't block the
+        rest of the finalization batch.
+        """
         actions = self.payload.get("on_all_green") or []
         if not isinstance(actions, list) or not actions:
             return
-        for action in actions:
-            if not isinstance(action, str) or not action.strip():
+        for raw in actions:
+            if not isinstance(raw, str) or not raw.strip():
                 continue
-            title = (
-                f"[persona:alfred-coo-a] [v1-ga-finalize] "
-                f"on_all_green: {action[:80]}"
-            )
-            body = (
-                f"Parent autonomous_build kickoff: {self.task_id}\n"
-                f"Action: {action}\n"
-                f"\n"
-                f"Execute this on_all_green action for Mission Control v1.0 GA. "
-                f"Use the appropriate tools (propose_pr / slack_post / "
-                f"http_get). Stay within scope.\n"
-            )
+            action = raw.strip()
             try:
-                await self.mesh.create_task(
-                    title=title,
-                    description=body,
-                    from_session_id=self.settings.soul_session_id,
-                )
-                self.state.record_event("on_all_green_dispatched", action=action)
+                handled = await self._dispatch_on_all_green_action(action)
+                if handled:
+                    self.state.record_event(
+                        "on_all_green_completed", action=action,
+                    )
+                else:
+                    logger.warning(
+                        "on_all_green: unknown action pattern %r; "
+                        "recognised: 'tag <name> [on <repo>]'",
+                        action,
+                    )
+                    self.state.record_event(
+                        "on_all_green_skipped_unknown", action=action,
+                    )
             except Exception:
                 logger.exception(
-                    "failed to dispatch on_all_green action: %s", action
+                    "on_all_green action failed: %s", action,
                 )
+                self.state.record_event(
+                    "on_all_green_failed", action=action,
+                )
+
+    async def _dispatch_on_all_green_action(self, action: str) -> bool:
+        """Pattern-match ``action`` to an in-process handler.
+
+        Returns ``True`` when a pattern matched and the handler ran
+        (success or failure raised), ``False`` for unrecognised
+        patterns so the caller can log + record the skip.
+        """
+        m = self._ON_ALL_GREEN_TAG_RE.match(action)
+        if m:
+            tag = m.group("name")
+            repo = m.group("repo") or "salucallc/alfred-coo-svc"
+            await self._finalize_release_tag(tag, repo)
+            return True
+        return False
+
+    async def _finalize_release_tag(self, tag: str, repo: str) -> None:
+        """Create a GitHub release on ``repo`` tagged ``tag``.
+
+        Uses the Releases API directly (httpx) rather than the gh CLI
+        so the daemon doesn't need ``gh auth login`` state inside the
+        container. Pre-release flag is auto-set when the tag name
+        contains ``rc.``, ``alpha``, ``beta``, or ``preview``.
+
+        Idempotent on tag-already-exists (422 from GitHub) — the
+        method logs + returns rather than raising, which lets
+        ``_run_on_all_green_actions`` mark the action complete on a
+        re-run after a partial finalization.
+        """
+        token = os.environ.get("GITHUB_TOKEN") or ""
+        if not token:
+            raise RuntimeError(
+                f"on_all_green tag {tag!r}: GITHUB_TOKEN unset",
+            )
+        is_pre = any(
+            marker in tag.lower()
+            for marker in ("rc.", "alpha", "beta", "preview")
+        )
+        body = {
+            "tag_name": tag,
+            "name": f"{tag} — auto-tagged on all-green",
+            "body": (
+                f"Auto-tagged by alfred-coo orchestrator on all-green.\n"
+                f"Parent kickoff: `{self.task_id}`."
+            ),
+            "prerelease": is_pre,
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"https://api.github.com/repos/{repo}/releases",
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "saluca-alfred/1.0",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        if r.status_code in (200, 201):
+            logger.info(
+                "on_all_green: created release %s on %s (prerelease=%s)",
+                tag, repo, is_pre,
+            )
+            return
+        if r.status_code == 422 and "already_exists" in r.text:
+            logger.info(
+                "on_all_green: release %s on %s already exists; idempotent skip",
+                tag, repo,
+            )
+            return
+        raise RuntimeError(
+            f"GitHub release create failed for {tag} on {repo}: "
+            f"{r.status_code} {r.text[:300]}"
+        )
 
     # ── stubs for later AB tickets ──────────────────────────────────────────
 
