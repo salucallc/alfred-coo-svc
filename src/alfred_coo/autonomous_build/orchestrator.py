@@ -4356,11 +4356,16 @@ class AutonomousBuildOrchestrator:
                         self.deadlock_grace_sec, blocked_ids,
                     )
                     for t in non_terminal:
+                        # SAL-3676: include ABANDONED upstreams in the
+                        # diagnostic — they're force-fail terminals that
+                        # block downstreams just like FAILED.
                         upstream_failed = [
                             self.graph.nodes[u].identifier
                             for u in (t.blocks_in or [])
                             if u in self.graph.nodes
-                            and self.graph.nodes[u].status == TicketStatus.FAILED
+                            and self.graph.nodes[u].status in (
+                                TicketStatus.FAILED, TicketStatus.ABANDONED,
+                            )
                         ]
                         t.status = TicketStatus.FAILED
                         self.state.record_event(
@@ -5875,8 +5880,14 @@ class AutonomousBuildOrchestrator:
         operator handling a phantom-loop ticket sees the same Linear
         state + label + comment as a grounding-gap escalation:
 
-          1. ``ticket.status = ESCALATED`` (terminal-non-failure;
-             wave-gate excludes from numerator + denominator).
+          1. ``ticket.status = ABANDONED`` (terminal abandonment).
+             SAL-3676 (2026-04-29): pre-fix this set ESCALATED, which
+             the wave-gate excused as legitimate. A phantom-loop is a
+             stuck-child force-fail — the orchestrator gave up on the
+             ticket because the child kept disappearing — which IS a
+             failure. ABANDONED is counted in the wave-gate FAILED
+             column so the gate surfaces real abandonments instead of
+             masking them as grounding-gaps.
           2. Linear state → ``Backlog`` (escapes orphan-active sweep
              without falsely claiming the ticket shipped).
           3. Linear label → ``human-assigned`` (dispatch-gate excuses
@@ -5891,10 +5902,10 @@ class AutonomousBuildOrchestrator:
 
         Best-effort: if any Linear write raises the helpers themselves
         log + swallow; the orchestrator's graph stays source of truth
-        and the ESCALATED status alone is enough to lift the wave-gate.
+        and the ABANDONED status alone is enough to lift the wave-gate.
         """
         n_in_window = len(self._consecutive_phantoms.get(ticket.id, []))
-        ticket.status = TicketStatus.ESCALATED
+        ticket.status = TicketStatus.ABANDONED  # SAL-3676
         # Clear in-flight bookkeeping so the next dispatch path (if any)
         # cannot re-attach to a stale child. ESCALATED is terminal so
         # this is mostly defensive.
@@ -5932,7 +5943,7 @@ class AutonomousBuildOrchestrator:
             )
             ticket.linear_state = "Backlog"
         # Reset the counter so a future re-entry starts fresh. The
-        # ESCALATED terminal status already prevents re-dispatch on
+        # ABANDONED terminal status already prevents re-dispatch on
         # this run; clearing the history matters only if an operator
         # reopens the ticket in Linear and the daemon picks it up
         # again on a later kickoff.
@@ -5945,7 +5956,15 @@ class AutonomousBuildOrchestrator:
         operator handling a hard-timeout sees the same Linear surface as
         a phantom-loop or wave-stall escalation:
 
-          1. ``ticket.status = ESCALATED`` (terminal-non-failure).
+          1. ``ticket.status = ABANDONED`` (terminal abandonment).
+             SAL-3676 (2026-04-29): pre-fix this set ESCALATED, which the
+             wave-gate excused as if the orchestrator never had workable
+             scope (parity with grounding-gap). That was wrong — a
+             hard-timeout means the orchestrator HAD scope and the
+             builder simply failed to ship within budget. ABANDONED is
+             counted in the wave-gate FAILED column so a wave full of
+             hard-timeout abandonments surfaces as "X failures" instead
+             of "nothing shipped".
           2. Linear → ``Backlog`` (escapes orphan-active sweep without
              falsely claiming the ticket shipped).
           3. Linear label → ``human-assigned`` (dispatch-gate excuses
@@ -5960,10 +5979,10 @@ class AutonomousBuildOrchestrator:
         state (operator already closed it manually, or this is re-entry
         from rehydrated state).
         """
-        ticket.status = TicketStatus.ESCALATED
+        ticket.status = TicketStatus.ABANDONED  # SAL-3676
         ticket.last_failure_reason = None
         # Drop child task id since we're abandoning the dispatch entirely;
-        # ESCALATED is terminal so re-attach is impossible on this run.
+        # ABANDONED is terminal so re-attach is impossible on this run.
         ticket.child_task_id = None
         ticket.dispatched_at = None
         already_terminal = (ticket.linear_state or "").strip().lower() in (
@@ -6081,8 +6100,15 @@ class AutonomousBuildOrchestrator:
         ``grounding_gap_ident`` audit string. Kept as a sibling helper
         so the two circuit-breaker paths can evolve independently
         without fighting over a single super-helper's signature.
+
+        SAL-3676 (2026-04-29): now sets ABANDONED instead of ESCALATED.
+        A wave-stall force-pass abandons every non-terminal ticket in
+        the wave because none of them produced green progress in the
+        ``WAVE_STALL_FORCE_PASS_SEC`` window — that's a real failure
+        class, not a legitimate grounding-gap, and the wave-gate must
+        count it as such (see ``_is_wave_gate_excused`` rationale).
         """
-        ticket.status = TicketStatus.ESCALATED
+        ticket.status = TicketStatus.ABANDONED  # SAL-3676
         ticket.child_task_id = None
         ticket.last_failure_reason = None
         self.state.record_event(
@@ -7835,7 +7861,17 @@ class AutonomousBuildOrchestrator:
         excused_ids = {t.id for t in excused}
         scored = [t for t in effective if t.id not in excused_ids]
 
-        failed = [t for t in scored if t.status == TicketStatus.FAILED]
+        # SAL-3676 (2026-04-29): ABANDONED counts as FAILED for wave-gate
+        # accounting. The status was split off from ESCALATED to capture
+        # force-fail-on-timeout / phantom-loop / wave-stall — three classes
+        # of "orchestrator gave up on the ticket" that pre-fix were
+        # silently excused as if they were grounding-gaps. Wave-gate must
+        # see them in the failed column so the green ratio reflects what
+        # actually shipped.
+        failed = [
+            t for t in scored
+            if t.status in (TicketStatus.FAILED, TicketStatus.ABANDONED)
+        ]
         cp_failed = [t for t in failed if t.is_critical_path]
         green = [t for t in scored if t.status == TicketStatus.MERGED_GREEN]
         threshold = float(self.wave_green_ratio_threshold)
@@ -8031,6 +8067,17 @@ class AutonomousBuildOrchestrator:
         # PATH_CONFLICT excusal so a ticket whose escalate path fired
         # post-dispatch (i.e. was not caught by wave-start verification)
         # is also excluded from the green ratio.
+        #
+        # SAL-3676 (2026-04-29): ESCALATED used to cover three distinct
+        # classes — legitimate-grounding-gap, force-fail-on-timeout, and
+        # phantom-loop-circuit-breaker — and excusing ALL of them here
+        # masked real failures. Tonight the MSSP-Ext orchestrator crashed
+        # at green=2 failed=0 excused=4-of-6 ratio=0.33 because three of
+        # those four "excused" tickets were hard-timeout abandonments,
+        # not grounding-gaps. The split now lives in the status enum:
+        # ABANDONED is the new force-fail terminal and is NOT excused
+        # here (it falls through and counts in the FAILED column),
+        # ESCALATED keeps the legitimate-non-failure semantics.
         if ticket.status == TicketStatus.ESCALATED:
             return True
 
@@ -9695,7 +9742,14 @@ class AutonomousBuildOrchestrator:
         self._snapshot_graph_into_state()
         total = len(self.graph)
         green = sum(1 for t in self.graph if t.status == TicketStatus.MERGED_GREEN)
-        failed = sum(1 for t in self.graph if t.status == TicketStatus.FAILED)
+        # SAL-3676: ABANDONED is a force-fail terminal — surface it in the
+        # final summary alongside FAILED so the kickoff completion event
+        # reflects real outcomes (a hard-timeout abandonment is just as
+        # much a failure as a builder-emitted FAILED).
+        failed = sum(
+            1 for t in self.graph
+            if t.status in (TicketStatus.FAILED, TicketStatus.ABANDONED)
+        )
         text = (
             f"autonomous_build complete: {green}/{total} merged_green, "
             f"{failed} failed, ${self.state.cumulative_spend_usd:.2f} spent, "

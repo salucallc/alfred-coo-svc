@@ -5929,10 +5929,12 @@ async def test_consecutive_phantom_circuit_breaker_escalates_after_5(
 ):
     """SAL-3070 / SAL-3038 fix #1: a ticket that produces 5 consecutive
     phantom-cleanup events inside the 10-min trailing window must be
-    force-escalated by the circuit breaker. The 5th call to
+    force-failed by the circuit breaker. The 5th call to
     ``_apply_phantom_carve_out`` for the same FAILED+phantom_child ticket
-    flips it to ESCALATED, transitions Linear to Backlog, applies the
-    ``human-assigned`` label, and posts an audit comment with
+    flips it to ABANDONED (SAL-3676 — terminal-failure that counts in the
+    wave-gate FAILED column; pre-fix this set ESCALATED and was excused
+    as if it were a grounding-gap), transitions Linear to Backlog, applies
+    the ``human-assigned`` label, and posts an audit comment with
     grounding_gap_ident=``phantom-loop-circuit-breaker``. Calls 1..4 still
     go through the SAL-2870 phantom-child carve-out unchanged (PENDING +
     retry_count unchanged) so legitimate transient flakes are unaffected.
@@ -5992,9 +5994,13 @@ async def test_consecutive_phantom_circuit_breaker_escalates_after_5(
                 f"retry_count={t.retry_count}"
             )
 
-    # Trip outcome: ESCALATED + Backlog + human-assigned + audit comment.
-    assert t.status == TicketStatus.ESCALATED, (
-        f"5th consecutive phantom in 10min window must escalate; "
+    # Trip outcome: ABANDONED + Backlog + human-assigned + audit comment.
+    # SAL-3676 (2026-04-29): pre-fix this asserted ESCALATED. The split
+    # moves phantom-loop force-fails to ABANDONED so the wave-gate
+    # excused-axis (which still excuses ESCALATED) does NOT mask the
+    # abandonment as a grounding-gap.
+    assert t.status == TicketStatus.ABANDONED, (
+        f"5th consecutive phantom in 10min window must be abandoned; "
         f"got {t.status!r}"
     )
     assert ("SAL-3070", "Backlog") in linear_calls, (
@@ -6151,12 +6157,15 @@ async def test_wave_gate_stall_force_pass_after_30min(monkeypatch):
         "wave stalled for >30min must force-pass; helper returned False"
     )
 
-    # Both non-terminal tickets escalated.
-    assert a.status == TicketStatus.ESCALATED, (
-        f"stalled non-terminal ticket must be escalated; got {a.status!r}"
+    # Both non-terminal tickets abandoned. SAL-3676: wave-stall force-pass
+    # is a force-fail class — the wave never made green progress, so the
+    # ticket is abandoned, not legitimately escalated. ABANDONED counts in
+    # the wave-gate FAILED column (ESCALATED would be excused).
+    assert a.status == TicketStatus.ABANDONED, (
+        f"stalled non-terminal ticket must be abandoned; got {a.status!r}"
     )
-    assert b.status == TicketStatus.ESCALATED, (
-        f"stalled non-terminal ticket must be escalated; got {b.status!r}"
+    assert b.status == TicketStatus.ABANDONED, (
+        f"stalled non-terminal ticket must be abandoned; got {b.status!r}"
     )
     # The already-MERGED_GREEN ticket is left alone.
     assert g.status == TicketStatus.MERGED_GREEN, (
@@ -6209,7 +6218,9 @@ async def test_builder_hard_timeout_consumes_retry_and_escalates_on_exhaustion(
     """Sequential-discipline Fix 1: a ticket dispatched but silent for
     >BUILDER_HARD_TIMEOUT_SEC must force-fail with retry budget consumed
     (NOT phantom-class). When retry is exhausted on the timeout, the
-    ticket force-escalates to ESCALATED + Linear Backlog +
+    ticket force-fails to ABANDONED (SAL-3676 — terminal-failure that
+    counts in the wave-gate FAILED column; pre-fix this set ESCALATED
+    and got masked as a grounding-gap excusal) + Linear Backlog +
     ``human-assigned`` label + audit comment with grounding_gap_ident=
     ``builder-hard-timeout`` so an operator gets the ticket instead of
     seeing it loop forever.
@@ -6315,10 +6326,12 @@ async def test_builder_hard_timeout_consumes_retry_and_escalates_on_exhaustion(
 
     await orch._poll_children()
 
-    # Exhaustion outcome: ESCALATED, retry_count incremented to budget,
+    # Exhaustion outcome: ABANDONED, retry_count incremented to budget,
     # Linear Backlog + human-assigned + audit comment all fired.
-    assert t.status == TicketStatus.ESCALATED, (
-        f"hard-timeout with budget exhausted must escalate; got {t.status!r}"
+    # SAL-3676: pre-fix this asserted ESCALATED; ABANDONED is the new
+    # terminal-failure class so the wave-gate counts it under FAILED.
+    assert t.status == TicketStatus.ABANDONED, (
+        f"hard-timeout with budget exhausted must be abandoned; got {t.status!r}"
     )
     assert t.retry_count == 2, (
         f"final retry slot must be consumed on exhaustion-escalation; "
