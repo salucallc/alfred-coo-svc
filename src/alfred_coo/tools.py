@@ -716,6 +716,324 @@ def _gate_a_apev_byte_match(
     )
 
 
+# Gate D regexes: extract route paths from FastAPI / Flask / Starlette decorators.
+# Catches @router.get("/path"), @router.post("/path", ...), @app.put("/x"),
+# @router.api_route("/y"), @app.delete("/z"), etc. Group 1 is the path.
+_ROUTE_DECORATOR_RE = re.compile(
+    r"""@(?:router|app)\.(?:get|post|put|patch|delete|head|options|api_route)\s*\(\s*['"]([^'"]+)['"]""",
+    re.VERBOSE,
+)
+# Catches `app.include_router(some_router, prefix="/v1/foo")` and the
+# `prefix=` form on `APIRouter(prefix="/v1/foo")`.
+_INCLUDE_PREFIX_RE = re.compile(
+    r"""(?:include_router|APIRouter)\s*\([^)]*?prefix\s*=\s*['"]([^'"]+)['"]""",
+)
+# Catches URL strings used in tests: client.get("/v1/foo"), httpx.post("/v1/bar"),
+# requests.put("/v1/baz"). Conservative: only matches when the URL is a literal
+# string starting with "/" — it's the test-file form Hawkman has been catching.
+_TEST_URL_CALL_RE = re.compile(
+    r"""(?:client|httpx|requests|conn|self\.client|TestClient\([^)]*\))\.(?:get|post|put|patch|delete|head|options)\s*\(\s*['"](/[^'"\s?#]+)""",
+)
+
+
+def _gate_d_endpoint_path_consistency(
+    files: Optional[Mapping[str, str]],
+) -> Optional[str]:
+    """Gate D (autonomy): every URL path called from a test file in the
+    propose_pr / update_pr files dict must be served by at least one
+    route decorator (with optional include_router prefix) in a router
+    file in the same files dict.
+
+    Catches the soul-svc PR #66 cycle-3 pattern where the test called
+    ``/v1/mssp/audit`` but the router mounted audit at
+    ``/v1/mssp/consent/audit`` — Hawkman GATE 3 (target drift) rejected
+    on every cycle.
+
+    Fail-open conditions (gate is silent, returns None):
+      - No files dict, or no test files in the dict
+      - No router files in the dict (only adding tests; prior router
+        change unrelated to this PR)
+      - No URL calls extractable from tests
+
+    These reduce to "this PR isn't adding both tests and routes
+    together". Don't block — Hawkman still does the deeper check.
+
+    Returns ``None`` to pass, or a string error to abort propose_pr.
+    """
+    if not files:
+        return None
+    test_urls: dict[str, str] = {}  # url → first test file that calls it
+    decorator_paths: list[str] = []
+    include_prefixes: list[str] = []
+    for path, content in files.items():
+        if not isinstance(path, str) or not isinstance(content, str):
+            continue
+        # Tests: extract URL calls
+        if "/test" in path or path.startswith("test") or "/tests/" in path:
+            for m in _TEST_URL_CALL_RE.finditer(content):
+                url = m.group(1)
+                test_urls.setdefault(url, path)
+            continue
+        # Routers / app modules: extract route decorators + include prefixes
+        if (
+            "router" in path.lower()
+            or "/api" in path.lower()
+            or path.endswith("main.py")
+            or path.endswith("app.py")
+            or path.endswith("__init__.py")
+        ):
+            for m in _ROUTE_DECORATOR_RE.finditer(content):
+                decorator_paths.append(m.group(1))
+            for m in _INCLUDE_PREFIX_RE.finditer(content):
+                include_prefixes.append(m.group(1))
+    if not test_urls or not decorator_paths:
+        # Only one side of the contract is in this PR — can't check.
+        return None
+    # Build the full set of mountable paths: every decorator path,
+    # plus every (prefix + decorator_path) combination. Conservative:
+    # also accept exact-match decorator without prefix (some routers
+    # expose paths at root).
+    mounted: set[str] = set(decorator_paths)
+    for pref in include_prefixes:
+        for dec in decorator_paths:
+            mounted.add(pref.rstrip("/") + dec)
+    # Strip path parameters for fuzzy match: "/v1/foo/{id}" matches
+    # test call "/v1/foo/abc-123".
+    def _strip_params(p: str) -> str:
+        return re.sub(r"\{[^}]+\}", "<param>", p)
+    mounted_normalised = {_strip_params(p) for p in mounted}
+
+    def _matches(test_url: str) -> bool:
+        # Strip query string and fragment if any.
+        u = test_url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        if u in mounted or u in mounted_normalised:
+            return True
+        # Try fuzzy: replace each path segment with <param> and see if
+        # the test url shape matches a mounted shape.
+        u_parts = u.split("/")
+        for m in mounted_normalised:
+            m_parts = m.split("/")
+            if len(u_parts) != len(m_parts):
+                continue
+            if all(
+                up == mp or mp == "<param>"
+                for up, mp in zip(u_parts, m_parts)
+            ):
+                return True
+        return False
+
+    orphans = sorted(
+        url for url in test_urls if not _matches(url)
+    )
+    if not orphans:
+        return None
+    sample = orphans[:5]
+    sample_files = sorted({test_urls[u] for u in sample})
+    return (
+        f"GATE_D_ENDPOINT_DRIFT: {len(orphans)} test URL(s) call paths "
+        f"that are not mounted by any router in this PR. Hawkman "
+        f"GATE 3 (target drift) will REQUEST_CHANGES; the live HTTP "
+        f"call would 404. Orphans: {sample!r}. Test files involved: "
+        f"{sample_files!r}. Mounted paths in PR: "
+        f"{sorted(mounted_normalised)[:10]!r}. "
+        f"Either add the missing route(s) or fix the test URL(s)."
+    )
+
+
+# Gate B-lite: regex patterns Hawkman explicitly names as placeholder
+# rejects in its system prompt. Line-grep matchers — no AST. Conservative
+# scope (only catches the unambiguous patterns) so false-positive rate
+# is near zero. Full Gate B (AST-walk over test functions, count
+# behavioral asserts, classify mocks vs trivial) is deferred to a
+# follow-up; this one closes ~40% of the easy reject cases at <30 LOC.
+#
+# `_BL_TRIVIAL_TEST_BODY_RE` matches a `def test_*` function whose body
+# (until the next dedent) consists solely of:
+#   - `pass`
+#   - `assert True`
+#   - `raise NotImplementedError(...)` / bare `NotImplementedError`
+# Multiline match; allows whitespace + a single docstring line.
+_BL_TRIVIAL_TEST_BODY_RE = re.compile(
+    r"""
+    ^(?P<indent>[ \t]*)def\s+test_\w+\s*\([^)]*\)\s*(?:->\s*[^:]+)?\s*:\s*\n
+    (?:[ \t]+(?:\"\"\".*?\"\"\"|'''.*?''')\s*\n)?
+    (?P<body>(?:[ \t]+(?:pass|assert\s+True|raise\s+NotImplementedError(?:\([^)]*\))?|NotImplementedError(?:\([^)]*\))?)\s*(?:\#[^\n]*)?\n)+)
+    """,
+    re.VERBOSE | re.MULTILINE | re.DOTALL,
+)
+# `_BL_PLACEHOLDER_PLAN_DOC_RE` matches the literal phrase Hawkman's
+# prompt rejects on: "placeholder implementations may need to be
+# replaced" (case-insensitive). Plan docs that admit this are an
+# automatic Hawkman REQUEST_CHANGES.
+_BL_PLACEHOLDER_PLAN_DOC_RE = re.compile(
+    r"placeholder\s+implementations?\s+(?:may\s+)?need(?:s)?\s+to\s+be\s+replaced",
+    re.IGNORECASE,
+)
+
+
+def _gate_b_lite_placeholder_tests(
+    files: Optional[Mapping[str, str]],
+) -> Optional[str]:
+    """Gate B-lite (autonomy): reject propose_pr / update_pr if the
+    files dict contains test files with placeholder-only test bodies
+    OR plan docs admitting placeholder implementations.
+
+    Catches the four unambiguous patterns Hawkman's system prompt
+    explicitly rejects: ``assert True``, ``pass`` (in a ``test_*``
+    function), ``NotImplementedError``, and the plan-doc admission
+    string "placeholder implementations may need to be replaced".
+
+    Conservative on purpose: this is a line-grep, not an AST analysis.
+    A test function with a SINGLE trivial assertion FOLLOWED BY a real
+    behavioral assertion will pass this gate (it only fires when the
+    body is 100% trivial). Full Gate B with classification of mocks vs
+    behavioral asserts is deferred.
+
+    Returns ``None`` to pass, or a string error to abort propose_pr.
+    """
+    if not files:
+        return None
+    placeholder_tests: list[tuple[str, str]] = []  # (file, snippet)
+    placeholder_plans: list[str] = []
+    for path, content in files.items():
+        if not isinstance(path, str) or not isinstance(content, str):
+            continue
+        if "/test" in path or path.startswith("test") or "/tests/" in path:
+            for m in _BL_TRIVIAL_TEST_BODY_RE.finditer(content):
+                snippet = m.group(0).strip().splitlines()[0]
+                placeholder_tests.append((path, snippet[:120]))
+        if path.startswith("plans/") or path.endswith(".md"):
+            if _BL_PLACEHOLDER_PLAN_DOC_RE.search(content):
+                placeholder_plans.append(path)
+    if not placeholder_tests and not placeholder_plans:
+        return None
+    parts = ["GATE_B_LITE_PLACEHOLDER:"]
+    if placeholder_tests:
+        parts.append(
+            f" {len(placeholder_tests)} test function(s) have "
+            f"placeholder-only bodies (assert True / pass / "
+            f"NotImplementedError). Hawkman GATE 4 will REQUEST_CHANGES. "
+            f"Add real behavioral assertions. Examples:"
+        )
+        for f, snip in placeholder_tests[:3]:
+            parts.append(f"  - {f}: {snip}")
+    if placeholder_plans:
+        parts.append(
+            f" {len(placeholder_plans)} plan doc(s) contain the literal "
+            f"phrase 'placeholder implementations may need to be "
+            f"replaced' which Hawkman explicitly rejects on: "
+            f"{placeholder_plans[:3]!r}. Remove the admission and ship "
+            f"the actual implementation."
+        )
+    return "\n".join(parts)
+
+
+def _fetch_latest_request_changes_review(
+    owner: str, repo: str, pr_number: int, *, token: str
+) -> Optional[str]:
+    """Fetch the most recent CHANGES_REQUESTED review body for a PR.
+
+    Returns the review body string, or ``None`` if no CHANGES_REQUESTED
+    review exists OR the GH API call fails. Used by Gate E.
+    """
+    if not token:
+        return None
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/"
+        f"{pr_number}/reviews?per_page=30"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            reviews = json.loads(r.read())
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return None
+    except Exception:
+        return None
+    if not isinstance(reviews, list):
+        return None
+    rejects = [
+        rv for rv in reviews
+        if isinstance(rv, dict) and rv.get("state") == "CHANGES_REQUESTED"
+    ]
+    if not rejects:
+        return None
+    rejects.sort(key=lambda rv: rv.get("submitted_at") or "", reverse=True)
+    return rejects[0].get("body") or None
+
+
+def _gate_e_fix_round_amnesia(
+    body: Optional[str],
+    *,
+    pr_url: Optional[str],
+    token: Optional[str] = None,
+    review_fetcher: Optional[Callable[..., Optional[str]]] = None,
+) -> Optional[str]:
+    """Gate E (autonomy): on update_pr, the new body MUST acknowledge
+    the prior CHANGES_REQUESTED review.
+
+    Catches the soul-svc PR #66 pattern where cycle 2 + cycle 3 had
+    identical Hawkman gate failures because the fix-round builder
+    never read the prior review. Forces the body to either:
+
+      (a) carry an explicit ``## Addresses Prior Feedback`` heading, OR
+      (b) cite ≥1 ten-character phrase from the prior review body
+          (rough proxy for "the builder read it")
+
+    Fail-open conditions:
+      - No prior CHANGES_REQUESTED review on the PR
+      - GH API call fails
+      - pr_url is malformed
+    """
+    if not body or not pr_url:
+        return None
+    m = re.match(
+        r"^https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$",
+        pr_url.strip(),
+    )
+    if not m:
+        return None
+    owner, repo, num_str = m.group(1), m.group(2), m.group(3)
+    fetcher = review_fetcher or _fetch_latest_request_changes_review
+    prior = fetcher(owner, repo, int(num_str), token=token or "")
+    if not prior or len(prior.strip()) < 30:
+        return None  # no actionable prior review
+    # Path (a): explicit heading
+    if re.search(
+        r"(?im)^\#{2,}\s*(?:addresses\s+prior|prior\s+feedback|fixes?\s+from\s+previous|response\s+to\s+review)",
+        body,
+    ):
+        return None
+    # Path (b): word-or-phrase overlap. Pull all 10+-char alphanumeric
+    # tokens from prior review and check if any appears in body. We use
+    # 10 chars because shorter overlaps (e.g. "endpoint", "test") fire
+    # false positives on every PR.
+    phrases = set()
+    for chunk in re.findall(r"[A-Za-z0-9_/.\-]{10,}", prior):
+        phrases.add(chunk)
+    if not phrases:
+        return None
+    overlap = phrases & set(re.findall(r"[A-Za-z0-9_/.\-]{10,}", body))
+    if overlap:
+        return None
+    preview = prior[:300] + ("..." if len(prior) > 300 else "")
+    return (
+        f"GATE_E_FIX_ROUND_AMNESIA: this is a fix-round update_pr but "
+        f"the new body neither carries a `## Addresses Prior Feedback` "
+        f"heading nor cites any 10-char-or-longer phrase from the prior "
+        f"CHANGES_REQUESTED review. Hawkman is likely to repeat the "
+        f"same gate failure. Prior review excerpt:\n\n{preview}"
+    )
+
+
 def _maybe_inject_apev_citation(
     body: Optional[str],
     *,
@@ -951,6 +1269,23 @@ async def propose_pr(
     )
     if gate_a_err:
         return {"error": gate_a_err}
+
+    # Gate D (autonomy gate): if the PR adds both router files and test
+    # files, every URL the tests call must be mounted by some route in
+    # the same files dict. Catches the soul-svc PR #66 cycle-3 pattern
+    # where tests called /v1/mssp/audit but the router mounted at
+    # /v1/mssp/consent/audit. Fail-open when only one side is in scope.
+    gate_d_err = _gate_d_endpoint_path_consistency(files)
+    if gate_d_err:
+        return {"error": gate_d_err}
+
+    # Gate B-lite (autonomy gate): reject if any test file has a 100%
+    # placeholder body (assert True / pass / NotImplementedError) or
+    # any plan doc admits "placeholder implementations may need to be
+    # replaced" — Hawkman explicitly REQUEST_CHANGES on these.
+    gate_b_err = _gate_b_lite_placeholder_tests(files)
+    if gate_b_err:
+        return {"error": gate_b_err}
 
     # Open the PR via GitHub REST API (avoids gh CLI, which needs a writable
     # $HOME for its config — the daemon runs with systemd ProtectHome=true).
@@ -1239,6 +1574,38 @@ async def update_pr(
             )
             if gate_a_err:
                 return {"error": gate_a_err}
+
+            # Gate E (autonomy gate): on a fix-round update, the new
+            # body MUST acknowledge the prior CHANGES_REQUESTED review,
+            # either via a `## Addresses Prior Feedback` heading or by
+            # citing a 10+-char phrase from the prior review. Catches
+            # the cycle-2-3 amnesia pattern where the fix-round builder
+            # ignores the prior review and re-trips the same gate.
+            gate_e_err = _gate_e_fix_round_amnesia(
+                body, pr_url=pr_url, token=token,
+            )
+            if gate_e_err:
+                return {"error": gate_e_err}
+
+        # Gate D + B-lite on update_pr: same checks the fresh PR path
+        # uses. update_pr's files are list-of-dicts; flatten to
+        # {path: content} for the gates to consume.
+        if files:
+            files_dict_for_gates = {
+                e["path"]: e["content"]
+                for e in files
+                if isinstance(e, dict) and "path" in e and "content" in e
+            }
+            gate_d_err = _gate_d_endpoint_path_consistency(
+                files_dict_for_gates,
+            )
+            if gate_d_err:
+                return {"error": gate_d_err}
+            gate_b_err = _gate_b_lite_placeholder_tests(
+                files_dict_for_gates,
+            )
+            if gate_b_err:
+                return {"error": gate_b_err}
 
         patch_payload: Dict[str, Any] = {}
         if title is not None:

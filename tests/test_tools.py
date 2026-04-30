@@ -2319,3 +2319,308 @@ def test_gate_a_tolerates_trailing_whitespace_normalisation():
         linear_fetcher=lambda code: canonical,
     )
     assert err is None
+
+
+# ── Gate D: endpoint path consistency ──────────────────────────────────────
+
+
+def test_gate_d_passes_when_test_url_matches_router_path():
+    """Test calls /v1/foo, router mounts /v1/foo — pass."""
+    from alfred_coo.tools import _gate_d_endpoint_path_consistency
+    files = {
+        "src/app/routers/foo.py": (
+            'router = APIRouter()\n'
+            '@router.get("/v1/foo")\n'
+            'async def get_foo(): pass\n'
+        ),
+        "tests/test_foo.py": (
+            'def test_foo(client):\n'
+            '    r = client.get("/v1/foo")\n'
+            '    assert r.status_code == 200\n'
+        ),
+    }
+    err = _gate_d_endpoint_path_consistency(files)
+    assert err is None
+
+
+def test_gate_d_fails_when_test_calls_unmounted_path():
+    """Test calls /v1/mssp/audit, router mounts /v1/mssp/consent/audit
+    — fail. This is the soul-svc PR #66 cycle-3 pattern."""
+    from alfred_coo.tools import _gate_d_endpoint_path_consistency
+    files = {
+        "src/app/routers/audit.py": (
+            'router = APIRouter()\n'
+            '@router.get("/v1/mssp/consent/audit")\n'
+            'async def get_audit(): pass\n'
+        ),
+        "tests/test_audit.py": (
+            'def test_audit(client):\n'
+            '    r = client.get("/v1/mssp/audit")\n'
+            '    assert r.status_code == 200\n'
+        ),
+    }
+    err = _gate_d_endpoint_path_consistency(files)
+    assert err is not None
+    assert "GATE_D_ENDPOINT_DRIFT" in err
+    assert "/v1/mssp/audit" in err
+
+
+def test_gate_d_passes_with_include_router_prefix():
+    """Router declares paths without prefix; main.py mounts with prefix.
+    Gate D must combine the two."""
+    from alfred_coo.tools import _gate_d_endpoint_path_consistency
+    files = {
+        "src/app/routers/users.py": (
+            'router = APIRouter()\n'
+            '@router.get("/me")\n'
+            'async def me(): pass\n'
+        ),
+        "src/app/main.py": (
+            'app.include_router(users_router, prefix="/v1/users")\n'
+        ),
+        "tests/test_users.py": (
+            'def test_me(client):\n'
+            '    r = client.get("/v1/users/me")\n'
+            '    assert r.status_code == 200\n'
+        ),
+    }
+    err = _gate_d_endpoint_path_consistency(files)
+    assert err is None
+
+
+def test_gate_d_passes_with_path_parameter_substitution():
+    """Router mounts /v1/users/{id}; test calls /v1/users/abc-123 — pass."""
+    from alfred_coo.tools import _gate_d_endpoint_path_consistency
+    files = {
+        "src/app/routers/users.py": (
+            'router = APIRouter()\n'
+            '@router.get("/v1/users/{id}")\n'
+            'async def get_user(id: str): pass\n'
+        ),
+        "tests/test_users.py": (
+            'def test_user(client):\n'
+            '    r = client.get("/v1/users/abc-123")\n'
+        ),
+    }
+    err = _gate_d_endpoint_path_consistency(files)
+    assert err is None
+
+
+def test_gate_d_fails_open_when_only_tests_in_files():
+    """If the PR only adds tests (router unchanged), Gate D returns
+    None — can't check without the router file."""
+    from alfred_coo.tools import _gate_d_endpoint_path_consistency
+    files = {
+        "tests/test_foo.py": 'client.get("/v1/foo")\n',
+    }
+    assert _gate_d_endpoint_path_consistency(files) is None
+
+
+def test_gate_d_fails_open_on_empty_files():
+    """No files dict → silent pass (gate doesn't apply)."""
+    from alfred_coo.tools import _gate_d_endpoint_path_consistency
+    assert _gate_d_endpoint_path_consistency({}) is None
+    assert _gate_d_endpoint_path_consistency(None) is None
+
+
+# ── Gate E: fix-round amnesia killer ────────────────────────────────────────
+
+
+def test_gate_e_passes_when_body_has_addresses_prior_heading():
+    """Body has explicit `## Addresses Prior Feedback` — gate passes."""
+    from alfred_coo.tools import _gate_e_fix_round_amnesia
+    err = _gate_e_fix_round_amnesia(
+        body=(
+            "## Summary\nFix the thing.\n\n"
+            "## Addresses Prior Feedback\n"
+            "Fixed Gate 4 evidence by adding behavioral assertions.\n"
+        ),
+        pr_url="https://github.com/salucallc/soul-svc/pull/66",
+        token="fake",
+        review_fetcher=lambda owner, repo, num, *, token: (
+            "GATE 4: Test bodies are placeholders without behavioral assertions."
+        ),
+    )
+    assert err is None
+
+
+def test_gate_e_passes_when_body_cites_phrase_from_prior_review():
+    """Body doesn't have the explicit heading but DOES contain a 10+
+    char phrase from the prior review — gate passes (proves the
+    builder read it)."""
+    from alfred_coo.tools import _gate_e_fix_round_amnesia
+    err = _gate_e_fix_round_amnesia(
+        body=(
+            "## Summary\nFix.\n\n"
+            "Replaced placeholder assertions in test_consent_lifecycle with real "
+            "behavioral checks against the withdrawn_at field.\n"
+        ),
+        pr_url="https://github.com/salucallc/soul-svc/pull/66",
+        token="fake",
+        review_fetcher=lambda owner, repo, num, *, token: (
+            "Gate 4: missing test for test_consent_lifecycle on withdrawn_at "
+            "behavior; placeholder assertions don't exercise units."
+        ),
+    )
+    assert err is None
+
+
+def test_gate_e_fails_when_body_ignores_prior_review():
+    """Body has no acknowledgement section AND no phrase overlap —
+    fail. This is the cycle-3 amnesia pattern."""
+    from alfred_coo.tools import _gate_e_fix_round_amnesia
+    err = _gate_e_fix_round_amnesia(
+        body=(
+            "## Summary\nUpdate the tests.\n\n"
+            "## APE/V Acceptance\n- [ ] foo\n"
+        ),
+        pr_url="https://github.com/salucallc/soul-svc/pull/66",
+        token="fake",
+        review_fetcher=lambda owner, repo, num, *, token: (
+            "Gate 4: missing test for test_consent_lifecycle on withdrawn_at "
+            "behavior; placeholder assertions don't exercise units. "
+            "Audit endpoint mismatch /v1/mssp/audit vs /v1/mssp/consent/audit."
+        ),
+    )
+    assert err is not None
+    assert "GATE_E_FIX_ROUND_AMNESIA" in err
+
+
+def test_gate_e_fails_open_when_no_prior_request_changes():
+    """First-cycle PR (no prior review) — gate doesn't apply."""
+    from alfred_coo.tools import _gate_e_fix_round_amnesia
+    err = _gate_e_fix_round_amnesia(
+        body="## Summary\nFresh PR.\n",
+        pr_url="https://github.com/salucallc/soul-svc/pull/99",
+        token="fake",
+        review_fetcher=lambda owner, repo, num, *, token: None,
+    )
+    assert err is None
+
+
+def test_gate_e_fails_open_on_invalid_pr_url():
+    """Malformed pr_url — gate returns None (don't block)."""
+    from alfred_coo.tools import _gate_e_fix_round_amnesia
+    err = _gate_e_fix_round_amnesia(
+        body="anything",
+        pr_url="not-a-url",
+        token="fake",
+        review_fetcher=lambda *a, **k: "review body",
+    )
+    assert err is None
+
+
+# ── Gate B-lite: placeholder test detector ──────────────────────────────────
+
+
+def test_gate_b_lite_passes_on_real_test():
+    """Real test with behavioral assertion — gate passes."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_real.py": (
+            'def test_user_create(client):\n'
+            '    r = client.post("/users", json={"name": "x"})\n'
+            '    assert r.status_code == 201\n'
+            '    assert r.json()["name"] == "x"\n'
+        ),
+    }
+    assert _gate_b_lite_placeholder_tests(files) is None
+
+
+def test_gate_b_lite_rejects_assert_true_only():
+    """Test body is just `assert True` — reject."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_lazy.py": (
+            'def test_consent_flow(client):\n'
+            '    assert True\n'
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+    assert "GATE_B_LITE_PLACEHOLDER" in err
+    assert "test_consent_flow" in err
+
+
+def test_gate_b_lite_rejects_pass_only():
+    """Test body is just `pass` — reject."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_stub.py": (
+            'def test_rotation():\n'
+            '    pass\n'
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+    assert "test_rotation" in err
+
+
+def test_gate_b_lite_rejects_not_implemented():
+    """Test body is `raise NotImplementedError` — reject."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_pending.py": (
+            'def test_audit(client):\n'
+            '    raise NotImplementedError("TODO")\n'
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+
+
+def test_gate_b_lite_rejects_plan_doc_placeholder_admission():
+    """Plan doc admits 'placeholder implementations may need to be
+    replaced' — reject."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "plans/v1-ga/SAL-3569.md": (
+            "# Plan\n\n"
+            "## Risks\n"
+            "Placeholder implementations may need to be replaced "
+            "before going live.\n"
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+    assert "plan doc" in err.lower()
+
+
+def test_gate_b_lite_passes_when_trivial_assert_followed_by_real():
+    """`assert status_code == 200` followed by `assert body[...] == ...`
+    — gate passes (regex only fires on 100%-trivial bodies)."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_mixed.py": (
+            'def test_consent(client):\n'
+            '    r = client.post("/consent")\n'
+            '    assert r.status_code == 200\n'
+            '    assert r.json()["status"] == "active"\n'
+        ),
+    }
+    assert _gate_b_lite_placeholder_tests(files) is None
+
+
+def test_gate_b_lite_passes_when_no_test_files():
+    """PR adds plan doc + router but no tests — gate doesn't apply."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "src/router.py": '@router.get("/x")\nasync def x(): pass\n',
+        "plans/v1-ga/SAL-1234.md": "# Plan\n\nLooks fine.\n",
+    }
+    assert _gate_b_lite_placeholder_tests(files) is None
+
+
+def test_gate_b_lite_ignores_pass_in_non_test_function():
+    """`pass` in a fixture or helper — gate doesn't fire (only matches
+    `def test_*`)."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/conftest.py": (
+            'import pytest\n'
+            '@pytest.fixture\n'
+            'def empty_db():\n'
+            '    pass\n'
+        ),
+    }
+    assert _gate_b_lite_placeholder_tests(files) is None
