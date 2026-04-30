@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "saluca-plugin-echo-inbound"
+version = "0.1.0"
+description = "Inbound echo plugin for Saluca."
+authors = ["Saluca LLC <dev@saluca.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+saluca-plugin-sdk = {path = "../../saluca-plugin-sdk"}
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
