@@ -2212,3 +2212,110 @@ def test_apev_inject_does_not_strip_paths_or_tuples():
         f"  expected: {src!r}\n"
         f"  got:      {out!r}"
     )
+
+
+# ── Gate A: APE/V byte-equal pre-flight (autonomy gate) ────────────────────
+
+
+def test_gate_a_passes_when_canonical_present_byte_for_byte():
+    """When the Linear acceptance section appears verbatim in the PR
+    body, Gate A returns None (pass)."""
+    from alfred_coo.tools import _gate_a_apev_byte_match
+    canonical = "- [ ] Endpoint returns 200\n- [ ] Tests added\n"
+    body = (
+        "## Summary\n\nFix the thing.\n\n"
+        "## APE/V Acceptance (machine-checkable)\n\n"
+        + canonical +
+        "\n## Plan doc\n..."
+    )
+    err = _gate_a_apev_byte_match(
+        body,
+        branch="feature/sal-3569-x",
+        title="SAL-3569: ...",
+        linear_fetcher=lambda code: canonical,
+    )
+    assert err is None
+
+
+def test_gate_a_fails_when_paraphrased_heading_used():
+    """Builder writes a paraphrased heading (## Acceptance criteria) so
+    auto-inject sees a citation present and skips. Gate A catches the
+    drift because the canonical text isn't a substring of the body."""
+    from alfred_coo.tools import _gate_a_apev_byte_match
+    canonical = "- [ ] Endpoint returns 200; tests added\n"
+    paraphrased = "- Endpoint returns 200, with tests added\n"
+    body = (
+        "## Acceptance criteria\n\n" + paraphrased +
+        "\n## Plan doc\n..."
+    )
+    err = _gate_a_apev_byte_match(
+        body,
+        branch="feature/sal-3569-x",
+        title="SAL-3569: ...",
+        linear_fetcher=lambda code: canonical,
+    )
+    assert err is not None
+    assert "GATE_A_APEV_NOT_VERBATIM" in err
+
+
+def test_gate_a_fails_on_empty_body():
+    """An empty body fails Gate A immediately — Hawkman would
+    REQUEST_CHANGES on body=None too."""
+    from alfred_coo.tools import _gate_a_apev_byte_match
+    err = _gate_a_apev_byte_match(
+        "",
+        branch="feature/sal-3569-x",
+        title="SAL-3569: ...",
+        linear_fetcher=lambda code: "criterion",
+    )
+    assert err is not None
+    assert "GATE_A_APEV_EMPTY_BODY" in err
+
+
+def test_gate_a_fails_open_when_no_ticket_code():
+    """If branch/title/url/body have no SAL-XXXX code, Gate A returns
+    None (fail-open). Can't fetch canonical text without the ID."""
+    from alfred_coo.tools import _gate_a_apev_byte_match
+    body = "## APE/V Acceptance\n\nsome stuff\n"
+    err = _gate_a_apev_byte_match(
+        body,
+        branch="feature/no-ticket-code",
+        title="just a fix",
+        linear_fetcher=lambda code: None,
+    )
+    assert err is None
+
+
+def test_gate_a_fails_open_when_linear_returns_none():
+    """If Linear has no acceptance section for this ticket (or the API
+    is unreachable), Gate A returns None (fail-open). Don't block PR
+    creation on infra glitches."""
+    from alfred_coo.tools import _gate_a_apev_byte_match
+    body = "## APE/V Acceptance\n\nsomething\n"
+    err = _gate_a_apev_byte_match(
+        body,
+        branch="feature/sal-9999-x",
+        title="SAL-9999: ...",
+        linear_fetcher=lambda code: None,  # no canonical text
+    )
+    assert err is None
+
+
+def test_gate_a_tolerates_trailing_whitespace_normalisation():
+    """Hawkman's regex tolerates trailing-whitespace per line. Gate A
+    must not be stricter than Hawkman — it should pass when the only
+    difference is trailing spaces."""
+    from alfred_coo.tools import _gate_a_apev_byte_match
+    canonical = "- [ ] Criterion one  \n- [ ] Criterion two   \n"
+    # Body has the same content but trailing whitespace stripped:
+    body = (
+        "## APE/V Acceptance (machine-checkable)\n\n"
+        "- [ ] Criterion one\n- [ ] Criterion two\n"
+    )
+    err = _gate_a_apev_byte_match(
+        body,
+        branch="feature/sal-3569-x",
+        title="SAL-3569: ...",
+        linear_fetcher=lambda code: canonical,
+    )
+    assert err is None
