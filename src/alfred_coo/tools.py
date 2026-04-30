@@ -2536,6 +2536,12 @@ async def linear_list_project_issues(
     if limit_int <= 0:
         return {"error": "limit must be positive"}
 
+    # dynamic-hints-from-ticket-body refactor (2026-04-29): added
+    # ``description`` so the orchestrator's hint resolver can parse the
+    # embedded ``## Target`` block at dispatch time without a per-ticket
+    # follow-up query. Linear's complexity budget is roomy enough at
+    # page_size=25 (the existing cap); description is a single string
+    # field per issue.
     query = (
         "query ProjectIssues($projectId: String!, $first: Int!, $after: String) { "
         "project(id: $projectId) { "
@@ -2543,7 +2549,7 @@ async def linear_list_project_issues(
         "issues(first: $first, after: $after) { "
         "pageInfo { hasNextPage endCursor } "
         "nodes { "
-        "id identifier title estimate "
+        "id identifier title description estimate "
         "labels { nodes { name } } "
         "state { name } "
         "relations { nodes { type relatedIssue { id identifier } } } "
@@ -2588,6 +2594,7 @@ async def linear_list_project_issues(
                 "id": n.get("id"),
                 "identifier": n.get("identifier"),
                 "title": n.get("title"),
+                "description": n.get("description") or "",
                 "labels": labels,
                 "estimate": n.get("estimate"),
                 "state": {"name": ((n.get("state") or {}).get("name"))},

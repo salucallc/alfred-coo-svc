@@ -30,7 +30,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
 
 import httpx
 
@@ -50,6 +50,7 @@ from .graph import (
     Ticket,
     TicketGraph,
     TicketStatus,
+    _parse_target_from_ticket_body,
     build_ticket_graph,
 )
 from .state import (
@@ -3033,22 +3034,134 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
     ),
 
 }
+# DEPRECATED (dynamic-hints-from-ticket-body refactor, 2026-04-29):
+# ``_TARGET_HINTS`` is now a *fallback* registry — the canonical source of
+# truth for a ticket's target is its Linear body's ``## Target`` block,
+# parsed by ``graph._parse_target_from_ticket_body`` and resolved by
+# ``_resolve_target_hint`` below. The dict is preserved so:
+#   1. Tickets without a ``## Target`` body section keep working (no
+#      mass-backfill drama).
+#   2. The OPS / F / SS / TIR / AB plan-doc codes that pre-date the
+#      refactor stay verifiable until each epic's planner template
+#      catches up.
+# New ticket families MUST emit the body section; do not extend this dict
+# for new codes. Existing entries here will be deleted as their bodies
+# are backfilled and dispatch is observed green for one full wave.
+
+
+#: Resolver tier name + callable. Each tier inspects ``ticket`` and
+#: returns ``Optional[TargetHint]``. The first tier to return a non-None
+#: hint wins; the resolver returns ``(hint, name)`` so callers can log
+#: which tier produced the answer (``hint_source=body|registry|...``).
+#:
+#: Forward-compat (2026-04-30, alfred-main directive): a future
+#: vision-aware-inference resolver registers as tier 3 (or higher) by
+#: appending to ``_TARGET_HINT_RESOLVERS`` at module-import time. The
+#: existing tier 1 (body) + tier 2 (registry) order is invariant — every
+#: future tier slots in BELOW the registry so manual operator overrides
+#: (which still go through the static dict) win against any AI-inferred
+#: target.
+_TargetHintResolver = Callable[[Ticket], Optional["TargetHint"]]
+
+
+def _resolve_via_body(ticket: Ticket) -> Optional["TargetHint"]:
+    """Tier 1: parse the ticket's Linear body for a ``## Target`` block."""
+    try:
+        parsed = _parse_target_from_ticket_body(
+            getattr(ticket, "body", "") or "",
+        )
+    except Exception:
+        logger.exception(
+            "_parse_target_from_ticket_body crashed for %s; "
+            "falling back to next resolver",
+            getattr(ticket, "identifier", "?"),
+        )
+        return None
+    if parsed is None:
+        return None
+    try:
+        return TargetHint(**parsed)
+    except (TypeError, ValueError):
+        logger.exception(
+            "body-parsed target for %s failed TargetHint validation "
+            "(%r); falling back to next resolver",
+            getattr(ticket, "identifier", "?"), parsed,
+        )
+        return None
+
+
+def _resolve_via_registry(ticket: Ticket) -> Optional["TargetHint"]:
+    """Tier 2: legacy hardcoded ``_TARGET_HINTS`` registry."""
+    code = (getattr(ticket, "code", "") or "").upper()
+    if not code:
+        return None
+    return _TARGET_HINTS.get(code)
+
+
+#: Ordered list of (tier_name, resolver) pairs. ``_resolve_target_hint``
+#: walks this list in order and returns the first non-None hit. Add a
+#: new tier by appending: ``_TARGET_HINT_RESOLVERS.append(("ai-vision",
+#: _resolve_via_vision))``. Existing entries are stable; tests pin the
+#: order at indices 0 (body) and 1 (registry).
+_TARGET_HINT_RESOLVERS: List[Tuple[str, _TargetHintResolver]] = [
+    ("body", _resolve_via_body),
+    ("registry", _resolve_via_registry),
+]
+
+
+def _resolve_target_hint(ticket: Ticket) -> Tuple[Optional["TargetHint"], str]:
+    """Resolve a ``TargetHint`` for ``ticket`` by walking the registered
+    resolver tiers in order. Returns ``(hint, source_name)``; if no tier
+    produces a hint, returns ``(None, "none")`` so the caller's
+    escalation path (the legacy ``(unresolved)`` block + grounding-gap
+    emit) fires unchanged.
+
+    Tier order at the time of writing (see ``_TARGET_HINT_RESOLVERS``):
+
+    1. ``body``     — parse ``## Target`` from the Linear ticket body.
+    2. ``registry`` — fall back to the static ``_TARGET_HINTS`` dict.
+
+    The returned source string is logged at the call sites that already
+    write structured orchestrator events — operators get a per-ticket
+    breadcrumb of which lookup tier produced the hint, so a regression
+    at any tier is immediately visible in production journals
+    (grep ``hint_source=``).
+
+    Resolver exceptions are caught + logged inside each resolver; the
+    iteration continues so a malformed body never breaks dispatch.
+    """
+    for tier_name, resolver in _TARGET_HINT_RESOLVERS:
+        try:
+            hint = resolver(ticket)
+        except Exception:
+            logger.exception(
+                "target-hint resolver %r crashed for %s; trying next tier",
+                tier_name, getattr(ticket, "identifier", "?"),
+            )
+            continue
+        if hint is not None:
+            return hint, tier_name
+    return None, "none"
 
 
 def _render_target_block(
     code: str,
     vr: Optional[VerificationResult] = None,
+    *,
+    hint: Optional["TargetHint"] = None,
 ) -> str:
     """Render a ``## Target`` markdown block for the given plan-doc code.
 
     Two rendering modes:
 
-    * ``vr is None`` — legacy AB-13 behaviour: render hint verbatim from
-      the static ``_TARGET_HINTS`` table, no verification comments. If
-      ``code`` is not in ``_TARGET_HINTS``, emit the pre-existing
-      ``(unresolved)`` escalation block so the child falls through to
-      Step 0 of its persona grounding protocol. Preserved byte-for-byte
-      so downstream snapshot tests keep passing.
+    * ``vr is None`` — legacy AB-13 behaviour: render hint verbatim. If a
+      ``hint`` kwarg is supplied (the post-refactor path: resolver hands
+      us a body-parsed or registry hint), use it; otherwise fall back to
+      the legacy ``_TARGET_HINTS[code]`` lookup (preserves byte-identical
+      output for the snapshot-style tests + tickets without bodies).
+      If neither produces a hint, emit the pre-existing ``(unresolved)``
+      escalation block so the child falls through to Step 0 of its
+      persona grounding protocol.
     * ``vr is not None`` — AB-17-c verified-render mode: drive the block
       off ``vr.path_results``, rendering per the Plan I §3 decision
       table (``expected`` × ``observed`` ∈ {exist, absent, unknown}).
@@ -3060,7 +3173,8 @@ def _render_target_block(
     """
     # ── vr is None — legacy AB-13 path (must remain byte-identical) ─
     if vr is None:
-        hint = _TARGET_HINTS.get((code or "").upper())
+        if hint is None:
+            hint = _TARGET_HINTS.get((code or "").upper())
         if hint is None:
             return (
                 "## Target\n"
@@ -4501,25 +4615,30 @@ class AutonomousBuildOrchestrator:
             return
 
         code_key = (ticket.code or "").upper()
-        if code_key:
-            hint = _TARGET_HINTS.get(code_key)
-            if hint is not None:
-                try:
-                    fresh_vr = await self._verify_hint(code_key, hint)
-                    # Key parity with `_verify_wave_hints` (uppercased) AND
-                    # with `_child_task_body`'s raw-`ticket.code` lookup —
-                    # ticket codes are uppercase by convention, but write
-                    # both keys defensively so a future lower-case code
-                    # cannot silently miss the cache lookup.
-                    self._verified_hints[code_key] = fresh_vr
-                    if ticket.code != code_key:
-                        self._verified_hints[ticket.code] = fresh_vr
-                except Exception:
-                    logger.exception(
-                        "SAL-2787: per-dispatch re-verify crashed for %s; "
-                        "falling back to wave-cached hint",
-                        code_key,
-                    )
+        # dynamic-hints-from-ticket-body refactor (2026-04-29): re-verify
+        # against the body-resolved hint when present so per-dispatch
+        # verification matches the hint the child will actually receive.
+        # Falls through to the registry via the resolver's tier-2.
+        resolved_predispatch_hint, predispatch_source = _resolve_target_hint(ticket)
+        if code_key and resolved_predispatch_hint is not None:
+            try:
+                fresh_vr = await self._verify_hint(
+                    code_key, resolved_predispatch_hint,
+                )
+                # Key parity with `_verify_wave_hints` (uppercased) AND
+                # with `_child_task_body`'s raw-`ticket.code` lookup —
+                # ticket codes are uppercase by convention, but write
+                # both keys defensively so a future lower-case code
+                # cannot silently miss the cache lookup.
+                self._verified_hints[code_key] = fresh_vr
+                if ticket.code != code_key:
+                    self._verified_hints[ticket.code] = fresh_vr
+            except Exception:
+                logger.exception(
+                    "SAL-2787: per-dispatch re-verify crashed for %s "
+                    "(hint_source=%s); falling back to wave-cached hint",
+                    code_key, predispatch_source,
+                )
         # Sequential-discipline Fix 3: pick the builder model for this
         # attempt from the fallback chain. Title-tag based routing means
         # the existing ``dispatch.select_model`` path resolves correctly
@@ -4667,18 +4786,30 @@ class AutonomousBuildOrchestrator:
                 "persona protocol)\n"
             )
         # AB-13 (SAL-2698, Plan H §2 G-2): resolve target owner/repo/paths
-        # up front via _TARGET_HINTS so the child knows which repo + which
-        # files to edit. Unmapped codes emit an (unresolved) block telling
-        # the child to open a grounding-gap Linear issue.
+        # up front so the child knows which repo + which files to edit.
+        # Unmapped codes emit an (unresolved) block telling the child to
+        # open a grounding-gap Linear issue.
+        #
+        # dynamic-hints-from-ticket-body refactor (2026-04-29): use the
+        # resolver — body parse first, registry second — so newly-fired
+        # epics whose tickets carry a ``## Target`` body section never
+        # need a registry entry. Legacy registry-only tickets keep
+        # working unchanged via the resolver's tier-2 fallback.
         #
         # AB-17-c (SAL — Plan I §3): pass the per-wave VerificationResult
         # through so the render can decorate the block with verified /
         # unresolved / conflict / unverified markers. AB-17-f tightened
         # this by initializing ``_verified_hints = {}`` in ``__init__``
         # (see AB-17-b block above), so no ``hasattr`` guard is needed.
+        resolved_hint, hint_source = _resolve_target_hint(ticket)
+        logger.info(
+            "hint_source=%s ticket=%s code=%s",
+            hint_source, ticket.identifier, ticket.code or "(none)",
+        )
         target_block = _render_target_block(
             ticket.code,
             vr=self._verified_hints.get(ticket.code),
+            hint=resolved_hint,
         )
         # 2026-04-27: pre-render the canonical APE/V acceptance section
         # from the Linear ticket body into the dispatched task body. This
@@ -6919,17 +7050,24 @@ class AutonomousBuildOrchestrator:
     # zero duplication.
 
     def _hint_for_ticket(self, ticket: Ticket):
-        """Look up the TargetHint for ticket.code.
+        """Look up the TargetHint for ``ticket``.
 
-        Returns None for tickets with no parsed code or codes not
-        in the static _TARGET_HINTS table - guardrail then runs
-        with hint_description="" (no deletion-license keywords
-        possible) which is the safe-default.
+        Returns None for tickets with no resolved hint (no body section,
+        no registry entry, no code) — guardrail then runs with
+        hint_description="" (no deletion-license keywords possible)
+        which is the safe-default.
+
+        dynamic-hints-from-ticket-body refactor (2026-04-29): switched
+        from a direct ``_TARGET_HINTS.get(code)`` to ``_resolve_target_hint``
+        so the destructive guardrail consults the same body-parsed hint
+        the builder dispatches against. Without this swap, a ticket with
+        a body-only hint would silently lose its deletion-license
+        keywords (the ``notes:`` field carries them) and the guardrail
+        would defang itself for every refactor ticket whose target was
+        never registered in the static dict.
         """
-        code = (ticket.code or "").upper()
-        if not code:
-            return None
-        return _TARGET_HINTS.get(code)
+        hint, _ = _resolve_target_hint(ticket)
+        return hint
 
     @staticmethod
     def _ticket_has_refactor_label(ticket: Ticket) -> bool:
@@ -7477,9 +7615,20 @@ class AutonomousBuildOrchestrator:
         # silent-escalated, because the original respawn body skipped the
         # block that `_child_task_body` emits. Mirror it here so the
         # respawned child knows owner/repo/paths.
+        #
+        # dynamic-hints-from-ticket-body refactor (2026-04-29): use the
+        # resolver so a body-only hint propagates to the fix-round body
+        # the same way it propagated to the initial dispatch.
+        respawn_hint, respawn_hint_source = _resolve_target_hint(ticket)
+        logger.info(
+            "respawn hint_source=%s ticket=%s code=%s round=%d",
+            respawn_hint_source, ticket.identifier,
+            ticket.code or "(none)", round_num,
+        )
         target_block = _render_target_block(
             ticket.code,
             vr=self._verified_hints.get(ticket.code),
+            hint=respawn_hint,
         )
 
         # AB-17-o (2026-04-24): look up the existing PR's head.ref so the
@@ -8762,7 +8911,14 @@ class AutonomousBuildOrchestrator:
         graph = getattr(self, "graph", None)
         ticket = graph.get_by_identifier(ticket_ident) if graph else None
         code = (getattr(ticket, "code", "") or "").upper().strip()
-        hint = _TARGET_HINTS.get(code) if code else None
+        # dynamic-hints-from-ticket-body refactor (2026-04-29): resolve via
+        # body parse first, then registry. The ``hint_source`` is logged
+        # so production journals show whether evidence-of-scope came from
+        # a body-resolved hint or the legacy registry.
+        if ticket is not None:
+            hint, hint_source = _resolve_target_hint(ticket)
+        else:
+            hint, hint_source = None, "none"
 
         if hint is None:
             # No hint to compare against. Refuse to auto-flip / auto-skip
@@ -8772,10 +8928,10 @@ class AutonomousBuildOrchestrator:
             # loop will treat this as "no merged PR found" and dispatch
             # the ticket fresh rather than trusting a title-mention.
             logger.info(
-                "%s candidate PR %s found for %s but no "
-                "_TARGET_HINTS entry exists for code %r; refusing to "
+                "%s candidate PR %s found for %s but no target hint "
+                "(hint_source=%s) exists for code %r; refusing to "
                 "auto-flip on weak evidence",
-                log_tag, pr_url, ticket_ident, code,
+                log_tag, pr_url, ticket_ident, hint_source, code,
             )
             return False
 
@@ -9831,11 +9987,16 @@ class AutonomousBuildOrchestrator:
     ) -> Dict[str, VerificationResult]:
         """Verify every ticket in the wave. Keyed by ticket code.
 
-        Tickets with no code or whose code is not in ``_TARGET_HINTS``
-        return a ``NO_HINT`` result so the renderer can emit the
-        ``(unresolved)`` block deterministically. Fan-out is bounded by
-        ``self._verify_semaphore``; the outer gather just waits for every
-        per-ticket coroutine to settle.
+        Tickets with no code, or no resolved hint (no body section AND
+        no registry entry), return a ``NO_HINT`` result so the renderer
+        can emit the ``(unresolved)`` block deterministically. Fan-out
+        is bounded by ``self._verify_semaphore``; the outer gather just
+        waits for every per-ticket coroutine to settle.
+
+        dynamic-hints-from-ticket-body refactor (2026-04-29): hint is
+        resolved per-ticket via ``_resolve_target_hint`` so a
+        body-resolved hint verifies at wave entry the same way a
+        registry hint did before.
         """
         tickets = self.graph.tickets_in_wave(wave)
         results: Dict[str, VerificationResult] = {}
@@ -9846,8 +10007,13 @@ class AutonomousBuildOrchestrator:
                 # Unparseable/missing code — nothing to key on. Skip so
                 # downstream rendering falls through to (unresolved).
                 return
-            hint = _TARGET_HINTS.get(code)
+            hint, hint_source = _resolve_target_hint(ticket)
             if hint is None:
+                logger.info(
+                    "wave-verify hint_source=none ticket=%s code=%s — "
+                    "marking NO_HINT",
+                    ticket.identifier, code,
+                )
                 results[code] = VerificationResult(
                     code=code,
                     hint=None,
@@ -9858,6 +10024,10 @@ class AutonomousBuildOrchestrator:
                     verified_at=time.time(),
                 )
                 return
+            logger.debug(
+                "wave-verify hint_source=%s ticket=%s code=%s",
+                hint_source, ticket.identifier, code,
+            )
             results[code] = await self._verify_hint(code, hint)
 
         await asyncio.gather(*[verify_one(t) for t in tickets])

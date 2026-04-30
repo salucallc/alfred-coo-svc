@@ -205,6 +205,14 @@ class Ticket:
     last_failure_reason: Optional[str] = None
     # Raw Linear state name for debugging / resume logic.
     linear_state: str = ""
+    # dynamic-hints-from-ticket-body refactor (2026-04-29): cache the raw
+    # Linear ticket body on the graph node so the orchestrator's hint
+    # resolver can re-parse the ``## Target`` block at dispatch time
+    # without re-querying Linear. Empty string when the ticket has no
+    # description (rare but legal). Kept off ``__repr__`` cost-paths via
+    # the dataclass default so existing code that prints tickets still
+    # produces stable output (default value only — no field flag needed).
+    body: str = ""
     # sequential-discipline Fix 1 (2026-04-28). Wall-clock when the most
     # recent ``_dispatch_child`` succeeded; consumed by ``_poll_children``'s
     # builder hard-timeout branch (force-fail w/ retry consumed when a
@@ -365,6 +373,182 @@ def _parse_code(title: str, labels: Optional[Sequence[str]] = None) -> str:
     return m.group(0).upper().replace("_", "-")
 
 
+#: Target-hint parser (dynamic-hints-from-ticket-body refactor, 2026-04-29).
+#:
+#: Matches a ``## Target`` (or ``## TARGET``) markdown header at the start
+#: of a line, then captures everything up to the next top-level ``##``
+#: header or end-of-string. Used by ``_parse_target_from_ticket_body`` to
+#: pluck the embedded YAML-ish target block out of a Linear ticket body.
+_TARGET_BLOCK_RE = re.compile(
+    r"(?im)^\#\#\s*Target\s*\n(?P<body>.*?)(?=^\#\#\s|\Z)",
+    re.DOTALL | re.MULTILINE,
+)
+
+# Recognise ``key: value`` lines in the target block.
+_TARGET_KV_RE = re.compile(r"^\s*(?P<key>[a-zA-Z_]+)\s*:\s*(?P<val>.*?)\s*$")
+
+# Recognise list items under ``paths:`` / ``new_paths:`` (``  - some/path``
+# or ``* some/path``). Linear's markdown renderer round-trips bullets
+# inconsistently — POSTed ``  - foo`` may come back as ``* foo`` after
+# a save-load cycle through the web UI, so we accept either marker.
+_TARGET_LIST_ITEM_RE = re.compile(r"^\s*[-*]\s+(?P<item>.+?)\s*$")
+
+# Codes that should NEVER come back from a parsed body (they're sentinel
+# placeholders the planner sub may emit for genuinely unresolved tickets).
+# The parser returns ``None`` when it sees them so the resolver falls
+# through to the registry / NO_HINT path cleanly.
+_TARGET_UNRESOLVED_MARKERS = frozenset(
+    {"unresolved", "(unresolved)", "tbd", "see plan doc", "(unresolved — see plan doc)"}
+)
+
+
+def _parse_target_from_ticket_body(body: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse a ``## Target`` markdown block out of a Linear ticket body.
+
+    Schema (parser-friendly markdown — keep it strict so the planner sub
+    can emit it deterministically):
+
+    .. code-block:: markdown
+
+        ## Target
+
+        owner: salucallc
+        repo: alfred-coo-svc
+        paths:
+          - src/alfred_coo/cockpit_router.py
+          - tests/test_cockpit_router.py
+        new_paths:
+          - migrations/0042_consent_grants.sql
+        base_branch: main
+        branch_hint: feature/sal-XXXX-short-slug
+        notes: free-form notes for the builder
+
+    Returns a dict with the same shape as ``orchestrator.TargetHint``
+    (kwargs-compatible: ``owner``, ``repo``, ``paths``, ``new_paths``,
+    ``base_branch``, ``branch_hint``, ``notes``) so the orchestrator can
+    construct a ``TargetHint`` directly. Returns ``None`` when:
+
+    * ``body`` is empty or has no ``## Target`` section;
+    * the section is the ``(unresolved — ...)`` placeholder; or
+    * the parsed block lacks both ``owner`` and ``repo`` (the bare
+      minimum every hint must have to be useful).
+
+    Both ``paths`` and ``new_paths`` are returned as tuples (or omitted
+    when absent) so the dataclass invariant
+    (``paths`` ∪ ``new_paths`` non-empty) enforces "useful hint" at
+    construction time. ``base_branch`` defaults to ``"main"`` to match
+    the ``TargetHint`` dataclass default.
+
+    The parser is intentionally lenient about whitespace + indentation
+    (so tickets pasted from Linear's web UI parse the same as those
+    POSTed via the API) but strict about the key vocabulary — unknown
+    keys are dropped silently. ``paths`` / ``new_paths`` lists keep YAML
+    semantics: a ``- item`` line under either key adds to that list
+    until the next non-list, non-blank line.
+    """
+    if not body:
+        return None
+
+    m = _TARGET_BLOCK_RE.search(body)
+    if not m:
+        return None
+
+    block = m.group("body") or ""
+    # Quick sniff for the placeholder. The planner sub may emit
+    # ``## Target\n(unresolved — see plan doc)`` for tickets whose
+    # target is genuinely undecided; treat that as "no body hint" so
+    # the resolver falls through to registry/NO_HINT cleanly.
+    stripped_first = ""
+    for line in block.splitlines():
+        if line.strip():
+            stripped_first = line.strip().lower()
+            break
+    if stripped_first.startswith("(unresolved") or stripped_first in _TARGET_UNRESOLVED_MARKERS:
+        return None
+
+    parsed: Dict[str, Any] = {}
+    paths: List[str] = []
+    new_paths: List[str] = []
+    current_list: Optional[List[str]] = None
+
+    for raw in block.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            # Blank line: do NOT end list-collection mode. Linear's
+            # markdown renderer inserts a blank line between ``paths:``
+            # and the first ``* item`` after a save-load round-trip
+            # (the renderer normalises tight lists to loose lists with a
+            # paragraph break). Keep ``current_list`` armed; only a
+            # subsequent non-list, non-blank line ends list mode.
+            continue
+
+        # List item under paths: / new_paths:
+        if current_list is not None:
+            li = _TARGET_LIST_ITEM_RE.match(line)
+            if li:
+                item = li.group("item").strip()
+                # Drop trailing inline comments (`# verified exists @ main` etc.)
+                if "#" in item:
+                    # Only strip when the # is preceded by whitespace —
+                    # don't mangle filenames that legitimately contain #.
+                    hash_match = re.search(r"\s+#", item)
+                    if hash_match:
+                        item = item[: hash_match.start()].rstrip()
+                if item:
+                    current_list.append(item)
+                continue
+            # Non-list line ends list mode.
+            current_list = None
+
+        kv = _TARGET_KV_RE.match(line)
+        if not kv:
+            continue
+        key = kv.group("key").strip().lower()
+        val = (kv.group("val") or "").strip()
+
+        if key in ("paths", "new_paths"):
+            current_list = paths if key == "paths" else new_paths
+            # YAML allows inline values too (``paths: [a, b]``) but we
+            # don't emit that form; if val is non-empty assume it's a
+            # single-item shorthand.
+            if val and not val.startswith("["):
+                current_list.append(val)
+            continue
+
+        if key in ("owner", "repo", "base_branch", "branch_hint", "notes"):
+            parsed[key] = val
+            continue
+
+        # Unknown key — silently dropped (forward-compat).
+
+    # Minimum viable hint: owner + repo present.
+    if not parsed.get("owner") or not parsed.get("repo"):
+        return None
+
+    if paths:
+        parsed["paths"] = tuple(paths)
+    if new_paths:
+        parsed["new_paths"] = tuple(new_paths)
+
+    # Default base_branch to "main" to match the TargetHint dataclass
+    # default — but only if we don't already have one in the body.
+    parsed.setdefault("base_branch", "main")
+
+    # At least one of paths / new_paths must be non-empty (TargetHint
+    # invariant). If the body lists neither, the planner sub goofed; the
+    # resolver should fall through to registry/NO_HINT instead of
+    # crashing the dataclass constructor.
+    if not parsed.get("paths") and not parsed.get("new_paths"):
+        return None
+
+    # Drop empty optional strings so TargetHint(...)'s defaults apply.
+    for opt_key in ("branch_hint", "notes"):
+        if not parsed.get(opt_key):
+            parsed.pop(opt_key, None)
+
+    return parsed
+
+
 def _linear_state_to_status(state_name: str) -> TicketStatus:
     """Map a Linear state name back to our internal enum.
 
@@ -454,6 +638,11 @@ async def build_ticket_graph(
             labels=labels,
             status=_linear_state_to_status(state_name),
             linear_state=state_name,
+            # dynamic-hints-from-ticket-body refactor: cache the raw body
+            # so the orchestrator's hint resolver can re-parse the
+            # ``## Target`` section at dispatch time without an extra
+            # Linear round-trip.  Linear surfaces it as ``description``.
+            body=str(item.get("description") or ""),
         )
         graph.nodes[uuid] = ticket
         graph.identifier_index[identifier] = uuid
