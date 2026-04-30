@@ -16,6 +16,12 @@ EnvironmentFile=/etc/alfred-coo/.env
 # is unset or points at a missing file. Edits to the YAML take effect on
 # the NEXT dispatch — no daemon restart required.
 Environment=MODEL_REGISTRY_PATH=/etc/alfred-coo/model_registry.yaml
+# SAL-3557 (2026-04-29): cockpit_router shells out to `gh pr list` for the
+# RecentMerges panel. Under ProtectHome=true the default ~/.config/gh path
+# is unreadable, so gh fails before it can pick up GITHUB_TOKEN from the
+# EnvironmentFile. Pin gh's config dir to a ReadWritePath so the CLI starts
+# cleanly and falls through to the env-var token.
+Environment=GH_CONFIG_DIR=/var/lib/alfred-coo/gh-config
 ExecStart=/opt/alfred-coo/venv/bin/python -m alfred_coo
 Restart=on-failure
 RestartSec=15
