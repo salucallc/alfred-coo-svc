@@ -64,11 +64,21 @@ def test_all_pm_personas_have_topics():
 
 
 def test_alfred_coo_a_has_b3_tools():
-    """B.3.1+B.3.2+B.3.4: alfred-coo-a opts into tool-use with all five tools."""
+    """SAL-371X (1d): alfred-coo-a tool-list trimmed from 6 → 4 to lift
+    gpt-oss merge rate. Builder body never invokes slack_post or
+    mesh_task_create; reducing tool schema cuts tool-selection branching
+    factor and reduces silent-complete loop pattern (per
+    `reference_gpt_oss_120b_tool_call_regression`).
+    """
     p = get_persona("alfred-coo-a")
     assert p.tools, "alfred-coo-a should have tool-use enabled"
-    for expected in ("linear_create_issue", "slack_post", "mesh_task_create", "propose_pr", "http_get"):
-        assert expected in p.tools, f"alfred-coo-a missing tool: {expected}"
+    expected = {"linear_create_issue", "propose_pr", "update_pr", "http_get"}
+    assert set(p.tools) == expected, (
+        f"alfred-coo-a tools mismatch: {p.tools}; expected {expected}"
+    )
+    # Regression guards — these were trimmed and must not return.
+    assert "slack_post" not in p.tools
+    assert "mesh_task_create" not in p.tools
 
 
 def test_default_persona_has_no_tools():

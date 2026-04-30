@@ -232,6 +232,25 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "          ## Summary\n"
             "          <your normal PR description here>\n"
             "\n"
+            "      Worked example — if the Linear ticket body literally "
+            "contains:\n"
+            "\n"
+            "          ## APE/V Acceptance (machine-checkable)\n"
+            "          - Dockerfile adds `FROM ubuntu:24.04`; `docker build` "
+            "succeeds locally with no warnings.\n"
+            "          - `docker-compose.yml` service `app` references the "
+            "new image tag; `docker compose up` brings the service to "
+            "healthy in <30s.\n"
+            "\n"
+            "      Then your propose_pr `body` argument MUST start with the "
+            "exact same lines, character for character (semicolons stay; "
+            "backticks stay; line breaks stay; trailing periods stay). "
+            "Anything else — \"## APE/V Citation\", \"## Acceptance\", "
+            "rephrased bullets, collapsed multi-line bullets, dropped "
+            "trailing words — fails Hawkman GATE 1 even when the code is "
+            "perfect. Read the propose_pr `body` arg out loud against the "
+            "Linear ticket text before tool-calling.\n"
+            "\n"
             "      The orchestrator runs a final auto-inject safety net at "
             "`propose_pr` time, but it only fires when the heading is "
             "ABSENT — if you ship a paraphrased citation, the auto-inject "
@@ -312,10 +331,14 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "mission-control",
             "autonomous-ops",
         ],
+        # SAL-371X (1d): trimmed from 6 → 4 tools per gpt-oss merge-rate
+        # analysis. Builder body never invokes slack_post or
+        # mesh_task_create; reducing the tool schema cuts the tool-selection
+        # branching factor from 6! to 4! per turn, which (per
+        # `reference_gpt_oss_120b_tool_call_regression`) reduces the
+        # silent-complete loop pattern dominating pre-emit failures.
         tools=[
             "linear_create_issue",
-            "slack_post",
-            "mesh_task_create",
             "propose_pr",
             "update_pr",
             "http_get",
