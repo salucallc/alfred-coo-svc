@@ -6693,3 +6693,213 @@ async def test_kickoff_model_routing_propagates_into_child_body(monkeypatch):
     end = body.find("-->", start)
     parsed = _json.loads(body[start:end].strip())
     assert parsed["model_routing"] == {"builder": "deepseek-v3.2:cloud"}
+
+
+# ── on_all_green actions (SAL-3713) ────────────────────────────────────────
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code: int, text: str = "", json_data: dict | None = None):
+        self.status_code = status_code
+        self.text = text
+        self._json = json_data
+
+    def json(self):
+        return self._json
+
+
+class _FakeHttpClient:
+    """Stand-in for httpx.AsyncClient used by _finalize_release_tag.
+
+    Captures every POST so tests can assert the URL + payload, and
+    returns whatever ``response`` was injected at construction time.
+    """
+
+    def __init__(self, response: _FakeHttpResponse):
+        self._response = response
+        self.calls: list[dict] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, json=None, headers=None, **kwargs):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        return self._response
+
+
+def _patch_httpx(monkeypatch, response: _FakeHttpResponse) -> _FakeHttpClient:
+    """Install a fake httpx.AsyncClient on the orchestrator module.
+
+    Returns the client so tests can inspect ``client.calls``.
+    """
+    import alfred_coo.autonomous_build.orchestrator as orch_mod
+
+    fake = _FakeHttpClient(response)
+
+    def _factory(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(orch_mod.httpx, "AsyncClient", _factory)
+    return fake
+
+
+async def test_on_all_green_empty_list_is_noop():
+    """Empty on_all_green list returns immediately, no events recorded."""
+    orch = _mk_orchestrator(kickoff_desc={"linear_project_id": "p1", "on_all_green": []})
+    orch._parse_payload()
+    await orch._run_on_all_green_actions()
+    events = [e for e in orch.state.events if "on_all_green" in e.get("kind", "")]
+    assert events == []
+
+
+async def test_on_all_green_tag_pattern_calls_github_releases_api(monkeypatch):
+    """'tag v1.0.0-rc.7' creates a GitHub release on the default repo."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_token")
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1", "on_all_green": ["tag v1.0.0-rc.7"]}
+    )
+    orch._parse_payload()
+    fake = _patch_httpx(
+        monkeypatch,
+        _FakeHttpResponse(
+            201,
+            json_data={"id": 999, "tag_name": "v1.0.0-rc.7"},
+        ),
+    )
+
+    await orch._run_on_all_green_actions()
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["url"] == (
+        "https://api.github.com/repos/salucallc/alfred-coo-svc/releases"
+    )
+    body = fake.calls[0]["json"]
+    assert body["tag_name"] == "v1.0.0-rc.7"
+    assert body["prerelease"] is True  # rc. → prerelease
+    assert body["name"].startswith("v1.0.0-rc.7")
+
+    completed = [
+        e for e in orch.state.events
+        if e.get("kind") == "on_all_green_completed"
+    ]
+    assert len(completed) == 1
+
+
+async def test_on_all_green_tag_with_repo_targets_custom_repo(monkeypatch):
+    """'tag v1.2.3 on salucallc/soul-svc' hits the soul-svc releases API."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_token")
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1", "on_all_green": ["tag v1.2.3 on salucallc/soul-svc"]}
+    )
+    orch._parse_payload()
+    fake = _patch_httpx(
+        monkeypatch,
+        _FakeHttpResponse(201, json_data={"id": 1, "tag_name": "v1.2.3"}),
+    )
+
+    await orch._run_on_all_green_actions()
+
+    assert fake.calls[0]["url"] == (
+        "https://api.github.com/repos/salucallc/soul-svc/releases"
+    )
+    body = fake.calls[0]["json"]
+    assert body["tag_name"] == "v1.2.3"
+    assert body["prerelease"] is False  # plain semver → not prerelease
+
+
+async def test_on_all_green_unknown_pattern_records_skipped(monkeypatch):
+    """Unrecognised action pattern records skipped event, doesn't fail."""
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1", "on_all_green": ["do something undefined"]}
+    )
+    orch._parse_payload()
+
+    await orch._run_on_all_green_actions()
+
+    skipped = [
+        e for e in orch.state.events
+        if e.get("kind") == "on_all_green_skipped_unknown"
+    ]
+    assert len(skipped) == 1
+    assert skipped[0]["action"] == "do something undefined"
+
+
+async def test_on_all_green_tag_already_exists_is_idempotent(monkeypatch):
+    """422 already_exists from GitHub completes silently (idempotent)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_token")
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1", "on_all_green": ["tag v1.0.0-rc.6"]}
+    )
+    orch._parse_payload()
+    _patch_httpx(
+        monkeypatch,
+        _FakeHttpResponse(
+            422,
+            text='{"errors":[{"code":"already_exists","field":"tag_name"}]}',
+        ),
+    )
+
+    await orch._run_on_all_green_actions()
+
+    completed = [
+        e for e in orch.state.events
+        if e.get("kind") == "on_all_green_completed"
+    ]
+    failed = [
+        e for e in orch.state.events
+        if e.get("kind") == "on_all_green_failed"
+    ]
+    assert len(completed) == 1
+    assert len(failed) == 0
+
+
+async def test_on_all_green_missing_token_records_failed(monkeypatch):
+    """No GITHUB_TOKEN raises, action records failed event, loop continues."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p1",
+            "on_all_green": [
+                "tag v1.0.0-rc.7",
+                "tag v1.0.1 on salucallc/other",
+            ],
+        }
+    )
+    orch._parse_payload()
+
+    await orch._run_on_all_green_actions()
+
+    failed = [
+        e for e in orch.state.events
+        if e.get("kind") == "on_all_green_failed"
+    ]
+    completed = [
+        e for e in orch.state.events
+        if e.get("kind") == "on_all_green_completed"
+    ]
+    # Both actions fail (no token), but the loop continues to the second.
+    assert len(failed) == 2
+    assert len(completed) == 0
+
+
+async def test_on_all_green_no_longer_dispatches_mesh_tasks(monkeypatch):
+    """Regression guard: SAL-3713 removed mesh-dispatch under [v1-ga-finalize]."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_token")
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1", "on_all_green": ["tag v1.0.0-rc.7"]},
+        mesh=mesh,
+    )
+    orch._parse_payload()
+    _patch_httpx(
+        monkeypatch,
+        _FakeHttpResponse(201, json_data={"id": 1, "tag_name": "v1.0.0-rc.7"}),
+    )
+
+    await orch._run_on_all_green_actions()
+
+    # No mesh tasks should be created — direct API call instead.
+    assert len(mesh.created) == 0
