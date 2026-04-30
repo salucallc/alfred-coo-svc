@@ -1,23 +1,34 @@
 """Builder-skip-already-merged tests (Gap 4, 2026-04-29).
 
 Coverage for the pre-flight merged-PR check added to ``_dispatch_wave``:
-before firing a builder for a ticket, the orchestrator now searches
-GitHub for a merged PR mentioning the ticket identifier; if one exists
-the ticket has already shipped, the orchestrator marks it MERGED_GREEN
-and skips dispatch. Reuses the existing ``_search_recent_merged_pr_urls``
-helper (driven by the ``_gh_pr_search_fn`` test stub).
+before firing a builder for a ticket, the orchestrator searches GitHub
+for a merged PR mentioning the ticket identifier; if one exists AND the
+PR's changed files intersect the ticket's ``_TARGET_HINTS`` expected
+scope, the ticket has already shipped, the orchestrator marks it
+MERGED_GREEN and skips dispatch. Reuses the ``_search_recent_merged_pr_urls``
++ ``_pr_intersects_expected_scope`` helpers (driven by the ``_gh_pr_search_fn``
+and ``_gh_pr_files_fn`` test stubs).
 
-Pins four behaviours:
-  1. Ticket with a merged PR → ``_ticket_has_merged_pr`` returns the
-     URL; the dispatch-loop branch marks MERGED_GREEN, records a
-     ``merged_pr_skip`` event, and does NOT create a builder mesh task.
-  2. Ticket with no merged PR → helper returns None; the orchestrator
-     dispatches a builder normally.
-  3. Ticket with only an OPEN PR (search yields nothing because the
-     stub returns []) → helper returns None; ticket is NOT marked
-     MERGED_GREEN. Whatever path is correct (e.g. PR-exists-skip →
-     AWAITING_REVIEW) takes over.
-  4. Two consecutive lookups of the same ticket within the cache
+2026-04-29 federation-misfire fix: the path-intersection check is now
+shared with ``_find_recent_merged_pr_for`` so the dispatch loop and
+stale-sweep agree on what counts as evidence-of-implementation. Tests
+below assert the behaviour at the helper level and at the dispatch-loop
+branch level.
+
+Pins six behaviours:
+  1. Ticket WITH ``_TARGET_HINTS`` + PR that touches an expected path
+     -> MERGED_GREEN, builder NOT dispatched.
+  2. Ticket WITH ``_TARGET_HINTS`` + PR that only mentions the ticket
+     ID but doesn't touch expected paths -> helper returns None,
+     ticket dispatches fresh (federation 02:33Z misfire regression).
+  3. Ticket WITHOUT ``_TARGET_HINTS`` (NO_HINT) + PR that mentions the
+     ticket ID -> helper returns None, ticket dispatches fresh
+     (conservative: refuse to auto-flip on weak evidence).
+  4. No merged PR found at all -> helper returns None, dispatch
+     proceeds normally.
+  5. Open PR only (search returns []) -> helper returns None, ticket
+     not marked MERGED_GREEN.
+  6. Two consecutive lookups of the same ticket within the cache
      window result in exactly one underlying GitHub-search call.
 """
 
@@ -38,7 +49,7 @@ from alfred_coo.autonomous_build.orchestrator import (
 from alfred_coo.autonomous_build.state import OrchestratorState
 
 
-# ── Fakes (mirror test_pr_exists_ready_counter.py + test_inherited_open_pr_review_dispatch.py) ──
+# Fakes mirror test_pr_exists_ready_counter.py + test_inherited_open_pr_review_dispatch.py
 
 
 class _FakeMesh:
@@ -122,32 +133,42 @@ def _seed_graph(orch: AutonomousBuildOrchestrator, tickets: list[Ticket]) -> Non
     orch.graph = g
 
 
-# ── 1. merged-PR present → MERGED_GREEN + no dispatch ─────────────────────
+# 1. merged-PR present + path intersects -> MERGED_GREEN + no dispatch
 
 
 @pytest.mark.asyncio
-async def test_merged_pr_marks_green_and_skips_dispatch():
-    """A ticket whose merged PR is found in GitHub Search must be
-    transitioned to MERGED_GREEN, must record a ``merged_pr_skip``
-    state event, and must NOT result in a builder mesh task being
-    created. Mirrors the dispatch-loop branch in ``_dispatch_wave``.
+async def test_merged_pr_with_intersecting_files_marks_green_and_skips_dispatch():
+    """A ticket whose merged PR is found in GitHub Search AND whose
+    changed files intersect the ticket's ``_TARGET_HINTS`` expected
+    scope must be transitioned to MERGED_GREEN, must record a
+    ``merged_pr_skip`` state event, and must NOT result in a builder
+    mesh task being created. Mirrors the dispatch-loop branch in
+    ``_dispatch_wave``.
+
+    Uses OPS-14D which has ``scope_middleware.py`` in
+    ``_TARGET_HINTS[OPS-14D].paths`` so the PR's changed files can
+    intersect.
     """
     mesh = _FakeMesh()
     orch = _mk_orch(mesh=mesh)
 
-    ticket = _t("u-3037", "SAL-3037", code="OPS-14E", wave=2, epic="ops")
+    ticket = _t("u-3037", "SAL-3037", code="OPS-14D", wave=2, epic="ops")
     ticket.status = TicketStatus.PENDING
     _seed_graph(orch, [ticket])
     orch.state = OrchestratorState(kickoff_task_id="kick-gap4")
 
-    # _gh_pr_search_fn is the existing stub used by the stale-sweep
-    # helpers. It feeds _search_recent_merged_pr_urls, which
-    # _ticket_has_merged_pr layers cache + None-handling on top of.
-    async def stub(ident):
+    async def search_stub(ident):
         assert ident == "SAL-3037"
         return ["https://github.com/salucallc/alfred-coo-svc/pull/283"]
 
-    orch._gh_pr_search_fn = stub
+    async def files_stub(url):
+        # PR #283 actually edits the OPS-14D scope_middleware implementation
+        # file -> intersects expected scope -> counts as evidence.
+        assert url == "https://github.com/salucallc/alfred-coo-svc/pull/283"
+        return ("src/alfred_coo/auth/scope_middleware.py",)
+
+    orch._gh_pr_search_fn = search_stub
+    orch._gh_pr_files_fn = files_stub
     # Avoid live Linear API call during test.
     orch._update_linear_state = _noop_update_linear
 
@@ -167,7 +188,7 @@ async def test_merged_pr_marks_green_and_skips_dispatch():
             skips_total=orch._merged_pr_skips,
         )
         await orch._update_linear_state(ticket, "Done")
-    else:  # pragma: no cover — branch retained for parity with prod
+    else:  # pragma: no cover - branch retained for parity with prod
         await orch._dispatch_child(ticket)
 
     assert ticket.status == TicketStatus.MERGED_GREEN
@@ -184,18 +205,121 @@ async def test_merged_pr_marks_green_and_skips_dispatch():
     )
 
 
-# ── 2. no merged PR → builder dispatches normally ────────────────────────
+# 2. PR mentions ticket but doesn't touch expected paths -> DISPATCH FRESH
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_without_intersecting_files_dispatches_fresh():
+    """Federation 2026-04-29 02:33:25Z misfire regression: a merged PR
+    that mentions a ticket ID in title or body but does NOT touch any
+    of the ticket's ``_TARGET_HINTS`` expected paths must NOT be treated
+    as evidence-of-implementation. The helper returns None and the
+    dispatch loop fires a builder fresh.
+
+    Concretely: SAL-3568 (federation wave-1) had hint paths under
+    ``migrations/`` but the falsely-claimed PR #302 only touched
+    unrelated files (it mentioned SAL-3568 in its body for context).
+    The stale-sweep matcher already rejected this; the dispatch-loop
+    pre-flight previously did not.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orch(mesh=mesh)
+
+    # OPS-14D has paths under src/alfred_coo/auth/ in _TARGET_HINTS
+    ticket = _t("u-fed", "SAL-3568", code="OPS-14D", wave=1, epic="ops")
+    ticket.status = TicketStatus.PENDING
+    _seed_graph(orch, [ticket])
+    orch.state = OrchestratorState(kickoff_task_id="kick-gap4")
+
+    async def search_stub(ident):
+        return ["https://github.com/salucallc/alfred-coo-svc/pull/302"]
+
+    async def files_stub(url):
+        # PR #302 touches unrelated migrations files; mentions SAL-3568
+        # in body but does NOT implement OPS-14D.
+        return (
+            "migrations/mssp_federation_functions.sql",
+            "migrations/mssp_federation_tables.sql",
+        )
+
+    orch._gh_pr_search_fn = search_stub
+    orch._gh_pr_files_fn = files_stub
+
+    merged_url = await orch._ticket_has_merged_pr(ticket.identifier)
+    assert merged_url is None, (
+        "PR that mentions ticket but doesn't intersect expected scope "
+        "must NOT be treated as evidence-of-implementation"
+    )
+
+    # Replicate the dispatch-loop branch: helper returned None -> dispatch.
+    if merged_url is None:
+        await orch._dispatch_child(ticket)
+
+    assert ticket.status != TicketStatus.MERGED_GREEN
+    assert len(mesh.created) == 1, (
+        "builder must dispatch when merged PR is not the implementation"
+    )
+    assert orch._merged_pr_skips == 0
+
+
+# 3. NO_HINT ticket + PR mentions it -> DISPATCH FRESH (conservative)
+
+
+@pytest.mark.asyncio
+async def test_no_hint_ticket_with_merged_pr_dispatches_fresh():
+    """A ticket whose ``code`` is not in ``_TARGET_HINTS`` cannot be
+    scope-verified, so the helper conservatively returns None - the
+    dispatch loop fires a builder fresh rather than trusting a
+    title-mention. Mirrors the stale-sweep matcher's NO_HINT branch
+    (refuse to auto-flip on weak evidence).
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orch(mesh=mesh)
+
+    # OPS-14E is intentionally NOT in _TARGET_HINTS (NO_HINT case).
+    ticket = _t("u-9999", "SAL-9999", code="OPS-14E", wave=1, epic="ops")
+    ticket.status = TicketStatus.PENDING
+    _seed_graph(orch, [ticket])
+    orch.state = OrchestratorState(kickoff_task_id="kick-gap4")
+
+    async def search_stub(ident):
+        return ["https://github.com/salucallc/alfred-coo-svc/pull/999"]
+
+    async def files_stub(url):  # pragma: no cover - should never be called
+        raise AssertionError(
+            "files_stub must not be called when ticket has no _TARGET_HINTS"
+        )
+
+    orch._gh_pr_search_fn = search_stub
+    orch._gh_pr_files_fn = files_stub
+
+    merged_url = await orch._ticket_has_merged_pr(ticket.identifier)
+    assert merged_url is None, (
+        "NO_HINT ticket must not auto-flip on title-mention alone"
+    )
+
+    if merged_url is None:
+        await orch._dispatch_child(ticket)
+
+    assert ticket.status != TicketStatus.MERGED_GREEN
+    assert len(mesh.created) == 1, (
+        "NO_HINT ticket must dispatch fresh; conservative refusal to skip"
+    )
+    assert orch._merged_pr_skips == 0
+
+
+# 4. no merged PR -> builder dispatches normally
 
 
 @pytest.mark.asyncio
 async def test_no_merged_pr_dispatches_normally():
-    """Search yields nothing → helper returns None and the orchestrator
+    """Search yields nothing -> helper returns None and the orchestrator
     proceeds to ``_dispatch_child``.
     """
     mesh = _FakeMesh()
     orch = _mk_orch(mesh=mesh)
 
-    ticket = _t("u-9999", "SAL-9999", code="OPS-99", wave=1, epic="ops")
+    ticket = _t("u-9999", "SAL-9999", code="OPS-14D", wave=1, epic="ops")
     ticket.status = TicketStatus.PENDING
     _seed_graph(orch, [ticket])
     orch.state = OrchestratorState(kickoff_task_id="kick-gap4")
@@ -216,7 +340,7 @@ async def test_no_merged_pr_dispatches_normally():
     assert orch._merged_pr_skips == 0
 
 
-# ── 3. open PR only (no merged PR) → not MERGED_GREEN ─────────────────────
+# 5. open PR only (no merged PR) -> not MERGED_GREEN
 
 
 @pytest.mark.asyncio
@@ -225,7 +349,7 @@ async def test_open_pr_does_not_trigger_merged_green():
     invisible to it. Returning [] from the search stub mirrors that:
     the helper returns None, the ticket is NOT marked MERGED_GREEN,
     and the dispatch path falls through to whatever check handles
-    open PRs (covered by SAL-3038 / PR #286 — AWAITING_REVIEW).
+    open PRs (covered by SAL-3038 / PR #286 - AWAITING_REVIEW).
     """
     mesh = _FakeMesh()
     orch = _mk_orch(mesh=mesh)
@@ -236,7 +360,7 @@ async def test_open_pr_does_not_trigger_merged_green():
     orch.state = OrchestratorState(kickoff_task_id="kick-gap4")
 
     # Open PR exists in reality but ``is:merged`` excludes it from the
-    # search response — stub returns [].
+    # search response - stub returns [].
     async def merged_stub(ident):
         return []
 
@@ -253,7 +377,7 @@ async def test_open_pr_does_not_trigger_merged_green():
     assert skip_events == [], "open-PR-only must not record merged_pr_skip"
 
 
-# ── 4. cache: only one GitHub call per ticket per window ──────────────────
+# 6. cache: only one GitHub call per ticket per window
 
 
 @pytest.mark.asyncio
@@ -265,13 +389,23 @@ async def test_merged_pr_lookup_cached_within_window():
     """
     orch = _mk_orch()
     orch.state = OrchestratorState(kickoff_task_id="kick-gap4")
-    call_count = {"n": 0}
+    # Seed graph so the path-intersection check resolves a hint.
+    ticket = _t("u-3037", "SAL-3037", code="OPS-14D", wave=2, epic="ops")
+    _seed_graph(orch, [ticket])
 
-    async def stub(ident):
-        call_count["n"] += 1
+    search_count = {"n": 0}
+    files_count = {"n": 0}
+
+    async def search_stub(ident):
+        search_count["n"] += 1
         return ["https://github.com/salucallc/alfred-coo-svc/pull/283"]
 
-    orch._gh_pr_search_fn = stub
+    async def files_stub(url):
+        files_count["n"] += 1
+        return ("src/alfred_coo/auth/scope_middleware.py",)
+
+    orch._gh_pr_search_fn = search_stub
+    orch._gh_pr_files_fn = files_stub
 
     first = await orch._ticket_has_merged_pr("SAL-3037")
     second = await orch._ticket_has_merged_pr("SAL-3037")
@@ -279,12 +413,15 @@ async def test_merged_pr_lookup_cached_within_window():
     assert first == second == (
         "https://github.com/salucallc/alfred-coo-svc/pull/283"
     )
-    assert call_count["n"] == 1, (
+    assert search_count["n"] == 1, (
         "second lookup within cache window must be served from cache"
+    )
+    assert files_count["n"] == 1, (
+        "files lookup must also be cached via the merged-pr cache"
     )
 
 
-# ── helpers ────────────────────────────────────────────────────────────────
+# helpers
 
 
 async def _noop_update_linear(ticket, state_name):
