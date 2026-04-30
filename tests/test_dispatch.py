@@ -1094,3 +1094,152 @@ def test_select_model_registry_fallback_to_persona_preferred(monkeypatch, tmp_pa
     task = {"title": "[persona:alfred-coo-a] hello"}
     # No tag, no registry => fall back to persona.preferred_model.
     assert select_model(task, persona) == "qwen3-coder:30b-a3b-q4_K_M"
+
+
+# ── SAL-3670: builder_fallback_chain[0] honored at attempt 0 ───────────────
+
+
+def _registry_with_broken_baseline(tmp_path) -> str:
+    """Write a registry whose builder primary is gpt-oss:120b-cloud — the
+    real-world broken baseline that SAL-3670 protects against. Tests that
+    rely on the chain winning over the registry use this fixture so the
+    assertion proves the chain bypasses the broken pick.
+    """
+    p = tmp_path / "registry.yaml"
+    p.write_text(
+        "schema_version: 1\n"
+        "models:\n"
+        "  gpt-oss:120b-cloud: {provider: x, capabilities: [], status: active}\n"
+        "  kimi-k2-thinking:cloud: {provider: x, capabilities: [], status: active}\n"
+        "  qwen3-coder:480b-cloud: {provider: x, capabilities: [], status: active}\n"
+        "roles:\n"
+        "  builder:\n"
+        "    primary: gpt-oss:120b-cloud\n"
+        "    fallback_chain: []\n"
+        "    last_resort: gpt-oss:120b-cloud\n"
+        "  qa:\n"
+        "    primary: gpt-oss:120b-cloud\n"
+        "    fallback_chain: []\n"
+        "    last_resort: gpt-oss:120b-cloud\n"
+        "stable_baseline:\n  builder: gpt-oss:120b-cloud\n",
+        encoding="utf-8",
+    )
+    return str(p)
+
+
+def test_kickoff_fallback_chain_overrides_registry_for_builder_attempt_0(
+    tmp_path, monkeypatch
+):
+    """SAL-3670: builder_fallback_chain[0] must beat registry at attempt 0.
+
+    Bug context: when the kickoff payload supplies a fallback chain, the
+    operator's first preference is the canonical attempt-0 model. Prior to
+    this fix, dispatch ignored the chain and used registry.primary, which
+    in production was the broken gpt-oss:120b-cloud baseline.
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setenv("MODEL_REGISTRY_PATH", _registry_with_broken_baseline(tmp_path))
+    mr._reset_for_tests()
+
+    payload = {
+        "builder_fallback_chain": [
+            "kimi-k2-thinking:cloud",
+            "qwen3-coder:480b-cloud",
+        ],
+    }
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-3670 hello",
+        "description": json.dumps(payload),
+    }
+    persona = _MiniPersona("alfred-coo-a")
+    assert select_model(task, persona) == "kimi-k2-thinking:cloud"
+    mr._reset_for_tests()
+
+
+def test_model_routing_beats_fallback_chain(tmp_path, monkeypatch):
+    """`model_routing.builder` is a hard pin and must outrank the chain.
+
+    The chain is a wishlist (preferred order); `model_routing.builder` is
+    a per-kickoff override the operator sets when they want exactly one
+    model. Override > chain > registry.
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setenv("MODEL_REGISTRY_PATH", _registry_with_broken_baseline(tmp_path))
+    mr._reset_for_tests()
+
+    payload = {
+        "model_routing": {"builder": "qwen3-coder:480b-cloud"},
+        "builder_fallback_chain": [
+            "kimi-k2-thinking:cloud",
+            "gpt-oss:120b-cloud",
+        ],
+    }
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-3670 hello",
+        "description": json.dumps(payload),
+    }
+    persona = _MiniPersona("alfred-coo-a")
+    assert select_model(task, persona) == "qwen3-coder:480b-cloud"
+    mr._reset_for_tests()
+
+
+def test_fallback_chain_only_affects_builder_role(tmp_path, monkeypatch):
+    """The chain is builder-only; QA/orchestrator must ignore it.
+
+    QA selection has its own routing knobs (model_routing.qa, registry qa
+    role). A `builder_fallback_chain` set on a QA task must NOT leak into
+    the QA pick — otherwise QA would mirror builder choice, defeating the
+    point of role-segmented routing.
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setenv("MODEL_REGISTRY_PATH", _registry_with_broken_baseline(tmp_path))
+    mr._reset_for_tests()
+
+    payload = {
+        "builder_fallback_chain": [
+            "kimi-k2-thinking:cloud",
+            "qwen3-coder:480b-cloud",
+        ],
+    }
+    task = {
+        "title": "[persona:hawkman-qa-a] SAL-3670 review",
+        "description": json.dumps(payload),
+    }
+    persona = _MiniPersona("hawkman-qa-a")
+    # Chain is builder-only -> QA falls through to registry primary, which
+    # in this fixture is gpt-oss:120b-cloud. The point: kimi was NOT picked.
+    assert select_model(task, persona) == "gpt-oss:120b-cloud"
+    mr._reset_for_tests()
+
+
+def test_chain_in_child_task_dict_path(tmp_path, monkeypatch):
+    """Orchestrator-injected child path: `task["builder_fallback_chain"]`.
+
+    When the orchestrator builds child task dicts it sets the chain
+    directly on the task object (no description JSON wrapper). Mirrors how
+    `_peek_kickoff_model_override` handles the direct dict path for
+    `model_routing`.
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setenv("MODEL_REGISTRY_PATH", _registry_with_broken_baseline(tmp_path))
+    mr._reset_for_tests()
+
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-3670 child",
+        # Direct dict path — no description JSON.
+        "builder_fallback_chain": [
+            "kimi-k2-thinking:cloud",
+            "qwen3-coder:480b-cloud",
+        ],
+    }
+    persona = _MiniPersona("alfred-coo-a")
+    assert select_model(task, persona) == "kimi-k2-thinking:cloud"
+    mr._reset_for_tests()
