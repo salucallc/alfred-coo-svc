@@ -3508,6 +3508,16 @@ class AutonomousBuildOrchestrator:
         self.builder_fallback_chain: Tuple[str, ...] = (
             DEFAULT_BUILDER_FALLBACK_CHAIN
         )
+        # SAL-3670 follow-up (2026-04-30): kickoff-payload override
+        # propagation. Initialised empty here so tests / restored-state
+        # instances that skip ``_parse_payload`` still have the attr;
+        # populated by ``_parse_payload`` when the kickoff carries an
+        # explicit ``model_routing`` dict. Embedded into child task
+        # bodies via ``_render_model_routing_block`` so spawned children's
+        # ``dispatch.select_model`` honours the operator's model pin at
+        # attempt 0 (without this propagation, the override only fired on
+        # the kickoff parent task, not on spawned children).
+        self.model_routing_override: Dict[str, str] = {}
 
         # AB-17-q · external cancel signal (SAL-2756, 2026-04-24).
         # An operator who PATCHes the kickoff task's lifecycle state to
@@ -3856,6 +3866,27 @@ class AutonomousBuildOrchestrator:
                     chain_override, DEFAULT_BUILDER_FALLBACK_CHAIN,
                 )
                 self.builder_fallback_chain = DEFAULT_BUILDER_FALLBACK_CHAIN
+
+        # SAL-3670 follow-up (2026-04-30): capture the parent's
+        # ``model_routing`` dict (if any) so child task bodies carry it
+        # forward via the ``<!-- model_routing: ... -->`` block in
+        # ``_child_task_body``. Without propagation,
+        # ``dispatch.select_model`` on a spawned child only sees the
+        # persona default + registry primary and silently routes to
+        # ``gpt-oss:120b-cloud`` even when the operator pinned a
+        # different model on the parent kickoff (the bug this fix
+        # closes). ``builder_fallback_chain`` is already on ``self``
+        # (above); this captures the role-keyed ``model_routing`` map
+        # separately.
+        routing_override = payload.get("model_routing")
+        if isinstance(routing_override, dict):
+            self.model_routing_override = {
+                str(k): str(v)
+                for k, v in routing_override.items()
+                if isinstance(k, str) and isinstance(v, str) and v
+            }
+        else:
+            self.model_routing_override = {}
 
         # AB-05: build the payload-configured tracker + cadence. Keep the
         # previously-constructed defaults if the payload omits a field so
@@ -4822,6 +4853,16 @@ class AutonomousBuildOrchestrator:
         # Best-effort: a Linear hiccup must not block dispatch, so on any
         # failure we fall back to the legacy placeholder checklist.
         apev_block = self._render_apev_acceptance_block(ticket)
+        # SAL-3670 follow-up (2026-04-30): kickoff-payload override
+        # propagation. Embed a single ``<!-- model_routing: {...} -->``
+        # HTML-comment block carrying any parent-kickoff overrides
+        # forward to the spawned child. Picked up by
+        # ``dispatch._peek_kickoff_payload`` so ``select_model`` honours
+        # ``model_routing.<role>`` and ``builder_fallback_chain[0]`` at
+        # attempt 0. Empty / default values are skipped so the legacy
+        # body shape is unchanged for runs that don't touch model
+        # routing.
+        routing_block = self._render_model_routing_block()
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -4831,6 +4872,7 @@ class AutonomousBuildOrchestrator:
             f"Estimate: {ticket.estimate}\n"
             f"Parent autonomous_build kickoff: {self.task_id}\n"
             f"{plan_doc_code_line}"
+            f"{routing_block}"
             f"\n"
             f"{target_block}"
             f"\n"
@@ -4849,6 +4891,60 @@ class AutonomousBuildOrchestrator:
             f"files outside those paths without opening a grounding-gap "
             f"Linear issue first.\n"
         )
+
+    def _render_model_routing_block(self) -> str:
+        """Render the ``<!-- model_routing: {...} -->`` propagation block
+        for child task bodies, or empty string when there's nothing to
+        propagate.
+
+        SAL-3670 follow-up (2026-04-30): child tasks need to carry the
+        parent kickoff's per-run model overrides forward. Otherwise
+        ``dispatch.select_model`` on the spawned child only sees the
+        persona default + registry primary, and silently routes to
+        ``gpt-oss:120b-cloud`` even when the operator pinned a different
+        model on the parent kickoff (the bug this fix closes).
+
+        The block is parsed by ``dispatch._peek_kickoff_payload`` via the
+        ``<!-- model_routing:`` marker; ``select_model`` then consults
+        ``model_routing.<role>`` and ``builder_fallback_chain[0]`` in
+        precedence order. The block is omitted entirely (returns ``""``)
+        when no payload override is present so the legacy body shape is
+        unchanged for runs that don't touch model routing.
+
+        Includes:
+          * ``model_routing``: the role-keyed map captured from the
+            kickoff payload's ``model_routing`` dict (operator-set).
+          * ``builder_fallback_chain``: the chain head onward, but only
+            when the operator overrode the default chain. The chain at
+            attempt 0 is read by ``select_model`` when
+            ``model_routing.builder`` is not set.
+        """
+        block: Dict[str, Any] = {}
+        if (
+            isinstance(self.model_routing_override, dict)
+            and self.model_routing_override
+        ):
+            block["model_routing"] = dict(self.model_routing_override)
+        # Only propagate the chain when it differs from the module
+        # default; default-chain runs don't need a propagation block at
+        # all (registry + persona default already produce the right
+        # attempt-0 model on the child).
+        if (
+            isinstance(self.builder_fallback_chain, tuple)
+            and tuple(self.builder_fallback_chain)
+            != tuple(DEFAULT_BUILDER_FALLBACK_CHAIN)
+        ):
+            block["builder_fallback_chain"] = list(self.builder_fallback_chain)
+        if not block:
+            return ""
+        # Single-line JSON keeps the body shape compact + grep-friendly.
+        # The HTML-comment fence is invisible to GitHub's PR rendering
+        # and to Hawkman's APE/V parsers (which key off ``##`` headings).
+        try:
+            payload_json = json.dumps(block, sort_keys=True)
+        except (TypeError, ValueError):
+            return ""
+        return f"<!-- model_routing: {payload_json} -->\n"
 
     def _render_apev_acceptance_block(self, ticket: Ticket) -> str:
         """Render the canonical APE/V acceptance section for a child task.
