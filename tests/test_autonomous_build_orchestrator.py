@@ -1824,8 +1824,13 @@ def test_target_hints_entry_count_unchanged():
     wave-1 (SAL-3566..3568). Both kickoffs (0de3e2be MSSP-EX retry +
     dae5a5c0 MSSP federation) crashed earlier the same day with
     green=0/excused=N because the persona's Step 0 grounding-gap path
-    fired on every dispatch (NO_HINT escalation)."""
-    assert len(_TARGET_HINTS) == 154
+    fired on every dispatch (NO_HINT escalation). Bumped 154 -> 161
+    by the same-day follow-up (PR fix/wave1-co-ai-regex-and-hints):
+    +7 entries CO-W1-A/B/C (Cockpit Consumer UX wave-1,
+    SAL-3591..3593) + AI-W1-A/B/C/D (Agent Ingest wave-1,
+    SAL-3609..3612). Without these the same NO_HINT escalation would
+    fire on every Cockpit-UX or Agent-Ingest wave-1 dispatch."""
+    assert len(_TARGET_HINTS) == 161
 
 
 def test_target_hints_keys_are_uppercase():

@@ -321,3 +321,122 @@ def test_target_hints_cover_mssp_wave_1_codes() -> None:
         "without these the persona's Step 0 grounding-gap path fires "
         "on every dispatch and the wave-gate crashes with green=0."
     )
+
+
+@pytest.mark.parametrize(
+    "title, labels, expected",
+    [
+        # wave-1 silent-complete fix follow-up (2026-04-29 evening):
+        # Cockpit Consumer UX track. Long-form bracket prefix is
+        # normalised unconditionally (no label gate needed).
+        (
+            "[Cockpit Consumer UX W1-A] Cockpit theme schema, loader, "
+            "alias-table, validation",
+            ["track:cockpit-consumer-ux", "wave-1"],
+            "CO-W1-A",
+        ),
+        (
+            "[Cockpit Consumer UX W1-B] Ship 7 new theme packs "
+            "(synthwave-1989, brutalist, ...)",
+            ["track:cockpit-consumer-ux", "wave-1"],
+            "CO-W1-B",
+        ),
+        (
+            "[Cockpit Consumer UX W1-C] Document the 5 existing themes "
+            "against the new theme schema",
+            ["track:cockpit-consumer-ux", "wave-1"],
+            "CO-W1-C",
+        ),
+        # Cockpit prefix is unambiguous; even WITHOUT labels it parses
+        # (the regex anchors on the inline track name).
+        (
+            "[Cockpit Consumer UX W2-A] later wave",
+            None,
+            "CO-W2-A",
+        ),
+        # Underscore variant inside the bracket should still match
+        # (defensive — humans drift between dash and underscore).
+        (
+            "[Cockpit Consumer UX W1_D] underscore wave-key variant",
+            ["track:cockpit-consumer-ux"],
+            "CO-W1-D",
+        ),
+        # Agent Ingest track uses the BARE "[W1-A]" prefix; only the
+        # presence of `track:agent-ingest` label triggers the AI-
+        # normalisation. Without the label, the bare bracket should
+        # parse to '' (unmatched) — safety against accidental over-match
+        # on unrelated tickets that might use a bare wave bracket.
+        (
+            "[W1-A] Plugin SDK base — direction-aware SalucaPlugin ABC",
+            ["track:agent-ingest", "wave-1"],
+            "AI-W1-A",
+        ),
+        (
+            "[W1-B] Soul-svc soulkey issuance API for external agents",
+            ["track:agent-ingest", "wave-1"],
+            "AI-W1-B",
+        ),
+        (
+            "[W1-C] Inbound reference plugin saluca-plugin-echo-inbound",
+            ["track:agent-ingest", "wave-1"],
+            "AI-W1-C",
+        ),
+        (
+            "[W1-D] Outbound reference plugin saluca-plugin-echo-outbound",
+            ["track:agent-ingest", "wave-1"],
+            "AI-W1-D",
+        ),
+        # Bare "[W1-A]" WITHOUT `track:agent-ingest` label MUST NOT
+        # over-match. Closes the over-match risk.
+        (
+            "[W1-A] some unrelated ticket without the agent-ingest track",
+            ["track:something-else", "wave-1"],
+            "",
+        ),
+        (
+            "[W1-A] no labels at all",
+            None,
+            "",
+        ),
+    ],
+)
+def test_parse_code_co_ai_track_titles(
+    title: str, labels: list[str] | None, expected: str
+) -> None:
+    """wave-1 silent-complete fix follow-up (2026-04-29 evening):
+    _CODE_RE recognises CO-W{N}-{A..Z} and AI-W{N}-{A..Z}. _parse_code
+    normalises "[Cockpit Consumer UX W1-A]" -> "CO-W1-A"
+    unconditionally (long-form prefix is unique to that track) and
+    "[W1-A]" -> "AI-W1-A" only when `track:agent-ingest` is in labels
+    (label-gated to avoid over-matching unrelated bare brackets).
+    Closes the NO_HINT escalation spiral that would have hit
+    SAL-3591/3592/3593 (Cockpit-UX wave-1) and SAL-3609/3610/3611/3612
+    (Agent-Ingest wave-1) had the kickoffs fired against the original
+    PR #302 regex."""
+    assert _parse_code(title, labels=labels) == expected
+
+
+def test_target_hints_cover_co_ai_wave_1_codes() -> None:
+    """wave-1 silent-complete fix follow-up (2026-04-29 evening): every
+    Cockpit-UX + Agent-Ingest wave-1 code that _parse_code now extracts
+    MUST have a `_TARGET_HINTS` entry, otherwise dispatch still ends in
+    NO_HINT (unresolved) escalate path. Pinned so a future ticket-rename
+    can't silently regress the wave-gate."""
+    from alfred_coo.autonomous_build.orchestrator import _TARGET_HINTS
+
+    expected_codes = {
+        "CO-W1-A",
+        "CO-W1-B",
+        "CO-W1-C",
+        "AI-W1-A",
+        "AI-W1-B",
+        "AI-W1-C",
+        "AI-W1-D",
+    }
+    missing = expected_codes - set(_TARGET_HINTS.keys())
+    assert not missing, (
+        f"_TARGET_HINTS missing wave-1 CO/AI codes {sorted(missing)}; "
+        "without these the persona's Step 0 grounding-gap path fires "
+        "on every Cockpit-UX or Agent-Ingest wave-1 dispatch and the "
+        "wave-gate crashes with green=0."
+    )
