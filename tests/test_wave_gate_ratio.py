@@ -279,3 +279,207 @@ async def test_9_green_1_failed_passes_soft_green(monkeypatch):
         f"{[e['kind'] for e in orch.state.events]}"
     )
     assert soft.get("green_ratio") == pytest.approx(0.9)
+
+
+# ── SAL-3676 (2026-04-29) — ESCALATED vs ABANDONED discriminator ──────────
+#
+# Tonight's MSSP-Ext orchestrator crashed at 07:19:45Z with
+# ``green=2 failed=0 excused=4 of 6 ratio=0.33`` — three of those four
+# excused tickets were hard-timeout abandonments (SAL-3539/3540/3541), one
+# was a legitimate human-assigned skip (SAL-3545). Pre-fix the wave-gate
+# excusal axis 4 matched any ESCALATED ticket, so the abandonments were
+# masked as grounding-gaps and the operator-facing message read "nothing
+# shipped" rather than "3 hard-timeout failures pulled the ratio down".
+#
+# These three tests pin the post-fix contract:
+#
+#   1. Grounding-gap escalations (legitimate ESCALATED) — STILL excused.
+#      A wave with all-grounding-gap-escalations preserves the pre-fix
+#      excusal behaviour (ratio = 0/N, fails on the threshold but the
+#      message reflects the excused-only shape).
+#
+#   2. Hard-timeout abandonments (ABANDONED) — counted in the FAILED
+#      column. A wave with hard-timeout abandonments brings the ratio
+#      below threshold AND the wave-gate raise message says "X failures",
+#      not "nothing shipped".
+#
+#   3. Mixed: legitimate ESCALATED + abandonment ABANDONED — the
+#      ABANDONED bucket counts against the ratio, ESCALATED stays
+#      excused. End-to-end discriminator parity check.
+
+
+def _excuse_human_assigned(t: Ticket) -> None:
+    """Seed the human-assigned label so axis 1 of _is_wave_gate_excused
+    fires (independent of the SAL-3676 axis-4 ESCALATED-only check)."""
+    t.labels = ["human-assigned"]
+
+
+async def test_grounding_gap_escalated_still_excused_post_sal_3676(monkeypatch):
+    """Case A: a wave full of legitimate grounding-gap escalations —
+    every ticket is ESCALATED via the persona's `linear_create_issue`
+    emit-mode (SAL-2886 path, _envelope_is_grounding_gap → True). All
+    of them must stay excused (axis 4 still matches ESCALATED) so the
+    pre-fix grounding-gap behaviour is preserved.
+
+    With excused-in-denominator (SAL-3072) the wave still fails at
+    ratio=0.0, but the operator-facing message is "(green=0
+    excused=N); nothing shipped" — NOT "X non-critical failure(s)".
+    That's the discriminator: ESCALATED tickets show up in the
+    excused-dominant message bucket, not in the failed-pulled-the-
+    ratio-down bucket.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+    tickets = [_t(f"ueg{i}", f"SAL-EG{i}", f"TIR-EG{i:02d}") for i in range(4)]
+    for t in tickets:
+        t.status = TicketStatus.ESCALATED
+    _seed(orch, tickets)
+    await _patch_nosleep(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="nothing shipped|green_ratio"):
+        await orch._wait_for_wave_gate(1)
+
+    halt = next(
+        e for e in orch.state.events
+        if e["kind"] == "wave_halt_below_soft_green"
+    )
+    # All 4 ESCALATED stay excused; failed bucket empty.
+    assert halt.get("excused_count") == 4
+    assert halt.get("failed") == [], (
+        f"ESCALATED must NOT count in failed column post-SAL-3676; "
+        f"got failed={halt.get('failed')}"
+    )
+    assert halt.get("green_ratio") == pytest.approx(0.0)
+
+
+async def test_hard_timeout_abandoned_counts_as_failed_post_sal_3676(
+    monkeypatch,
+):
+    """Case B (the bug we shipped to fix): a wave full of ABANDONED
+    tickets (the new force-fail terminal that hard-timeout / phantom-
+    loop / wave-stall set instead of ESCALATED) must count in the FAILED
+    column. With 3 ABANDONED + 1 green out of 4, ratio = 1/4 = 0.25 —
+    below default 0.9 threshold → wave halts. The raise message MUST
+    reflect "3 non-critical failure(s)" not "nothing shipped" so an
+    operator tailing logs sees the real failure count instead of a
+    misleading grounding-gap masquerade.
+
+    Pre-fix (SAL-3676 reproduction): all 3 ABANDONED would have been
+    set to ESCALATED, axis-4 of _is_wave_gate_excused would have excused
+    them, ratio = 1/1 = 1.00 → FORCE-PASS the wave despite 3 real
+    failures. SAL-3072 (denominator math) flipped this to 1/4 = 0.25
+    → fail, but the message still said "nothing shipped" — operator
+    couldn't tell timeouts from grounding-gaps. Tonight's MSSP-Ext
+    crash is the live evidence.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+    green = _t("ug-1", "SAL-G-1", "TIR-G-01")
+    green.status = TicketStatus.MERGED_GREEN
+    abandoned = [
+        _t(f"ua{i}", f"SAL-A{i}", f"TIR-A{i:02d}") for i in range(3)
+    ]
+    for t in abandoned:
+        t.status = TicketStatus.ABANDONED
+    _seed(orch, [green] + abandoned)
+    await _patch_nosleep(monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await orch._wait_for_wave_gate(1)
+
+    msg = str(excinfo.value)
+    # Must surface the real failure count, NOT the excused-dominant shape.
+    assert "non-critical failure" in msg, (
+        f"raise message must surface the real failure count; got: {msg!r}"
+    )
+    assert "nothing shipped" not in msg, (
+        f"ABANDONED must not be classified as excused/grounding-gap; "
+        f"got: {msg!r}"
+    )
+
+    halt = next(
+        e for e in orch.state.events
+        if e["kind"] == "wave_halt_below_soft_green"
+    )
+    # ABANDONED ⇒ counted as failed.
+    assert sorted(halt.get("failed") or []) == [
+        "SAL-A0", "SAL-A1", "SAL-A2",
+    ], (
+        f"ABANDONED tickets must populate the failed bucket; "
+        f"got failed={halt.get('failed')}"
+    )
+    assert halt.get("excused_count") == 0, (
+        f"ABANDONED must NOT be excused; got "
+        f"excused_count={halt.get('excused_count')}"
+    )
+    assert halt.get("green_ratio") == pytest.approx(1 / 4, abs=1e-3)
+
+
+async def test_mixed_escalated_and_abandoned_split_correctly(monkeypatch):
+    """Case C (end-to-end discriminator): a wave with one legitimate
+    grounding-gap escalation + one human-assigned skip + three hard-
+    timeout abandonments + two greens.
+
+    Post-SAL-3676 contract:
+      - The human-assigned ticket → excused via axis 1 (label).
+      - The grounding-gap ticket  → excused via axis 4 (ESCALATED).
+      - The three abandoned tickets → counted in the FAILED column.
+      - The two greens → numerator.
+
+    denominator = 2 green + 3 failed + 2 excused = 7
+    ratio = 2 / 7 ≈ 0.286 → below 0.9 → halt with the failure-class
+    message ("3 non-critical failure(s)").
+
+    Mirrors tonight's MSSP-Ext crash shape (green=2 abandoned=3 excused=
+    1 + 1) so we'd catch a regression of this exact incident. Pre-fix
+    the three abandoned would have been ESCALATED + excused → ratio =
+    2/2 = 1.00, force-pass the wave despite 3 real timeouts.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+
+    greens = [_t(f"ug{i}", f"SAL-G{i}", f"TIR-G{i:02d}") for i in range(2)]
+    for t in greens:
+        t.status = TicketStatus.MERGED_GREEN
+
+    # Legitimate ESCALATED via the grounding-gap path (no label, axis 4).
+    grounding_gap = _t("ueg", "SAL-EG", "TIR-EG")
+    grounding_gap.status = TicketStatus.ESCALATED
+
+    # Legitimate excusal via the human-assigned label (axis 1).
+    human = _t("uh", "SAL-H", "TIR-H")
+    human.status = TicketStatus.ESCALATED  # shape from line 4149 of orch
+    _excuse_human_assigned(human)
+
+    abandoned = [_t(f"ua{i}", f"SAL-A{i}", f"TIR-A{i:02d}") for i in range(3)]
+    for t in abandoned:
+        t.status = TicketStatus.ABANDONED
+
+    _seed(orch, greens + [grounding_gap, human] + abandoned)
+    await _patch_nosleep(monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await orch._wait_for_wave_gate(1)
+
+    msg = str(excinfo.value)
+    assert "non-critical failure" in msg, (
+        f"raise message must surface the real failure count; got: {msg!r}"
+    )
+
+    halt = next(
+        e for e in orch.state.events
+        if e["kind"] == "wave_halt_below_soft_green"
+    )
+    # ABANDONED → failed bucket; ESCALATED + human-assigned → excused.
+    assert sorted(halt.get("failed") or []) == [
+        "SAL-A0", "SAL-A1", "SAL-A2",
+    ], (
+        f"only ABANDONED must populate the failed bucket; got "
+        f"failed={halt.get('failed')}"
+    )
+    assert halt.get("excused_count") == 2, (
+        f"ESCALATED + human-assigned must total 2 excused; got "
+        f"excused_count={halt.get('excused_count')}"
+    )
+    # 2 / (2 + 3 + 2) = 2/7 ≈ 0.286
+    assert halt.get("green_ratio") == pytest.approx(2 / 7, abs=1e-3)

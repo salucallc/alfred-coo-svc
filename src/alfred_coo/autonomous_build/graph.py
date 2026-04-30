@@ -68,6 +68,26 @@ class TicketStatus(str, Enum):
     # retry budget. ESCALATED is terminal-non-failure - wave-gate excludes
     # from numerator + denominator (parity with PATH_CONFLICT excusal).
     ESCALATED = "escalated"
+    # SAL-3676 (2026-04-29): split the ``terminal-non-failure but actually
+    # abandoned`` cases out of ESCALATED. Pre-fix, ``_is_wave_gate_excused``
+    # axis 4 excused EVERY ESCALATED ticket regardless of why the escalation
+    # fired. This masked three real abandonment classes as legitimate
+    # grounding-gap escalations:
+    #   - builder hard-timeout (retry budget exhausted, no PR shipping)
+    #   - phantom-loop circuit breaker (child kept disappearing)
+    #   - wave-stall force-pass (no green progress in 30min window)
+    # Tonight (2026-04-29 03:19 UTC) the MSSP-Ext orchestrator crashed at
+    # ``green=2 failed=0 excused=4 of 6 ratio=0.33`` — three of those four
+    # excused were hard-timeout abandonments that should have been counted
+    # as failures (and the wave-gate would have surfaced "3 failures" instead
+    # of the misleading "nothing shipped" message). ABANDONED is terminal
+    # AND counted in the wave-gate denominator under the FAILED column —
+    # the orchestrator gave up on the ticket, that IS a failure. ESCALATED
+    # is reserved for the legitimate-out-of-band cases (grounding-gap from
+    # the persona's own escalate path; human-assigned dispatch-skip and the
+    # respawn-path mirror at line ~6910) where the orchestrator never had a
+    # workable scope.
+    ABANDONED = "abandoned"
 
 
 # Terminal states — once a ticket lands here the wave loop stops polling it.
@@ -78,6 +98,7 @@ TERMINAL_STATES: frozenset[TicketStatus] = frozenset(
         TicketStatus.MERGED_GREEN,
         TicketStatus.FAILED,
         TicketStatus.ESCALATED,  # SAL-2886
+        TicketStatus.ABANDONED,  # SAL-3676
     }
 )
 
