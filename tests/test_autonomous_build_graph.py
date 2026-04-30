@@ -235,3 +235,89 @@ def test_parse_code_empty_title_returns_empty() -> None:
     """Empty-title guard: no crash, empty string, orchestrator fallback
     emits the escalate line."""
     assert _parse_code("") == ""
+
+
+@pytest.mark.parametrize(
+    "title, expected",
+    [
+        # wave-1 silent-complete fix (2026-04-29): MSSP extraction track.
+        # Before this fix, every title parsed to '' and the rendered
+        # ## Target block was `(unresolved)`, triggering the persona's
+        # Step 0 grounding-gap escalate path. Both kickoffs (0de3e2be +
+        # dae5a5c0) crashed with green=0/excused=N as a result.
+        (
+            "MSSP-EX-A — Extract GitHub identity refs (org, allowlist, QA bot)",
+            "MSSP-EX-A",
+        ),
+        ("MSSP-EX-B — Extract GHCR image refs in workflows + compose", "MSSP-EX-B"),
+        ("MSSP-EX-C — Extract Linear team key + UUID + ticket regex", "MSSP-EX-C"),
+        (
+            "MSSP-EX-D — Extract Oracle infrastructure refs (HIGH RISK)",
+            "MSSP-EX-D",
+        ),
+        ("MSSP-EX-E — Extract Slack channel + token + operator user-id", "MSSP-EX-E"),
+        ("MSSP-EX-H — Add MSSPSettings + MSSP install identity vars", "MSSP-EX-H"),
+        # wave-1 silent-complete fix: MSSP federation track. Titles use
+        # "MSSP Federation W1-A: ..." (a SPACE between MSSP and
+        # Federation). _parse_code normalises that phrase to MSSP-FED-W1-A
+        # before regex search so the federation tickets resolve to a
+        # non-empty code.
+        (
+            "MSSP Federation W1-A: schema for grants + audit + pubkeys",
+            "MSSP-FED-W1-A",
+        ),
+        (
+            "MSSP Federation W1-B: scope catalog YAML + loader + contract tests",
+            "MSSP-FED-W1-B",
+        ),
+        (
+            "MSSP Federation W1-C: SQL functions for issue / revoke / renew",
+            "MSSP-FED-W1-C",
+        ),
+        # Multi-digit wave numbers should also normalise correctly.
+        (
+            "MSSP Federation W2-A: phase-2 enforcement",
+            "MSSP-FED-W2-A",
+        ),
+        # MSSP-EX missing trailing letter → must not match (avoids
+        # accidental partial-prefix matches on unrelated MSSP-EX prose).
+        ("MSSP-EX standalone with no suffix", ""),
+        # MSSP without -EX or Federation prefix should not match.
+        ("MSSP general write-up", ""),
+    ],
+)
+def test_parse_code_mssp_track_titles(title: str, expected: str) -> None:
+    """wave-1 silent-complete fix (2026-04-29): _CODE_RE recognises
+    MSSP-EX-{A..Z} and MSSP-FED-W{N}-{A..Z}, and _parse_code normalises
+    the federation title's "MSSP Federation W1-A" phrase into the
+    canonical MSSP-FED-W1-A token. Closes the NO_HINT escalation
+    spiral on kickoffs 0de3e2be (MSSP-EX retry) + dae5a5c0 (MSSP
+    Federation wave-1)."""
+    assert _parse_code(title) == expected
+
+
+def test_target_hints_cover_mssp_wave_1_codes() -> None:
+    """wave-1 silent-complete fix (2026-04-29): every MSSP wave-1 code
+    that _parse_code now extracts MUST have a `_TARGET_HINTS` entry,
+    otherwise dispatch still ends in the NO_HINT (unresolved) escalate
+    path. Test pinned so a future ticket-rename can't silently regress
+    the wave-gate (kickoff would crash again the same way)."""
+    from alfred_coo.autonomous_build.orchestrator import _TARGET_HINTS
+
+    expected_codes = {
+        "MSSP-EX-A",
+        "MSSP-EX-B",
+        "MSSP-EX-C",
+        "MSSP-EX-D",
+        "MSSP-EX-E",
+        "MSSP-EX-H",
+        "MSSP-FED-W1-A",
+        "MSSP-FED-W1-B",
+        "MSSP-FED-W1-C",
+    }
+    missing = expected_codes - set(_TARGET_HINTS.keys())
+    assert not missing, (
+        f"_TARGET_HINTS missing wave-1 MSSP codes {sorted(missing)}; "
+        "without these the persona's Step 0 grounding-gap path fires "
+        "on every dispatch and the wave-gate crashes with green=0."
+    )

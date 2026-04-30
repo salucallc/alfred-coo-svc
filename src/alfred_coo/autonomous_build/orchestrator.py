@@ -2704,6 +2704,171 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="umbrella hint — _CODE_RE collapses OPS-14d-{a,b,c,d} all to OPS-14D; child must Step-2 verify against its own subset. AD-a = TTL constant + iat shape (ttl_constants.py + test_jwt_iat_shape.py). AD-b = validator + boundary tests (ttl_validator.py + test_ttl_validator.py). AD-c = wire validator into scope_middleware.py (modify) + targeted unit test. AD-d = end-to-end (tests/e2e/test_ttl_end_to_end.py: token at iat=now-25h → 401 via real middleware).",
     ),
 
+    # ── MSSP Extraction track (track:public-release, wave-1) ───────────
+    # wave-1 silent-complete fix (2026-04-29): MSSP-EX-{A..H} ticket
+    # bodies already enumerate target file paths but the persona's Step
+    # 0 reads the orchestrator's rendered ## Target block, not the
+    # description. Without `_TARGET_HINTS` entries the block was
+    # `(unresolved)` and every builder escalated as a grounding gap,
+    # crashing kickoff 0de3e2be. Hints below mirror the
+    # "Files (alfred-coo-svc)" lists in the SAL-3538..3545 bodies.
+    "MSSP-EX-A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/tools.py",
+            "src/alfred_coo/autonomous_build/orchestrator.py",
+            "src/alfred_coo/autonomous_build/dry_run.py",
+            "src/alfred_coo/config.py",
+        ),
+        new_paths=(
+            "tests/test_mssp_env_extraction_gh.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-ex-a-gh-identity",
+        notes="MSSP-EX-A — extract hardcoded salucallc/saluca-labs/cristianxruvalcaba-coder/salucatiresias refs to env-driven Settings.gh_*. Acceptance: 6+ tests; grep -nrE 'salucallc|salucatiresias' src/ returns 0 outside fixtures; default behaviour preserves Saluca env (smoke green); http_get rejects orgs not in allowlist.",
+    ),
+    "MSSP-EX-B": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            ".github/workflows/publish.yml",
+            "deploy/endpoint/docker-compose.yml",
+            "deploy/appliance/docker-compose.yml",
+            "deploy/appliance/IMAGE_PINS.md",
+        ),
+        new_paths=(
+            ".github/workflows/mssp_compose_smoke.yml",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-ex-b-ghcr-image-refs",
+        notes="MSSP-EX-B — replace hardcoded ghcr.io/salucallc/* image refs with vars.MSSP_GHCR_REGISTRY (workflows) and ${MSSP_IMAGE_REGISTRY} (compose). Cross-repo: also touches soul-svc .github/workflows/publish.yml + oracle-deploy-webhook repos.yaml.example (out-of-tree; child opens companion PR or notes follow-up). Acceptance: docker compose -f deploy/appliance/docker-compose.yml config passes with MSSP_IMAGE_REGISTRY=ghcr.io/acme; no salucallc literals when overridden; new CI smoke .github/workflows/mssp_compose_smoke.yml.",
+    ),
+    "MSSP-EX-C": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/tools.py",
+            "src/alfred_coo/dispatch.py",
+            "src/alfred_coo/main.py",
+            "src/alfred_coo/autonomous_build/graph.py",
+            "src/alfred_coo/config.py",
+        ),
+        new_paths=(
+            "tests/test_mssp_env_extraction_linear.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-ex-c-linear-team-key",
+        notes="MSSP-EX-C — extract SAL_TEAM_ID, SAL ticket regex prefix, and Linear User-Agent to Settings.linear_team_id / Settings.linear_team_key. Acceptance: MSSP_LINEAR_TEAM_KEY=ACME makes regex match ACME-1234; linear_create_issue uses overridden teamId; default team_key=SAL preserved.",
+    ),
+    "MSSP-EX-D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/config.py",
+            "src/alfred_coo/tools.py",
+            "src/alfred_coo/fleet_endpoint/memory_push.py",
+            "src/alfred_coo/fleet_gateway/Dockerfile",
+            "src/alfred_coo/artifacts.py",
+            "src/alfred_coo/autonomous_build/model_registry.py",
+            "scripts/sync_model_registry_to_oracle.sh",
+            "deploy/alfred-coo.service",
+        ),
+        new_paths=(
+            "tests/test_mssp_env_extraction_oracle.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-ex-d-oracle-infra",
+        notes="MSSP-EX-D — HIGHEST RISK: replace 100.105.27.63, ports 8080/8090, SSH path ~/.ssh/oci-saluca with MSSP_* env vars. Cross-repo: also touches soul-svc routers/healthz_chain.py, Dockerfile, gcp_config.py + oracle-deploy-webhook src/oracle_deploy_webhook/app.py (companion PRs or follow-up). Acceptance: override propagates everywhere; default URL still 100.105.27.63:8080 (Saluca smoke green); grep -nE '100.105.27.63' src/ returns 0 production matches.",
+    ),
+    "MSSP-EX-E": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/config.py",
+            "src/alfred_coo/autonomous_build/orchestrator.py",
+            "src/alfred_coo/autonomous_build/ss08_gate.py",
+            "src/alfred_coo/tools.py",
+        ),
+        new_paths=(
+            "tests/test_mssp_env_extraction_slack.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-ex-e-slack-channel-token",
+        notes="MSSP-EX-E — replace C0ASAKFTR1C and U0AH88KHZ4H literals; standardise SLACK_BOT_TOKEN_ALFRED env name. Add slack_operator_user_id to Settings. Acceptance: overrides flow to all default channel resolutions; SS-08 ACK gate honors MSSP_SLACK_OPERATOR_USER_ID; default values preserved; test_autonomous_build_ss08_gate.py still passes.",
+    ),
+    "MSSP-EX-H": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "src/alfred_coo/config.py",
+            "pyproject.toml",
+        ),
+        new_paths=(
+            "src/alfred_coo/cli/__init__.py",
+            "src/alfred_coo/cli/validate_install.py",
+            "deploy/.env.template",
+            "scripts/install.sh",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-ex-h-install-identity",
+        notes="MSSP-EX-H — introduce MSSP_INSTALL_* family (INSTALL_ID, INSTALL_DISPLAY_NAME, INSTALL_OWNER_NAME, INSTALL_OWNER_EMAIL, INSTALL_ORG_NAME, PROGRAM_NAME) across all daemons; mssp-validate CLI. Mirror in soul-svc + oracle-deploy-webhook MSSPSettings (companion PRs). Acceptance: mssp-validate exits 0 on fresh Saluca install (defaults); on synthetic install where DISPLAY_NAME=Acme but GH_ORG=salucallc, exits 1 with WARNING; install.sh generates UUID if MSSP_INSTALL_ID unset.",
+    ),
+
+    # ── MSSP Federation track (track:mssp-federation, wave-1) ──────────
+    # wave-1 silent-complete fix (2026-04-29): SHI-consent federation
+    # primitives on soul-svc. Federation tickets target a FRESH migration
+    # file pair (SQL schema + functions); listed under new_paths because
+    # the next free migration number must be picked by the child via
+    # http_get against the existing migrations directory. Hints align to
+    # the SAL-3566..3568 ticket bodies (mssp_federation_consent_records
+    # / mssp_federation_audit / SQL functions). Repo is soul-svc;
+    # alfred-coo-svc + Tiresias scope-catalog work is an out-of-tree
+    # follow-up the child notes in the PR (or stages as a companion PR
+    # against alfred-coo-svc — graph.py covers both repos via cross-org
+    # path lookup for Step 2 verify).
+    "MSSP-FED-W1-A": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "migrations/",
+        ),
+        new_paths=(
+            "migrations/mssp_federation_schema.sql",
+            "tests/test_mssp_federation_schema.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-fed-w1-a-consent-schema",
+        notes="MSSP Federation W1-A (SAL-3566) — add SHI-consent federation tables: mssp_federation_consent_records, mssp_federation_audit, client_content_id_map. Dual-signed audit rows (both customer + MSSP ed25519 signatures required). Many-to-one cardinality. Pick the next free migration number by listing migrations/ via http_get. APE/V: schema CREATE statements emit the columns + indexes from the ticket body verbatim; both signatures required at write time.",
+    ),
+    "MSSP-FED-W1-B": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(),
+        new_paths=(
+            "configs/scope_catalog.yaml",
+            "src/soul_svc/scope_catalog.py",
+            "tests/test_scope_catalog.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-fed-w1-b-scope-catalog",
+        notes="MSSP Federation W1-B (SAL-3567) — define federation scope catalog as YAML loaded by soul-svc + Tiresias + alfred-coo. 10 scopes total: mssp:audit:read/metric/roadmap/incident:read; mssp:dispatch:rotate-key/compliance-check/patch-apply/custom; mssp:incident:elevate; mssp:audit:content-retrieve. APE/V: loader returns all 10; mssp:audit:content-retrieve carries requires_hitl=true AND bulk_forbidden=true; catalog hash snapshot test passes; scope removal causes loader to fail (no silent removal). Out-of-tree consumers in alfred-coo-svc + Tiresias are companion PRs.",
+    ),
+    "MSSP-FED-W1-C": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "migrations/",
+        ),
+        new_paths=(
+            "migrations/mssp_federation_functions.sql",
+            "tests/test_mssp_federation_functions.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/mssp-fed-w1-c-consent-functions",
+        notes="MSSP Federation W1-C (SAL-3568) — SQL functions establish_consent / withdraw_consent_by_customer / withdraw_consent_by_mssp / rotate_key_by_customer / rotate_key_by_mssp. Each writes a dual-signed audit row in the same transaction. Bilateral divorce (either party may withdraw); peer-unreachable exception with outcome=peer_unreachable. Depends on W1-A schema; child should rebase on the W1-A migration before opening the PR. APE/V: each function tested at boundary (single-sig rejected, both-sig accepted, peer-unreachable noted).",
+    ),
+
 }
 
 
