@@ -219,6 +219,41 @@ def _peek_kickoff_model_override(task: dict, role: str) -> str | None:
     return None
 
 
+def _peek_builder_fallback_chain(task: dict) -> list | None:
+    """Return `task['builder_fallback_chain']` if set, else None.
+
+    SAL-3670: prior to this helper, attempt-0 dispatch ignored the kickoff
+    payload's `builder_fallback_chain[0]` and fell straight through to the
+    model registry, which would return whatever stable_baseline says (often
+    a degraded model). The chain is the operator's authoritative wishlist;
+    when present it must win over the registry at attempt 0.
+
+    Reads two paths (mirrors `_peek_kickoff_model_override`):
+      1. `task["builder_fallback_chain"]` direct (orchestrator-injected on
+         child task dicts).
+      2. `task["description"]` parsed as JSON, then
+         `payload["builder_fallback_chain"]` (kickoff parent).
+
+    Returns the list as-is, or None when absent. Best-effort — never raises.
+    """
+    # Direct dict path.
+    chain = task.get("builder_fallback_chain") if isinstance(task, dict) else None
+    if isinstance(chain, list):
+        return chain
+    # JSON-payload path.
+    desc = task.get("description") if isinstance(task, dict) else None
+    if isinstance(desc, str) and desc.strip().startswith("{"):
+        try:
+            payload = json.loads(desc)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            chain2 = payload.get("builder_fallback_chain")
+            if isinstance(chain2, list):
+                return chain2
+    return None
+
+
 def select_model(task: dict, persona) -> str:
     """Pick the model for `task` + `persona`.
 
@@ -239,6 +274,22 @@ def select_model(task: dict, persona) -> str:
                 role, getattr(persona, "name", "?"), override,
             )
             return override
+
+    # (1b) SAL-3670: builder_fallback_chain[0] from kickoff payload wins over
+    # the registry at attempt 0. Only the builder role consults this; QA /
+    # orchestrator have their own routing knobs. Without this tier the
+    # operator-supplied chain is ignored on first attempt and dispatch falls
+    # through to whatever stable_baseline the registry hands back.
+    if role == "builder":
+        chain = _peek_builder_fallback_chain(task)
+        if chain and isinstance(chain[0], str) and chain[0]:
+            logger.info(
+                "model picked: role=%s persona=%s ticket=%s model=%s "
+                "(attempt 0, source=kickoff_fallback_chain[0])",
+                role, getattr(persona, "name", "?"),
+                _peek_linear_ticket_for_log(task), chain[0],
+            )
+            return chain[0]
 
     # (2) Legacy tag shortcuts.
     if "[tag:strategy]" in title:
