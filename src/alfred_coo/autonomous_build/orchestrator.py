@@ -8568,6 +8568,73 @@ class AutonomousBuildOrchestrator:
         )
         return files
 
+    async def _pr_intersects_expected_scope(
+        self,
+        pr_url: str,
+        ticket_ident: str,
+        *,
+        log_tag: str,
+    ) -> bool:
+        """Shared per-candidate path-intersection check used by both the
+        stale-sweep matcher and the dispatch-loop merged-PR pre-flight.
+
+        Returns True iff:
+          - ticket has a ``_TARGET_HINTS`` entry (otherwise we cannot
+            verify scope and must NOT auto-flip);
+          - the PR's ``files_changed`` can be fetched; AND
+          - at least one changed file intersects
+            ``hint.paths ∪ hint.new_paths`` (and the diff isn't entirely
+            non-evidence files).
+
+        Returns False on any of: no hint, file fetch failure, or no
+        intersection. Logs at INFO so the rejection reason is visible in
+        production journals (the federation 2026-04-29 02:33Z misfire
+        flipped SAL-3566/3567/3568 to MERGED_GREEN because the
+        dispatch-loop branch did NOT run this check; the stale-sweep
+        path did and correctly rejected the same PR #302).
+
+        ``log_tag`` is ``[stale-sweep]`` or ``[merged-skip]`` so the
+        operator can tell which code path emitted the rejection.
+        """
+        graph = getattr(self, "graph", None)
+        ticket = graph.get_by_identifier(ticket_ident) if graph else None
+        code = (getattr(ticket, "code", "") or "").upper().strip()
+        hint = _TARGET_HINTS.get(code) if code else None
+
+        if hint is None:
+            # No hint to compare against. Refuse to auto-flip / auto-skip
+            # — the whole point of the tightening rule is to require
+            # positive evidence, and a code-search hit on a PR with no
+            # scope contract isn't enough. NO_HINT case: the dispatch
+            # loop will treat this as "no merged PR found" and dispatch
+            # the ticket fresh rather than trusting a title-mention.
+            logger.info(
+                "%s candidate PR %s found for %s but no "
+                "_TARGET_HINTS entry exists for code %r; refusing to "
+                "auto-flip on weak evidence",
+                log_tag, pr_url, ticket_ident, code,
+            )
+            return False
+
+        files_changed = await self._fetch_pr_files(pr_url)
+        if files_changed is None:
+            logger.debug(
+                "%s file fetch failed for %s (ticket %s); "
+                "skipping this candidate",
+                log_tag, pr_url, ticket_ident,
+            )
+            return False
+        if not self._pr_files_match_hint(files_changed, hint):
+            logger.info(
+                "%s candidate PR %s for %s does NOT "
+                "intersect expected scope (paths=%r new_paths=%r "
+                "changed=%r); rejecting as not-an-implementation",
+                log_tag, pr_url, ticket_ident, hint.paths, hint.new_paths,
+                files_changed[:8],
+            )
+            return False
+        return True
+
     async def _find_recent_merged_pr_for(self, ticket_ident: str) -> Optional[str]:
         """Search ``salucallc/*`` for a merged PR citing ``ticket_ident``
         in title or body within the last ``_STALE_SWEEP_PR_LOOKBACK_SEC``,
@@ -8586,21 +8653,17 @@ class AutonomousBuildOrchestrator:
         verify scope, so we conservatively return None — the sweeper
         leaves it for human review rather than auto-flip on weak evidence.
 
+        2026-04-29 federation misfire: the path-intersection check is now
+        shared with ``_ticket_has_merged_pr`` via
+        ``_pr_intersects_expected_scope``; both code paths now agree on
+        what counts as evidence-of-implementation.
+
         Tests stub this via ``self._gh_pr_search_fn`` to avoid live HTTP.
         ``self._gh_pr_files_fn`` separately stubs the file fetch used by
         the new intersection check.
         """
         if not ticket_ident:
             return None
-
-        # Resolve the ticket's plan-doc code so we can look up the hint.
-        # ``self.graph`` is populated by the wave loop before any sweep
-        # runs; if it's not yet built (early-startup race), skip rather
-        # than guess.
-        graph = getattr(self, "graph", None)
-        ticket = graph.get_by_identifier(ticket_ident) if graph else None
-        code = (getattr(ticket, "code", "") or "").upper().strip()
-        hint = _TARGET_HINTS.get(code) if code else None
 
         candidate_urls = await self._search_recent_merged_pr_urls(
             ticket_ident,
@@ -8611,36 +8674,10 @@ class AutonomousBuildOrchestrator:
         # Walk candidates in search-rank order, returning the first that
         # passes the file-overlap check.
         for url in candidate_urls:
-            if hint is None:
-                # No hint to compare against. Refuse to auto-flip — the
-                # whole point of the tightening rule is to require
-                # positive evidence, and a code-search hit on a PR with
-                # no scope contract isn't enough.
-                logger.info(
-                    "[stale-sweep] candidate PR %s found for %s but no "
-                    "_TARGET_HINTS entry exists for code %r; refusing to "
-                    "auto-flip on weak evidence",
-                    url, ticket_ident, code,
-                )
-                continue
-            files_changed = await self._fetch_pr_files(url)
-            if files_changed is None:
-                logger.debug(
-                    "[stale-sweep] file fetch failed for %s (ticket %s); "
-                    "skipping this candidate",
-                    url, ticket_ident,
-                )
-                continue
-            if not self._pr_files_match_hint(files_changed, hint):
-                logger.info(
-                    "[stale-sweep] candidate PR %s for %s does NOT "
-                    "intersect expected scope (paths=%r new_paths=%r "
-                    "changed=%r); rejecting as not-an-implementation",
-                    url, ticket_ident, hint.paths, hint.new_paths,
-                    files_changed[:8],
-                )
-                continue
-            return url
+            if await self._pr_intersects_expected_scope(
+                url, ticket_ident, log_tag="[stale-sweep]",
+            ):
+                return url
         return None
 
     async def _search_recent_merged_pr_urls(
@@ -8735,28 +8772,45 @@ class AutonomousBuildOrchestrator:
         self, ticket_ident: str,
     ) -> Optional[str]:
         """Return the URL of a merged PR mentioning ``ticket_ident`` in
-        title or body within the lookback window, else None.
+        title or body within the lookback window AND whose changed files
+        intersect the ticket's ``_TARGET_HINTS`` expected scope, else None.
 
         Pre-flight check used by the dispatch loop in ``_dispatch_wave``:
         if a builder is about to be fired for a ticket whose PR has
-        already merged, we mark the ticket MERGED_GREEN and skip dispatch
-        instead of wasting a build cycle. Reuses the existing
-        ``_search_recent_merged_pr_urls`` helper (the looser raw search
-        also driven by the test-only ``_gh_pr_search_fn`` stub) so we do
-        not maintain a parallel GitHub-search code path.
+        already merged AND that PR is the actual implementation, we mark
+        the ticket MERGED_GREEN and skip dispatch instead of wasting a
+        build cycle.
 
-        Note: this deliberately does NOT layer on the file-overlap
-        intersection check ``_find_recent_merged_pr_for`` applies — that
-        check is a *stale-sweep* tightening rule (PRs that only edit
-        ``_TARGET_HINTS`` are not evidence of implementation). For
-        pre-flight builder-skip we trust a merged-PR-mention as enough
-        signal: the merge bot already gated on Hawkman APPROVE before
-        merging, so the ticket has shipped by definition.
+        Path-intersection check (2026-04-29 fix): historically this
+        helper accepted any merged PR that mentioned the ticket in title
+        or body, even if the PR only edited an unrelated file (e.g. a
+        plan-doc, a sibling ticket's `_TARGET_HINTS` entry, or a
+        retrospective comment in another PR's body). The federation
+        wave-1 02:33:25Z misfire (SAL-3566/3567/3568 falsely flipped to
+        Done off PR #302, which only mentioned them in its body while
+        editing unrelated migrations) made the same-file inconsistency
+        explicit: the stale-sweep matcher already ran this check via
+        ``_find_recent_merged_pr_for``; the dispatch-loop pre-flight did
+        not. Both paths now share ``_pr_intersects_expected_scope`` so a
+        PR is only treated as evidence-of-implementation when its
+        ``files_changed`` overlaps ``hint.paths ∪ hint.new_paths``.
+
+        Conservative NO_HINT behaviour: tickets whose code is not in
+        ``_TARGET_HINTS`` cannot be scope-verified, so this helper now
+        returns None for them (rather than auto-skipping on a
+        title-mention). The dispatch loop will then dispatch fresh; if
+        the ticket really has shipped, the post-build PR-create flow or
+        the next stale-sweep tick will reconcile it.
+
+        Reuses ``_search_recent_merged_pr_urls`` for the search step and
+        ``_pr_intersects_expected_scope`` for the per-candidate check —
+        both shared with the stale-sweep matcher so the two code paths
+        cannot drift again.
 
         Results are cached per-ticket for ``MERGED_PR_CACHE_TTL_SEC`` so
         a 16-ticket wave doesn't fire 16 Search calls every 45s tick.
-        Tests stub the round-trip via ``self._gh_pr_search_fn`` (shared
-        with the stale-sweep helpers).
+        Tests stub the round-trip via ``self._gh_pr_search_fn`` and
+        ``self._gh_pr_files_fn``.
         """
         if not ticket_ident:
             return None
@@ -8783,7 +8837,12 @@ class AutonomousBuildOrchestrator:
         url: Optional[str] = None
         try:
             urls = await self._search_recent_merged_pr_urls(ticket_ident)
-            url = urls[0] if urls else None
+            for candidate in urls:
+                if await self._pr_intersects_expected_scope(
+                    candidate, ticket_ident, log_tag="[merged-skip]",
+                ):
+                    url = candidate
+                    break
         except Exception:
             logger.exception(
                 "[merged-skip] PR search raised for %s; treating as "
