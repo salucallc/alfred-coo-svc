@@ -515,3 +515,72 @@ def test_resolver_appended_tier_skipped_when_body_or_registry_hits() -> None:
         assert stub_calls == []
     finally:
         orch_mod._TARGET_HINT_RESOLVERS.pop()
+
+
+# ── SAL-3740: parser resilience to format drift ────────────────────────────
+
+
+def test_parse_target_accepts_parenthetical_between_key_and_colon() -> None:
+    """SAL-3740: path-fix subs sometimes emit lines like
+
+        new_paths (you will CREATE all of these — directory not yet
+        populated):
+
+    instead of the canonical ``new_paths:``. Pre-fix, the parser's
+    ``key: value`` regex required immediate ``:`` after the key word
+    and silently dropped 13 of 14 wave-2 tickets into NO_HINT, mass-
+    crashing four Phase 2 kickoffs. Now the parser tolerates an
+    optional parenthetical between the key word and the colon.
+    """
+    body = (
+        "## Target\n"
+        "\n"
+        "owner: salucallc\n"
+        "repo: alfred-coo-svc\n"
+        "base_branch: main\n"
+        "\n"
+        "new_paths (you will CREATE all of these — bootstrap dir):\n"
+        "  - plugins/saluca-plugin-langchain/setup.py\n"
+        "  - plugins/saluca-plugin-langchain/src/__init__.py\n"
+    )
+    parsed = _parse_target_from_ticket_body(body)
+    assert parsed is not None, (
+        "parenthetical between key and colon should not break parsing"
+    )
+    assert parsed["owner"] == "salucallc"
+    assert parsed["new_paths"] == (
+        "plugins/saluca-plugin-langchain/setup.py",
+        "plugins/saluca-plugin-langchain/src/__init__.py",
+    )
+
+
+def test_parse_target_paths_with_parenthetical_also_accepted() -> None:
+    """Symmetry: same parenthetical tolerance for ``paths:``."""
+    body = (
+        "## Target\n"
+        "owner: salucallc\n"
+        "repo: alfred-coo-svc\n"
+        "paths (already exist — verify before editing):\n"
+        "  - src/alfred_coo/persona.py\n"
+    )
+    parsed = _parse_target_from_ticket_body(body)
+    assert parsed is not None
+    assert parsed["paths"] == ("src/alfred_coo/persona.py",)
+
+
+def test_parse_target_canonical_form_still_works() -> None:
+    """Regression guard: the parenthetical relaxation must not break
+    the canonical ``key:`` form (no parens) that the planner sub emits."""
+    body = (
+        "## Target\n"
+        "owner: salucallc\n"
+        "repo: alfred-coo-svc\n"
+        "paths:\n"
+        "  - a.py\n"
+        "new_paths:\n"
+        "  - b.py\n"
+    )
+    parsed = _parse_target_from_ticket_body(body)
+    assert parsed is not None
+    assert parsed["paths"] == ("a.py",)
+    assert parsed["new_paths"] == ("b.py",)
