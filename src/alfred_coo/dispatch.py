@@ -190,12 +190,75 @@ def _registry_role_for_persona(persona) -> str | None:
     return _PERSONA_ROLE_MAP.get(name)
 
 
+def _peek_kickoff_payload(task: dict) -> dict | None:
+    """Return the parsed kickoff-payload dict from `task`, or None.
+
+    Sources, in order:
+      1. ``task["description"]`` parsed as JSON when the description starts
+         with ``{`` (legacy: orchestrator-parent kickoff bodies are pure
+         JSON envelopes).
+      2. An HTML-comment-fenced block of the form
+         ``<!-- model_routing: {...} -->`` anywhere in the description.
+         The orchestrator embeds this on child task bodies to propagate
+         the kickoff's per-run model overrides into spawned children.
+         A child task body is otherwise plain markdown (the legacy
+         JSON-only parse misses it).
+
+    SAL-3670 follow-up (2026-04-30): without (2), the kickoff payload's
+    ``model_routing`` / ``builder_fallback_chain`` only fired for the
+    orchestrator parent task itself — every child dispatched by the
+    orchestrator silently fell through to the registry primary. Closes
+    that propagation gap so a chain pinned at kickoff time wins on
+    spawned-child attempt-0 dispatches too.
+
+    Returns None for any non-JSON / parse-error / non-dict payload.
+    Best-effort — never raises.
+    """
+    if not isinstance(task, dict):
+        return None
+    desc = task.get("description")
+    if not isinstance(desc, str) or not desc:
+        return None
+
+    # (1) Whole-body JSON envelope (kickoff parent).
+    if desc.strip().startswith("{"):
+        try:
+            payload = json.loads(desc)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+    # (2) Embedded ``<!-- model_routing: {...} -->`` propagation block
+    # (orchestrator-injected on child task bodies). Only one such block is
+    # parsed; if the operator embeds multiple, the first wins.
+    marker = "<!-- model_routing:"
+    start = desc.find(marker)
+    if start >= 0:
+        json_start = start + len(marker)
+        end = desc.find("-->", json_start)
+        if end > json_start:
+            blob = desc[json_start:end].strip()
+            try:
+                parsed = json.loads(blob)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
 def _peek_kickoff_model_override(task: dict, role: str) -> str | None:
     """Return `task['model_routing'][role]` if set, else None.
 
-    The mesh task body (description) is the kickoff JSON for orchestrator
-    parents; for child tasks the override is propagated by the orchestrator
-    when it builds child task bodies. Best-effort — never raises.
+    Sources, in order:
+      * Direct dict path: ``task["model_routing"][role]`` on the in-memory
+        task dict (orchestrator-injected in unit tests).
+      * Kickoff-payload path via ``_peek_kickoff_payload`` (full-body JSON
+        envelope OR embedded ``<!-- model_routing: ... -->`` propagation
+        block on child tasks).
+
+    Best-effort — never raises.
     """
     # Direct dict path (orchestrator-injected on child task dicts in tests).
     routing = task.get("model_routing") if isinstance(task, dict) else None
@@ -203,54 +266,49 @@ def _peek_kickoff_model_override(task: dict, role: str) -> str | None:
         v = routing.get(role)
         if isinstance(v, str) and v:
             return v
-    # JSON-payload path (kickoff parent).
-    desc = task.get("description") if isinstance(task, dict) else None
-    if isinstance(desc, str) and desc.strip().startswith("{"):
-        try:
-            payload = json.loads(desc)
-        except (ValueError, TypeError):
-            payload = None
-        if isinstance(payload, dict):
-            r2 = payload.get("model_routing")
-            if isinstance(r2, dict):
-                v = r2.get(role)
-                if isinstance(v, str) and v:
-                    return v
+    # Kickoff-payload path (parent envelope or child propagation block).
+    payload = _peek_kickoff_payload(task)
+    if isinstance(payload, dict):
+        r2 = payload.get("model_routing")
+        if isinstance(r2, dict):
+            v = r2.get(role)
+            if isinstance(v, str) and v:
+                return v
     return None
 
 
 def _peek_builder_fallback_chain(task: dict) -> list | None:
-    """Return `task['builder_fallback_chain']` if set, else None.
+    """Return ``task["builder_fallback_chain"]`` if set, else None.
 
     SAL-3670: prior to this helper, attempt-0 dispatch ignored the kickoff
-    payload's `builder_fallback_chain[0]` and fell straight through to the
-    model registry, which would return whatever stable_baseline says (often
-    a degraded model). The chain is the operator's authoritative wishlist;
-    when present it must win over the registry at attempt 0.
+    payload's ``builder_fallback_chain[0]`` and fell straight through to
+    the model registry, which would return whatever ``stable_baseline``
+    says (often a degraded model). The chain is the operator's
+    authoritative wishlist; when present it must win over the registry at
+    attempt 0.
 
-    Reads two paths (mirrors `_peek_kickoff_model_override`):
-      1. `task["builder_fallback_chain"]` direct (orchestrator-injected on
-         child task dicts).
-      2. `task["description"]` parsed as JSON, then
-         `payload["builder_fallback_chain"]` (kickoff parent).
+    Sources, in order:
+      * Direct dict path: ``task["builder_fallback_chain"]`` on the
+        in-memory task dict (orchestrator-injected on child task dicts in
+        tests).
+      * Kickoff-payload path via ``_peek_kickoff_payload`` (full-body JSON
+        envelope OR embedded ``<!-- model_routing: ... -->`` propagation
+        block on child tasks).
 
     Returns the list as-is, or None when absent. Best-effort — never raises.
     """
+    if not isinstance(task, dict):
+        return None
     # Direct dict path.
-    chain = task.get("builder_fallback_chain") if isinstance(task, dict) else None
+    chain = task.get("builder_fallback_chain")
     if isinstance(chain, list):
         return chain
-    # JSON-payload path.
-    desc = task.get("description") if isinstance(task, dict) else None
-    if isinstance(desc, str) and desc.strip().startswith("{"):
-        try:
-            payload = json.loads(desc)
-        except (ValueError, TypeError):
-            payload = None
-        if isinstance(payload, dict):
-            chain2 = payload.get("builder_fallback_chain")
-            if isinstance(chain2, list):
-                return chain2
+    # Kickoff-payload path.
+    payload = _peek_kickoff_payload(task)
+    if isinstance(payload, dict):
+        chain2 = payload.get("builder_fallback_chain")
+        if isinstance(chain2, list):
+            return chain2
     return None
 
 

@@ -6542,3 +6542,154 @@ async def test_builder_fallback_chain_swaps_model_on_retry(monkeypatch):
         f"second dispatch event must record qwen3-coder:480b-cloud; "
         f"got {dispatch_events[1]}"
     )
+
+
+# ── SAL-3670 follow-up: kickoff payload propagation into child task body ───
+
+
+async def test_kickoff_payload_chain_propagates_into_child_body(monkeypatch):
+    """When the operator overrides ``builder_fallback_chain`` on the parent
+    kickoff payload (chain head != default), the orchestrator must embed a
+    ``<!-- model_routing: ... -->`` propagation block in the child task
+    body so ``dispatch.select_model`` honours the chain head at attempt 0
+    inside the spawned child.
+
+    Closes the 2026-04-30 silent-fall-through bug: pre-fix, an operator
+    pinning ``kimi-k2-thinking:cloud`` in the chain saw wave-1 first
+    dispatches resolve to ``gpt-oss:120b-cloud`` because the chain was
+    only consulted on attempts 1+ AND only for tag-mapped models.
+    """
+    import json as _json
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p1",
+            "builder_fallback_chain": [
+                "kimi-k2-thinking:cloud",
+                "qwen3-coder:480b-cloud",
+            ],
+        },
+        mesh=mesh,
+    )
+    orch._parse_payload()
+
+    t = _t("u-1", "SAL-3670-PROP", "OPS-14D", 1, "ops", size="S", estimate=1)
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    async def _noop_verify(code_key, hint):
+        return VerificationResult(
+            code=code_key, hint=hint, status=HintStatus.UNVERIFIED,
+            repo_exists=True, path_results=tuple(), error=None,
+            verified_at=0.0,
+        )
+    monkeypatch.setattr(orch, "_verify_hint", _noop_verify)
+
+    await orch._dispatch_child(t)
+
+    body = mesh.created[-1]["description"]
+    # Marker present.
+    assert "<!-- model_routing:" in body, (
+        f"propagation block missing from child body; got body={body!r}"
+    )
+    # Round-trip: the embedded JSON must be parseable and carry the chain
+    # head the operator pinned.
+    start = body.find("<!-- model_routing:") + len("<!-- model_routing:")
+    end = body.find("-->", start)
+    parsed = _json.loads(body[start:end].strip())
+    assert parsed["builder_fallback_chain"][0] == "kimi-k2-thinking:cloud", (
+        f"chain head must propagate; got {parsed}"
+    )
+
+    # End-to-end: a downstream ``select_model`` call on a child task with
+    # this body must pick up the chain head as the attempt-0 model.
+    from alfred_coo import dispatch as _dispatch
+
+    class _MiniPersona:
+        name = "alfred-coo-a"
+        preferred_model = "claude-sonnet-4-7"
+
+    child_task = {"title": mesh.created[-1]["title"], "description": body}
+    pick = _dispatch.select_model(child_task, _MiniPersona())
+    assert pick == "kimi-k2-thinking:cloud", (
+        f"child must route to chain head at attempt 0; got {pick}"
+    )
+
+
+async def test_default_chain_does_not_emit_propagation_block(monkeypatch):
+    """A run that doesn't override ``builder_fallback_chain`` keeps the
+    legacy body shape: no propagation block. Avoids a no-op block on
+    every dispatched body.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1"}, mesh=mesh,
+    )
+    orch._parse_payload()
+
+    t = _t("u-2", "SAL-3670-DEF", "OPS-14D", 1, "ops", size="S", estimate=1)
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    async def _noop_verify(code_key, hint):
+        return VerificationResult(
+            code=code_key, hint=hint, status=HintStatus.UNVERIFIED,
+            repo_exists=True, path_results=tuple(), error=None,
+            verified_at=0.0,
+        )
+    monkeypatch.setattr(orch, "_verify_hint", _noop_verify)
+
+    await orch._dispatch_child(t)
+
+    body = mesh.created[-1]["description"]
+    assert "<!-- model_routing:" not in body, (
+        "default-chain runs must NOT emit a propagation block "
+        f"(legacy body shape); got body={body!r}"
+    )
+
+
+async def test_kickoff_model_routing_propagates_into_child_body(monkeypatch):
+    """Symmetric coverage: kickoff payload's ``model_routing`` dict (the
+    explicit role-keyed override) propagates into the child body and is
+    honoured by ``select_model`` at attempt 0.
+    """
+    import json as _json
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p1",
+            "model_routing": {"builder": "deepseek-v3.2:cloud"},
+        },
+        mesh=mesh,
+    )
+    orch._parse_payload()
+
+    t = _t("u-3", "SAL-3670-MR", "OPS-14D", 1, "ops", size="S", estimate=1)
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    async def _noop_verify(code_key, hint):
+        return VerificationResult(
+            code=code_key, hint=hint, status=HintStatus.UNVERIFIED,
+            repo_exists=True, path_results=tuple(), error=None,
+            verified_at=0.0,
+        )
+    monkeypatch.setattr(orch, "_verify_hint", _noop_verify)
+
+    await orch._dispatch_child(t)
+
+    body = mesh.created[-1]["description"]
+    assert "<!-- model_routing:" in body
+    start = body.find("<!-- model_routing:") + len("<!-- model_routing:")
+    end = body.find("-->", start)
+    parsed = _json.loads(body[start:end].strip())
+    assert parsed["model_routing"] == {"builder": "deepseek-v3.2:cloud"}

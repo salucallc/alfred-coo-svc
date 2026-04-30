@@ -1243,3 +1243,153 @@ def test_chain_in_child_task_dict_path(tmp_path, monkeypatch):
     persona = _MiniPersona("alfred-coo-a")
     assert select_model(task, persona) == "kimi-k2-thinking:cloud"
     mr._reset_for_tests()
+
+
+# ── SAL-3670 follow-up: child-task body propagation block ──────────────────
+#
+# The 2026-04-30 follow-up closes the propagation gap: the kickoff payload's
+# ``model_routing`` / ``builder_fallback_chain`` only fired for the
+# orchestrator parent task itself; spawned child tasks inherited NEITHER
+# field, so child ``select_model`` silently fell through to registry primary
+# even when the kickoff pinned a chain head. The orchestrator now embeds a
+# ``<!-- model_routing: {...} -->`` HTML-comment block at the top of every
+# child body when the operator overrode the default chain or set
+# ``model_routing``; ``_peek_kickoff_payload`` recognises that block and
+# returns the same payload-shape the JSON envelope produces.
+
+
+def test_chain_in_propagation_block_on_child_body(tmp_path, monkeypatch):
+    """Propagation block on a child markdown body: ``select_model`` reads
+    ``builder_fallback_chain[0]`` from the embedded JSON and uses it as the
+    attempt-0 model.
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setenv(
+        "MODEL_REGISTRY_PATH", _registry_with_broken_baseline(tmp_path),
+    )
+    mr._reset_for_tests()
+
+    block = json.dumps({
+        "builder_fallback_chain": [
+            "kimi-k2-thinking:cloud",
+            "qwen3-coder:480b-cloud",
+        ],
+    })
+    body = (
+        f"Ticket: SAL-1 (X)\n"
+        f"<!-- model_routing: {block} -->\n"
+        f"Wave: 0\nSize: S\n"
+        f"## Deliverable\nOpen ONE PR.\n"
+    )
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-1",
+        "description": body,
+    }
+    persona = _MiniPersona("alfred-coo-a")
+    assert select_model(task, persona) == "kimi-k2-thinking:cloud"
+    mr._reset_for_tests()
+
+
+def test_model_routing_in_propagation_block_on_child_body(tmp_path, monkeypatch):
+    """Symmetric coverage for the propagation block: when the orchestrator
+    embeds ``model_routing.builder`` in the propagation block, child
+    builder dispatch picks it up at attempt 0.
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setenv(
+        "MODEL_REGISTRY_PATH", _registry_with_broken_baseline(tmp_path),
+    )
+    mr._reset_for_tests()
+
+    block = json.dumps({
+        "model_routing": {"builder": "qwen3-coder:480b-cloud"},
+    })
+    body = (
+        f"Ticket: SAL-1 (X)\n"
+        f"<!-- model_routing: {block} -->\n"
+        f"## Deliverable\nx\n"
+    )
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-1",
+        "description": body,
+    }
+    persona = _MiniPersona("alfred-coo-a")
+    assert select_model(task, persona) == "qwen3-coder:480b-cloud"
+    mr._reset_for_tests()
+
+
+def test_propagation_block_malformed_json_falls_through(tmp_path, monkeypatch):
+    """Malformed JSON inside the propagation marker must NOT crash
+    ``select_model`` — falls through to the next precedence level (registry
+    primary in this fixture).
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    monkeypatch.setenv(
+        "MODEL_REGISTRY_PATH", _registry_with_broken_baseline(tmp_path),
+    )
+    mr._reset_for_tests()
+
+    body = (
+        "Ticket: SAL-1 (X)\n"
+        "<!-- model_routing: {not valid json} -->\n"
+        "## Deliverable\nx\n"
+    )
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-1",
+        "description": body,
+    }
+    persona = _MiniPersona("alfred-coo-a")
+    # Falls through to registry primary (gpt-oss:120b-cloud in fixture).
+    assert select_model(task, persona) == "gpt-oss:120b-cloud"
+    mr._reset_for_tests()
+
+
+# ── _peek_kickoff_payload + helpers direct unit tests ──────────────────────
+
+
+def test_peek_kickoff_payload_full_json_envelope():
+    """Whole-description JSON parses cleanly (legacy parent kickoff)."""
+    from alfred_coo.dispatch import _peek_kickoff_payload
+    task = {
+        "description": json.dumps({"linear_project_id": "p", "x": 1}),
+    }
+    parsed = _peek_kickoff_payload(task)
+    assert parsed == {"linear_project_id": "p", "x": 1}
+
+
+def test_peek_kickoff_payload_propagation_block():
+    """Propagation block extracted from a markdown body."""
+    from alfred_coo.dispatch import _peek_kickoff_payload
+    body = (
+        "Ticket: SAL-1\n"
+        '<!-- model_routing: {"model_routing": {"builder": "X"}} -->\n'
+        "## Deliverable\nx\n"
+    )
+    parsed = _peek_kickoff_payload({"description": body})
+    assert parsed == {"model_routing": {"builder": "X"}}
+
+
+def test_peek_kickoff_payload_returns_none_for_plain_body():
+    """Plain markdown body with no JSON envelope or marker → None."""
+    from alfred_coo.dispatch import _peek_kickoff_payload
+    body = "Ticket: SAL-1\n## Deliverable\nx\n"
+    assert _peek_kickoff_payload({"description": body}) is None
+    assert _peek_kickoff_payload({}) is None
+    assert _peek_kickoff_payload(None) is None  # type: ignore[arg-type]
+
+
+def test_peek_kickoff_payload_handles_malformed_block():
+    """Malformed JSON inside the block returns None, doesn't raise."""
+    from alfred_coo.dispatch import _peek_kickoff_payload
+    body = (
+        "Ticket: SAL-1\n"
+        "<!-- model_routing: {malformed} -->\n"
+        "## Deliverable\nx\n"
+    )
+    assert _peek_kickoff_payload({"description": body}) is None
