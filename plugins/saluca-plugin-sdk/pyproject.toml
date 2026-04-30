@@ -1,0 +1,13 @@
+[project]
+name = "saluca-plugin-sdk"
+version = "0.1.0"
+description = "Saluca Plugin SDK"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+package-dir = { "" = "saluca_plugin_sdk" }
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
