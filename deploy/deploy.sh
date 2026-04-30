@@ -23,6 +23,9 @@ fi
 # 2. directories
 run "install -d -o $SERVICE_USER -g $SERVICE_USER -m 0755 $INSTALL_DIR $LOG_DIR $STATE_DIR"
 run "install -d -o root -g $SERVICE_USER -m 0750 $ENV_DIR"
+# SAL-3557: gh CLI config dir must live under a ReadWritePath so the
+# cockpit_router's `gh pr list` shell-out works under ProtectHome=true.
+run "install -d -o $SERVICE_USER -g $SERVICE_USER -m 0700 $STATE_DIR/gh-config"
 
 # 3. copy code (assume CWD is the cloned repo)
 run "rsync -a --delete --exclude='.git' --exclude='__pycache__' --exclude='.venv' ./ $INSTALL_DIR/"
