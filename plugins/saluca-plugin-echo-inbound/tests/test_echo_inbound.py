@@ -1,0 +1,1 @@
+import pytest\nfrom saluca_plugin_echo_inbound.plugin import EchoInboundPlugin\n\ndef test_echo_returns_task():\n    plugin = EchoInboundPlugin()\n    task = {"id": "test", "payload": "data"}\n    result = plugin.dispatch_inbound(task)\n    assert result.status == "ok"\n    assert result.output == task\n

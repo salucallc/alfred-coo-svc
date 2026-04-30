@@ -1,0 +1,1 @@
+import pytest\nfrom saluca_plugin_sdk.contract.inbound import *  # noqa: F401\n\ndef test_placeholder():\n    assert True\n

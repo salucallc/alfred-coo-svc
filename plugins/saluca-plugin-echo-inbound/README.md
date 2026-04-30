@@ -1,0 +1,1 @@
+# saluca-plugin-echo-inbound\n\nAn inbound plugin that simply echoes the received task back in the dispatch result.\n\n## Usage\n\n```bash\npip install saluca-plugin-echo-inbound==0.1.0\n```\n

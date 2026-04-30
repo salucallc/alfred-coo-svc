@@ -1,0 +1,1 @@
+from saluca_plugin_sdk import SalucaPlugin, DispatchResult\n\nclass EchoInboundPlugin(SalucaPlugin):\n    direction = "inbound"\n\n    def dispatch_inbound(self, task):\n        return DispatchResult(status="ok", output=task)\n

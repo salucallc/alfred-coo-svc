@@ -1,0 +1,1 @@
+[project]\nname = "saluca-plugin-echo-inbound"\nversion = "0.1.0"\ndescription = "Echo inbound plugin for Saluca"\ndependencies = ["saluca-plugin-sdk>=0.1.0"]\n\n[tool.setuptools.packages.find]\nwhere = ["saluca_plugin_echo_inbound"]\n
