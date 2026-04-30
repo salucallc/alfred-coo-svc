@@ -2444,10 +2444,13 @@ def test_gate_e_passes_when_body_has_addresses_prior_heading():
     assert err is None
 
 
-def test_gate_e_passes_when_body_cites_phrase_from_prior_review():
-    """Body doesn't have the explicit heading but DOES contain a 10+
-    char phrase from the prior review — gate passes (proves the
-    builder read it)."""
+def test_gate_e_rejects_body_without_explicit_heading_even_with_keyword_overlap():
+    """SAL-3572 round-1 regression: body had keyword overlap on
+    `placeholder` with the prior review while admitting "Added
+    placeholder pytest tests" itself. The previous overlap-fallback
+    path passed Gate E, letting Hawkman repeat the same gate failure.
+    Tightened Gate E now requires the structural heading, so
+    overlap-only bodies fail."""
     from alfred_coo.tools import _gate_e_fix_round_amnesia
     err = _gate_e_fix_round_amnesia(
         body=(
@@ -2462,7 +2465,33 @@ def test_gate_e_passes_when_body_cites_phrase_from_prior_review():
             "behavior; placeholder assertions don't exercise units."
         ),
     )
-    assert err is None
+    assert err is not None
+    assert "GATE_E_FIX_ROUND_AMNESIA" in err
+
+
+def test_gate_e_accepts_all_heading_variants():
+    """Gate E accepts six heading variants — all should pass."""
+    from alfred_coo.tools import _gate_e_fix_round_amnesia
+    fetcher = lambda owner, repo, num, *, token: (
+        "Gate 4: tests are placeholders; please replace `assert True` "
+        "with real behavioral assertions on the consent_id field."
+    )
+    for heading in [
+        "## Addresses Prior Feedback",
+        "## Prior Feedback",
+        "## Fixes From Previous",
+        "## Response to Review",
+        "## Review Response",
+        "## Changes in Response",
+    ]:
+        body = f"{heading}\nFixed it.\n\n## APE/V Acceptance\n- [ ] x\n"
+        err = _gate_e_fix_round_amnesia(
+            body=body,
+            pr_url="https://github.com/salucallc/soul-svc/pull/66",
+            token="fake",
+            review_fetcher=fetcher,
+        )
+        assert err is None, f"heading {heading!r} should pass Gate E"
 
 
 def test_gate_e_fails_when_body_ignores_prior_review():
@@ -2622,5 +2651,108 @@ def test_gate_b_lite_ignores_pass_in_non_test_function():
             'def empty_db():\n'
             '    pass\n'
         ),
+    }
+    assert _gate_b_lite_placeholder_tests(files) is None
+
+
+def test_gate_b_lite_rejects_decorator_with_assert_true():
+    """SAL-3572 round-0 regression: `@pytest.mark.describe(...)` before
+    `def test_X():` plus a multi-line docstring plus `# TODO` comment
+    plus `assert True` slipped past the regex matcher. AST replacement
+    must catch this shape."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_mssp_pubkey.py": (
+            "import pytest\n"
+            "\n"
+            "@pytest.mark.describe('MSSP Federation Pubkey Lifecycle')\n"
+            "def test_pubkey_lookup_returns_both_halves():\n"
+            "    \"\"\"Placeholder test for GET /pubkeys returning both halves.\n"
+            "    Implementation should call the appropriate endpoint.\n"
+            "    \"\"\"\n"
+            "    # TODO: implement HTTP client call and signature verification\n"
+            "    assert True\n"
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+    assert "GATE_B_LITE_PLACEHOLDER" in err
+    assert "test_pubkey_lookup_returns_both_halves" in err
+
+
+def test_gate_b_lite_rejects_comment_before_assert_true():
+    """`# TODO` on a line by itself between docstring and `assert True`
+    must NOT defeat the gate (the regex needed the trivial line to be
+    the *first* body line; AST traversal ignores comments entirely)."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_lazy.py": (
+            "def test_thing():\n"
+            "    # TODO: real implementation\n"
+            "    # actually do something\n"
+            "    assert True\n"
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+    assert "test_thing" in err
+
+
+def test_gate_b_lite_rejects_async_test_with_pass():
+    """`async def test_X(): pass` is the same shape as sync placeholder."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_async.py": (
+            "import pytest\n"
+            "\n"
+            "@pytest.mark.asyncio\n"
+            "async def test_endpoint():\n"
+            "    pass\n"
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+    assert "test_endpoint" in err
+
+
+def test_gate_b_lite_rejects_docstring_only_test():
+    """Function body is just a docstring (no statements at all) — that
+    is also a placeholder, since the test never asserts anything."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_doc_only.py": (
+            "def test_documented():\n"
+            "    \"\"\"This test will check rotation.\"\"\"\n"
+        ),
+    }
+    err = _gate_b_lite_placeholder_tests(files)
+    assert err is not None
+    assert "test_documented" in err
+
+
+def test_gate_b_lite_passes_real_test_with_decorator():
+    """Decorator + real assertion + docstring + comments — must pass."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_with_decorator.py": (
+            "import pytest\n"
+            "\n"
+            "@pytest.mark.parametrize('x', [1, 2])\n"
+            "def test_thing(x, client):\n"
+            "    \"\"\"Smoke test.\"\"\"\n"
+            "    # set up\n"
+            "    r = client.post('/x', json={'v': x})\n"
+            "    assert r.status_code == 200\n"
+        ),
+    }
+    assert _gate_b_lite_placeholder_tests(files) is None
+
+
+def test_gate_b_lite_skips_unparseable_python():
+    """Syntax error in test file — gate fails-open (don't block on
+    something CI/Hawkman will catch first)."""
+    from alfred_coo.tools import _gate_b_lite_placeholder_tests
+    files = {
+        "tests/test_broken.py": "def test_x(:\n    assert True\n",
     }
     assert _gate_b_lite_placeholder_tests(files) is None

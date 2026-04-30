@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import ast
 import json
 import logging
 import os
@@ -840,19 +841,22 @@ def _gate_d_endpoint_path_consistency(
     )
 
 
-# Gate B-lite: regex patterns Hawkman explicitly names as placeholder
-# rejects in its system prompt. Line-grep matchers — no AST. Conservative
-# scope (only catches the unambiguous patterns) so false-positive rate
-# is near zero. Full Gate B (AST-walk over test functions, count
-# behavioral asserts, classify mocks vs trivial) is deferred to a
-# follow-up; this one closes ~40% of the easy reject cases at <30 LOC.
+# Gate B-lite: AST-based check for placeholder-only test functions.
+# Earlier regex form (kept as `_BL_TRIVIAL_TEST_BODY_RE` for legacy unit
+# tests) failed in production on 2026-04-30 because it could not match
+# `def test_X` preceded by `@pytest.mark.X` decorators or bodies that
+# interleave `# TODO` comment lines with the trivial assertion. AST
+# parsing makes both invisible (decorators travel on the function node;
+# comments are stripped before AST construction), so the gate becomes
+# robust to any test-style boilerplate while remaining conservative —
+# a single non-trivial statement makes the function not-a-placeholder.
 #
-# `_BL_TRIVIAL_TEST_BODY_RE` matches a `def test_*` function whose body
-# (until the next dedent) consists solely of:
+# Trivial statements (after stripping a leading docstring):
 #   - `pass`
-#   - `assert True`
-#   - `raise NotImplementedError(...)` / bare `NotImplementedError`
-# Multiline match; allows whitespace + a single docstring line.
+#   - `assert <truthy literal>` (assert True / assert 1 / assert "x")
+#   - `raise NotImplementedError(...)` or bare `NotImplementedError(...)`
+# Anything else (call, comparison, mock setup, await, return) flips the
+# function to non-trivial and the gate stays quiet.
 _BL_TRIVIAL_TEST_BODY_RE = re.compile(
     r"""
     ^(?P<indent>[ \t]*)def\s+test_\w+\s*\([^)]*\)\s*(?:->\s*[^:]+)?\s*:\s*\n
@@ -871,6 +875,57 @@ _BL_PLACEHOLDER_PLAN_DOC_RE = re.compile(
 )
 
 
+def _is_placeholder_test_function(node: ast.AST) -> bool:
+    """Return True iff ``node`` is a test function whose body, after
+    stripping the leading docstring, contains only trivial statements
+    (``pass``, ``assert <truthy literal>``, ``raise NotImplementedError``).
+
+    Comments are absent from the AST, so ``# TODO`` lines and decorators
+    do not affect this classification — that is the whole point of using
+    AST instead of regex matching.
+    """
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    if not node.name.startswith("test_"):
+        return False
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]  # drop docstring
+    if not body:
+        return True  # docstring-only function is a placeholder
+    for stmt in body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if isinstance(stmt, ast.Assert):
+            test = stmt.test
+            if isinstance(test, ast.Constant) and bool(test.value):
+                continue  # assert True / assert 1 / assert "x"
+            return False
+        if isinstance(stmt, ast.Raise):
+            exc = stmt.exc
+            target = None
+            if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name):
+                target = exc.func.id
+            elif isinstance(exc, ast.Name):
+                target = exc.id
+            if target == "NotImplementedError":
+                continue
+            return False
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            # Bare `NotImplementedError(...)` as a statement (no `raise`).
+            call = stmt.value
+            if isinstance(call.func, ast.Name) and call.func.id == "NotImplementedError":
+                continue
+            return False
+        return False  # any other statement = real behavior
+    return True
+
+
 def _gate_b_lite_placeholder_tests(
     files: Optional[Mapping[str, str]],
 ) -> Optional[str]:
@@ -883,25 +938,37 @@ def _gate_b_lite_placeholder_tests(
     function), ``NotImplementedError``, and the plan-doc admission
     string "placeholder implementations may need to be replaced".
 
-    Conservative on purpose: this is a line-grep, not an AST analysis.
-    A test function with a SINGLE trivial assertion FOLLOWED BY a real
-    behavioral assertion will pass this gate (it only fires when the
-    body is 100% trivial). Full Gate B with classification of mocks vs
-    behavioral asserts is deferred.
+    Uses ast.parse instead of line-grep so decorators (``@pytest.mark.X``),
+    comment lines, and assertion-after-comment shapes do not bypass the
+    check. A test function with a SINGLE trivial assertion FOLLOWED BY a
+    real behavioral assertion still passes — the gate only fires when the
+    function body is 100% trivial after the docstring.
 
     Returns ``None`` to pass, or a string error to abort propose_pr.
     """
     if not files:
         return None
-    placeholder_tests: list[tuple[str, str]] = []  # (file, snippet)
+    placeholder_tests: list[tuple[str, str]] = []  # (file, function name)
     placeholder_plans: list[str] = []
     for path, content in files.items():
         if not isinstance(path, str) or not isinstance(content, str):
             continue
-        if "/test" in path or path.startswith("test") or "/tests/" in path:
-            for m in _BL_TRIVIAL_TEST_BODY_RE.finditer(content):
-                snippet = m.group(0).strip().splitlines()[0]
-                placeholder_tests.append((path, snippet[:120]))
+        is_test_path = path.endswith(".py") and (
+            "/test" in path or path.startswith("test") or "/tests/" in path
+        )
+        if is_test_path:
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                # Don't block on unparseable test files — Hawkman / CI
+                # will catch the syntax error on its own and the gate
+                # avoids becoming a flaky merge-blocker.
+                continue
+            for node in ast.walk(tree):
+                if _is_placeholder_test_function(node):
+                    placeholder_tests.append(
+                        (path, f"def {node.name}(...)")
+                    )
         if path.startswith("plans/") or path.endswith(".md"):
             if _BL_PLACEHOLDER_PLAN_DOC_RE.search(content):
                 placeholder_plans.append(path)
@@ -912,8 +979,9 @@ def _gate_b_lite_placeholder_tests(
         parts.append(
             f" {len(placeholder_tests)} test function(s) have "
             f"placeholder-only bodies (assert True / pass / "
-            f"NotImplementedError). Hawkman GATE 4 will REQUEST_CHANGES. "
-            f"Add real behavioral assertions. Examples:"
+            f"NotImplementedError, ignoring docstrings + comments). "
+            f"Hawkman GATE 4 will REQUEST_CHANGES. Add real behavioral "
+            f"assertions. Examples:"
         )
         for f, snip in placeholder_tests[:3]:
             parts.append(f"  - {f}: {snip}")
@@ -970,6 +1038,17 @@ def _fetch_latest_request_changes_review(
     return rejects[0].get("body") or None
 
 
+_GATE_E_HEADING_RE = re.compile(
+    r"(?im)^\#{2,}\s*"
+    r"(?:addresses\s+prior\s+feedback"
+    r"|prior\s+feedback"
+    r"|fixes?\s+from\s+previous"
+    r"|response\s+to\s+review"
+    r"|review\s+response"
+    r"|changes?\s+in\s+response)"
+)
+
+
 def _gate_e_fix_round_amnesia(
     body: Optional[str],
     *,
@@ -977,16 +1056,19 @@ def _gate_e_fix_round_amnesia(
     token: Optional[str] = None,
     review_fetcher: Optional[Callable[..., Optional[str]]] = None,
 ) -> Optional[str]:
-    """Gate E (autonomy): on update_pr, the new body MUST acknowledge
-    the prior CHANGES_REQUESTED review.
+    """Gate E (autonomy): on update_pr, the new body MUST carry an
+    explicit ``## Addresses Prior Feedback`` heading (or one of the
+    accepted variants) when there is a prior CHANGES_REQUESTED review.
 
-    Catches the soul-svc PR #66 pattern where cycle 2 + cycle 3 had
-    identical Hawkman gate failures because the fix-round builder
-    never read the prior review. Forces the body to either:
-
-      (a) carry an explicit ``## Addresses Prior Feedback`` heading, OR
-      (b) cite ≥1 ten-character phrase from the prior review body
-          (rough proxy for "the builder read it")
+    Earlier version (b937cae) also accepted a 10-char-or-longer keyword
+    overlap with the prior review body. That heuristic admitted the
+    SAL-3572 round-1 update_pr at 22:47 UTC on 2026-04-30 because the
+    builder's body said "Added placeholder pytest tests" while the
+    prior review flagged "placeholder test bodies" — keyword overlap
+    on `placeholder` passed the gate even though the builder never
+    addressed the feedback. Requiring the structural heading forces
+    the builder to read the review and explicitly summarise their
+    response, which is the actual behaviour the gate exists to enforce.
 
     Fail-open conditions:
       - No prior CHANGES_REQUESTED review on the PR
@@ -1006,31 +1088,16 @@ def _gate_e_fix_round_amnesia(
     prior = fetcher(owner, repo, int(num_str), token=token or "")
     if not prior or len(prior.strip()) < 30:
         return None  # no actionable prior review
-    # Path (a): explicit heading
-    if re.search(
-        r"(?im)^\#{2,}\s*(?:addresses\s+prior|prior\s+feedback|fixes?\s+from\s+previous|response\s+to\s+review)",
-        body,
-    ):
-        return None
-    # Path (b): word-or-phrase overlap. Pull all 10+-char alphanumeric
-    # tokens from prior review and check if any appears in body. We use
-    # 10 chars because shorter overlaps (e.g. "endpoint", "test") fire
-    # false positives on every PR.
-    phrases = set()
-    for chunk in re.findall(r"[A-Za-z0-9_/.\-]{10,}", prior):
-        phrases.add(chunk)
-    if not phrases:
-        return None
-    overlap = phrases & set(re.findall(r"[A-Za-z0-9_/.\-]{10,}", body))
-    if overlap:
+    if _GATE_E_HEADING_RE.search(body):
         return None
     preview = prior[:300] + ("..." if len(prior) > 300 else "")
     return (
-        f"GATE_E_FIX_ROUND_AMNESIA: this is a fix-round update_pr but "
-        f"the new body neither carries a `## Addresses Prior Feedback` "
-        f"heading nor cites any 10-char-or-longer phrase from the prior "
-        f"CHANGES_REQUESTED review. Hawkman is likely to repeat the "
-        f"same gate failure. Prior review excerpt:\n\n{preview}"
+        f"GATE_E_FIX_ROUND_AMNESIA: this fix-round update_pr body does "
+        f"not carry a `## Addresses Prior Feedback` heading "
+        f"(accepted variants: 'Prior Feedback', 'Fixes From Previous', "
+        f"'Response to Review', 'Review Response', 'Changes in Response'). "
+        f"Add a section under that heading that summarises which review "
+        f"points you addressed and how. Prior review excerpt:\n\n{preview}"
     )
 
 
