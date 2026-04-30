@@ -367,6 +367,23 @@ class DryRunMesh:
             status=status,
         )
 
+    async def get_task(self, task_id: str) -> Dict[str, Any]:
+        """Fetch a single mesh task record. Used by the orchestrator's
+        cancel-signal poll. In dry-run mode there is no external mesh, so
+        return a stub that mirrors a non-cancelled live task.
+
+        SAL-3740: pre-fix, the orchestrator's ``_check_cancel_signal``
+        called ``self.mesh.get_task`` on every cadence tick and crashed
+        the dry-run smoke test with ``AttributeError`` because this
+        shim never had a ``get_task`` method. Adding the stub unblocks
+        the smoke without changing live behavior.
+        """
+        return {
+            "id": task_id,
+            "status": "claimed",
+            "result": None,
+        }
+
 
 # -- orchestrator wiring ---------------------------------------------------
 
