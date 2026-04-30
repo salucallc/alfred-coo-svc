@@ -1814,8 +1814,18 @@ def test_target_hints_entry_count_unchanged():
     PC-K4A..F / PC-N5A..E covering the 5-track cockpit surface plan
     at Z:/_planning/journey/phase_c_surface_tickets_2026-04-27.md
     (C2A and C2C dropped per Cristian: chat stack contained in
-    cockpit, no Oracle deploy)."""
-    assert len(_TARGET_HINTS) == 119
+    cockpit, no Oracle deploy). The 119 baseline drifted to 145
+    silently across PRs #270/#291/etc (intermediate hint-batch
+    additions never updated this assertion); test was failing on
+    origin/main pre-fix. Bumped 145 -> 154 by the wave-1
+    silent-complete fix 2026-04-29 (PR fix/wave1-no-hint-mssp-codes):
+    +9 entries MSSP-EX-A/B/C/D/E/H + MSSP-FED-W1-A/B/C covering the
+    MSSP extraction track (SAL-3538..3542, SAL-3545) + MSSP federation
+    wave-1 (SAL-3566..3568). Both kickoffs (0de3e2be MSSP-EX retry +
+    dae5a5c0 MSSP federation) crashed earlier the same day with
+    green=0/excused=N because the persona's Step 0 grounding-gap path
+    fired on every dispatch (NO_HINT escalation)."""
+    assert len(_TARGET_HINTS) == 154
 
 
 def test_target_hints_keys_are_uppercase():

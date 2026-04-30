@@ -105,10 +105,21 @@ KNOWN_EPICS: frozenset[str] = frozenset(
 # digits — pure letter suffix). The standard `\d{1,3}[A-Za-z]?` form
 # requires at least one digit and so previously skipped them, leaving 8
 # wave-3 tickets in the no_hint_no_code bucket.
+#
+# wave-1 silent-complete fix (2026-04-29): added MSSP-EX-X (single trailing
+# letter, no digits) and MSSP-FED-W{N}-X (wave-keyed federation codes) so
+# the MSSP extraction + federation tracks parse to a non-empty ticket.code
+# and pick up their `_TARGET_HINTS` entries. Without these prefixes, every
+# title like "MSSP-EX-A — Extract ..." or "MSSP Federation W1-A: ..."
+# parsed to code='', triggering the NO_HINT (unresolved) escalation block
+# and burning the wave-gate (kickoffs 0de3e2be + dae5a5c0, both crashed
+# 2026-04-29 with green=0/excused=N).
 _CODE_RE = re.compile(
     r"\b("
     r"(?:TIR|ALT|FLEET|OPS|SS|AB|MC|SG|C|D|E|F|H)[-_]?\d{1,3}[A-Za-z]?"
     r"|AD[-_][a-h]"
+    r"|MSSP[-_]EX[-_][A-Za-z]"
+    r"|MSSP[-_]FED[-_]W\d[-_][A-Za-z]"
     r")\b",
     re.IGNORECASE,
 )
@@ -281,10 +292,27 @@ def _parse_code(title: str) -> str:
     (no dash). An underscore in the source (``C_26``) is normalised to a
     dash (``C-26``) because plan docs use the dash form for multi-char
     prefixes exclusively. Uppercased for consistency.
+
+    wave-1 silent-complete fix (2026-04-29): the MSSP federation track
+    titles use "MSSP Federation W1-A: ..." (a SPACE between MSSP and
+    Federation), which `_CODE_RE` can't match as a single token. We
+    pre-normalise that specific phrase to ``MSSP-FED-W1-A`` before the
+    regex search so federation tickets parse to a non-empty code and
+    pick up their `_TARGET_HINTS` entries instead of NO_HINT-escalating
+    every wave-1 builder. The MSSP-EX-A style already uses dashes and
+    matches directly via the new regex branch.
     """
     if not title:
         return ""
-    m = _CODE_RE.search(title)
+    # Normalise "MSSP Federation W<N>-<X>" -> "MSSP-FED-W<N>-<X>" so the
+    # regex can extract a single token. Case-insensitive, single pass.
+    normalised = re.sub(
+        r"\bMSSP\s+Federation\s+(W\d+[-_][A-Za-z])\b",
+        r"MSSP-FED-\1",
+        title,
+        flags=re.IGNORECASE,
+    )
+    m = _CODE_RE.search(normalised)
     if not m:
         return ""
     return m.group(0).upper().replace("_", "-")
