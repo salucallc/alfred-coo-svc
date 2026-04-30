@@ -2869,6 +2869,169 @@ _TARGET_HINTS: Mapping[str, TargetHint] = {
         notes="MSSP Federation W1-C (SAL-3568) — SQL functions establish_consent / withdraw_consent_by_customer / withdraw_consent_by_mssp / rotate_key_by_customer / rotate_key_by_mssp. Each writes a dual-signed audit row in the same transaction. Bilateral divorce (either party may withdraw); peer-unreachable exception with outcome=peer_unreachable. Depends on W1-A schema; child should rebase on the W1-A migration before opening the PR. APE/V: each function tested at boundary (single-sig rejected, both-sig accepted, peer-unreachable noted).",
     ),
 
+    # ── Cockpit Consumer UX track (track:cockpit-consumer-ux, wave-1) ──
+    # wave-1 silent-complete fix follow-up (2026-04-29 evening): without
+    # `_TARGET_HINTS` entries SAL-3591/3592/3593 hit the NO_HINT
+    # (unresolved) escalate block, same failure mode as the MSSP wave-1
+    # crash. Repo is salucallc/alfred-portal (single Next.js app at the
+    # repo root, NOT a monorepo with apps/). The ticket bodies use the
+    # `apps/cockpit/...` path style (aspirational future monorepo
+    # layout); persona reconciles to real repo layout in Step 0 — actual
+    # cockpit code lives at `src/components/cockpit/` and
+    # `src/styles/cockpit/`. Existing themes today are CSS-based with
+    # `data-theme` on <html>; the new schema introduces JSON theme
+    # packs + `data-cockpit-theme` on <body>. Hints below give the
+    # persona both flavours of paths so it can pick the right one and
+    # not fabricate.
+    "CO-W1-A": TargetHint(
+        owner="salucallc",
+        repo="alfred-portal",
+        paths=(
+            "src/components/cockpit/useTheme.ts",
+            "src/styles/cockpit/tokens.css",
+        ),
+        new_paths=(
+            "src/lib/cockpit/themes/schema.ts",
+            "src/lib/cockpit/themes/aliasTable.ts",
+            "src/lib/cockpit/themes/loader.ts",
+            "src/lib/cockpit/themes/index.ts",
+            "src/lib/cockpit/themes/__tests__/schema.test.ts",
+            "src/lib/cockpit/themes/__tests__/loader.test.ts",
+        ),
+        base_branch="main",
+        branch_hint="feature/co-w1-a-cockpit-theme-schema",
+        notes="CO-W1-A (SAL-3591) — Cockpit theme JSON schema (apiVersion saluca.dev/cockpit-theme/v1) + Zod validator + alias table + runtime loader applying CSS custom properties on `<body data-cockpit-theme=\"<name>\">`. Repo `alfred-portal` is a single Next.js app rooted at repo root; ticket body uses `apps/cockpit/...` (aspirational monorepo) — reconcile to existing `src/components/cockpit/` + `src/lib/cockpit/themes/` (NEW). APE/V: vitest covers happy path + 5 invalid-shape paths + 3 unsafe-CSS-value paths (`expression()`, `javascript:`, remote `url()` rejected). End-to-end Playwright smoke applies phosphor then paper, asserts `.cockpit-bg` computed style swaps within 200ms with no FOUC. Plan: `Z:/_planning/consumer-ux-plan.md` §3.",
+    ),
+    "CO-W1-B": TargetHint(
+        owner="salucallc",
+        repo="alfred-portal",
+        paths=(
+            "src/styles/cockpit/tokens.css",
+        ),
+        new_paths=(
+            "src/lib/cockpit/themes/packs/synthwave-1989.json",
+            "src/lib/cockpit/themes/packs/brutalist.json",
+            "src/lib/cockpit/themes/packs/terminal-amber.json",
+            "src/lib/cockpit/themes/packs/dataviz-pastel.json",
+            "src/lib/cockpit/themes/packs/blueprint.json",
+            "src/lib/cockpit/themes/packs/vaporwave.json",
+            "src/lib/cockpit/themes/packs/starkpad.json",
+            "scripts/validate-themes.mjs",
+        ),
+        base_branch="main",
+        branch_hint="feature/co-w1-b-seven-theme-packs",
+        notes="CO-W1-B (SAL-3592) — author 7 baked-in theme JSON files conforming to W1-A schema: synthwave-1989 (neon pink+cyan retro grid), brutalist (high-contrast monochrome), terminal-amber (CRT amber-on-black), dataviz-pastel (Bauhaus muted), blueprint (white-on-blue technical), vaporwave (pink-purple-teal dreamy), starkpad (slate-blue+gold+holo, Superhero default). Each MUST include all required tokens per W1-A schema, plus `author` + `license` fields. Ticket body lists `apps/cockpit/themes/` — reconcile to repo's actual `src/lib/cockpit/themes/packs/` (NEW). APE/V: `pnpm validate-themes` iterates all packs and confirms schema-pass; hex tokens for `--cockpit-bg` and `--cockpit-accent` differ across all 12 themes (5 existing + 7 new); no two themes share both background and accent. Plan: `Z:/_planning/consumer-ux-plan.md` §3.3. Depends on CO-W1-A (schema must land first).",
+    ),
+    "CO-W1-C": TargetHint(
+        owner="salucallc",
+        repo="alfred-portal",
+        paths=(
+            "src/components/cockpit/useTheme.ts",
+            "src/styles/cockpit/tokens.css",
+        ),
+        new_paths=(
+            "src/lib/cockpit/themes/packs/phosphor.json",
+            "src/lib/cockpit/themes/packs/hawkman.json",
+            "src/lib/cockpit/themes/packs/ice.json",
+            "src/lib/cockpit/themes/packs/warroom.json",
+            "src/lib/cockpit/themes/packs/paper.json",
+        ),
+        base_branch="main",
+        branch_hint="feature/co-w1-c-document-existing-themes",
+        notes="CO-W1-C (SAL-3593) — convert the 5 existing themes (phosphor, hawkman, ice, warroom, paper) from `cockpit-DESIGN_NOTES.md` §3 token-override style into JSON packs matching W1-A schema. Source tokens live in `src/styles/cockpit/tokens.css` and the existing `useTheme.ts` enumerates the 5 names. Same friendly token names as W1-B; values must come from existing CSS so visual output round-trips pixel-identical (within ±2 channel deltaE) when applied through new JSON loader. Ticket body lists `apps/cockpit/themes/` — reconcile to actual `src/lib/cockpit/themes/packs/`. APE/V: side-by-side Playwright screenshot diff for each of the 5 themes shows zero visible regression; `pnpm validate-themes` passes for all 5. Depends on CO-W1-A (schema) + CO-W1-B (validate-themes script). Plan: `Z:/_planning/consumer-ux-plan.md` §3.3 + `cockpit-mockups/DESIGN_NOTES.md` §3.",
+    ),
+
+    # ── Agent Ingest track (track:agent-ingest, wave-1) ────────────────
+    # wave-1 silent-complete fix follow-up (2026-04-29 evening): without
+    # `_TARGET_HINTS` entries SAL-3609..3612 would hit the NO_HINT
+    # (unresolved) escalate block. Plan: `Z:/_planning/agent-ingest-plan.md`
+    # §2 (SDK ABC), §5 (manifest formats), §7 (soulkey issuance), §11
+    # (Wave 1 work split). The SDK is published from a NEW PyPI package
+    # `saluca-plugin-sdk` whose source lives in alfred-coo-svc monorepo
+    # under a NEW top-level `plugins/saluca-plugin-sdk/` subtree (per
+    # SAL-3611's "monorepo `plugins/saluca-plugin-echo-inbound/`"
+    # reference); soulkey API endpoints land in salucallc/soul-svc.
+    "AI-W1-A": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(
+            "pyproject.toml",
+        ),
+        new_paths=(
+            "plugins/saluca-plugin-sdk/pyproject.toml",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/__init__.py",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/agent_plugin.py",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/dataclasses.py",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/manifest_validator.py",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/audit_hook.py",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/conftest.py",
+            "plugins/saluca-plugin-sdk/tests/test_abc_conformance.py",
+            "plugins/saluca-plugin-sdk/tests/test_manifest_validator.py",
+            "plugins/saluca-plugin-sdk/tests/fixtures/external_agent_manifest.yaml",
+            "plugins/saluca-plugin-sdk/tests/fixtures/external_surface_manifest.yaml",
+            "plugins/saluca-plugin-sdk/README.md",
+            "plugins/saluca-plugin-sdk/LICENSE",
+        ),
+        base_branch="main",
+        branch_hint="feature/ai-w1-a-plugin-sdk-base",
+        notes="AI-W1-A (SAL-3609) — saluca-plugin-sdk PyPI package (PolyForm-Noncommercial-1.0.0, v0.1.0). `SalucaPlugin` ABC with `direction: inbound|outbound|bidirectional` discriminator. Direction-conditional methods: `dispatch_inbound(agent_id, task, scope)` for inbound+bidirectional; `dispatch_outbound(agent_id, action, scope)` for outbound+bidirectional. Mis-routed calls raise NotImplementedError. Required-on-all: discover, register, lifecycle(start|stop|health), audit_hook, unregister. Dataclasses: AgentCapabilities, RegistrationResult, DispatchResult, AuditEvent. Default audit_hook POSTs to soul-svc /v1/audit/external-agent/event with HMAC signed by plugin's soulkey. Manifest pydantic validators for both `ExternalAgent` and `ExternalSurface` kinds. Legacy alias `AgentPlugin = SalucaPlugin` exported. APE/V: `pip install saluca-plugin-sdk==0.1.0` succeeds; CI gate validates direction-conditional override requirement (inbound class without dispatch_inbound override → conformance failure); both reference manifests round-trip; bad scope enums + missing fields rejected with structured errors. Plan: `Z:/_planning/agent-ingest-plan.md` §2 + §5.",
+    ),
+    "AI-W1-B": TargetHint(
+        owner="salucallc",
+        repo="soul-svc",
+        paths=(
+            "migrations/",
+            "routers/",
+        ),
+        new_paths=(
+            "migrations/021_external_agent_soulkeys.sql",
+            "routers/external_agent_soulkeys.py",
+            "tests/test_external_agent_soulkeys.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ai-w1-b-soulkey-issuance-api",
+        notes="AI-W1-B (SAL-3610) — soul-svc gains 3 endpoints to issue/rotate/revoke soulkeys for externally-registered agents OR surfaces (one flow, both directions). HKDF-derived from tenant master key: salt=sha256(tenant_id||tenant_master_salt), ikm=tenant_master_key, info='saluca-agent-soulkey-v1'||agent_id, 32 bytes. Endpoints: POST /v1/agents/external/issue-soulkey (returns plaintext sk_agent_<...> once, persists hash); POST /v1/agents/external/{agent_id}/rotate-soulkey (rotates per-agent salt; old marked revoked); POST /v1/agents/external/{agent_id}/revoke-soulkey (hard revoke). DDL: external_agent_soulkeys table — agent_id PK, tenant_id, direction, soulkey_hash, kid, created_at, revoked_at, harness, audit_metadata jsonb. Pick the next free migration number by listing migrations/ via http_get (021 is current best guess; verify in Step 0). APE/V: issue once → use → rotate → use new (200) → use old (401) → revoke → use new (401). Direction recorded in audit_metadata for every event. Format mirrors `reference_agent_fleet_canonical` sk_agent_<rest>. Plan: `Z:/_planning/agent-ingest-plan.md` §7. Register new router in soul-svc `serve.py` (modify path resolved at impl time).",
+    ),
+    "AI-W1-C": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "plugins/saluca-plugin-echo-inbound/pyproject.toml",
+            "plugins/saluca-plugin-echo-inbound/saluca_plugin_echo_inbound/__init__.py",
+            "plugins/saluca-plugin-echo-inbound/saluca_plugin_echo_inbound/plugin.py",
+            "plugins/saluca-plugin-echo-inbound/manifest.yaml",
+            "plugins/saluca-plugin-echo-inbound/tests/test_echo_inbound.py",
+            "plugins/saluca-plugin-echo-inbound/README.md",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/contract/__init__.py",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/contract/inbound.py",
+            "plugins/saluca-plugin-sdk/tests/contract/test_inbound_contract.py",
+            "plugins/saluca-plugin-sdk/tests/contract/fixtures/broken_inbound_plugin.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ai-w1-c-echo-inbound-plus-contract-suite",
+        notes="AI-W1-C (SAL-3611) — saluca-plugin-echo-inbound: trivial inbound plugin subclassing SalucaPlugin with direction=\"inbound\"; `dispatch_inbound` echoes the task back as `DispatchResult(status='ok', output=task)`. Contract suite at saluca-plugin-sdk/tests/contract/inbound.py drives a plugin through register → discover → lifecycle('health') → dispatch_inbound → unregister, asserting each return matches SDK type contracts. CI gate: any plugin claiming `direction in {inbound, bidirectional}` must include `pytest -m saluca_plugin_contract` running the suite. APE/V: `pip install saluca-plugin-echo-inbound==0.1.0` works; contract suite passes against echo plugin and reports pass; deliberately-broken inbound plugin (dispatch_inbound returns wrong type) FAILS contract suite with clear error. Depends on AI-W1-A (SDK base). Plan: `Z:/_planning/agent-ingest-plan.md` §2 + Wave 1 §11.",
+    ),
+    "AI-W1-D": TargetHint(
+        owner="salucallc",
+        repo="alfred-coo-svc",
+        paths=(),
+        new_paths=(
+            "plugins/saluca-plugin-echo-outbound/pyproject.toml",
+            "plugins/saluca-plugin-echo-outbound/saluca_plugin_echo_outbound/__init__.py",
+            "plugins/saluca-plugin-echo-outbound/saluca_plugin_echo_outbound/plugin.py",
+            "plugins/saluca-plugin-echo-outbound/manifest.yaml",
+            "plugins/saluca-plugin-echo-outbound/tests/test_echo_outbound.py",
+            "plugins/saluca-plugin-echo-outbound/README.md",
+            "plugins/saluca-plugin-sdk/saluca_plugin_sdk/contract/outbound.py",
+            "plugins/saluca-plugin-sdk/tests/contract/test_outbound_contract.py",
+            "plugins/saluca-plugin-sdk/tests/contract/fixtures/missing_actions_plugin.py",
+        ),
+        base_branch="main",
+        branch_hint="feature/ai-w1-d-echo-outbound-plus-contract-suite",
+        notes="AI-W1-D (SAL-3612) — saluca-plugin-echo-outbound: trivial outbound plugin subclassing SalucaPlugin with direction=\"outbound\"; `dispatch_outbound` POSTs the action to a configured mock HTTP endpoint and returns response as DispatchResult. Manifest declares `outbound_actions: [echo.send]`. Contract suite at saluca-plugin-sdk/tests/contract/outbound.py drives register → discover → lifecycle → dispatch_outbound (action `echo.send`) → unregister, asserting outbound-specific argument schema and DispatchResult.output matches mock-endpoint payload. CI gate symmetric to AI-W1-C. APE/V: `pip install saluca-plugin-echo-outbound==0.1.0` works; contract suite passes; plugin without `outbound_actions[]` in manifest fails CI validation. Depends on AI-W1-A (SDK base). Plan: `Z:/_planning/agent-ingest-plan.md` §2.",
+    ),
+
 }
 
 
@@ -8568,6 +8731,73 @@ class AutonomousBuildOrchestrator:
         )
         return files
 
+    async def _pr_intersects_expected_scope(
+        self,
+        pr_url: str,
+        ticket_ident: str,
+        *,
+        log_tag: str,
+    ) -> bool:
+        """Shared per-candidate path-intersection check used by both the
+        stale-sweep matcher and the dispatch-loop merged-PR pre-flight.
+
+        Returns True iff:
+          - ticket has a ``_TARGET_HINTS`` entry (otherwise we cannot
+            verify scope and must NOT auto-flip);
+          - the PR's ``files_changed`` can be fetched; AND
+          - at least one changed file intersects
+            ``hint.paths ∪ hint.new_paths`` (and the diff isn't entirely
+            non-evidence files).
+
+        Returns False on any of: no hint, file fetch failure, or no
+        intersection. Logs at INFO so the rejection reason is visible in
+        production journals (the federation 2026-04-29 02:33Z misfire
+        flipped SAL-3566/3567/3568 to MERGED_GREEN because the
+        dispatch-loop branch did NOT run this check; the stale-sweep
+        path did and correctly rejected the same PR #302).
+
+        ``log_tag`` is ``[stale-sweep]`` or ``[merged-skip]`` so the
+        operator can tell which code path emitted the rejection.
+        """
+        graph = getattr(self, "graph", None)
+        ticket = graph.get_by_identifier(ticket_ident) if graph else None
+        code = (getattr(ticket, "code", "") or "").upper().strip()
+        hint = _TARGET_HINTS.get(code) if code else None
+
+        if hint is None:
+            # No hint to compare against. Refuse to auto-flip / auto-skip
+            # — the whole point of the tightening rule is to require
+            # positive evidence, and a code-search hit on a PR with no
+            # scope contract isn't enough. NO_HINT case: the dispatch
+            # loop will treat this as "no merged PR found" and dispatch
+            # the ticket fresh rather than trusting a title-mention.
+            logger.info(
+                "%s candidate PR %s found for %s but no "
+                "_TARGET_HINTS entry exists for code %r; refusing to "
+                "auto-flip on weak evidence",
+                log_tag, pr_url, ticket_ident, code,
+            )
+            return False
+
+        files_changed = await self._fetch_pr_files(pr_url)
+        if files_changed is None:
+            logger.debug(
+                "%s file fetch failed for %s (ticket %s); "
+                "skipping this candidate",
+                log_tag, pr_url, ticket_ident,
+            )
+            return False
+        if not self._pr_files_match_hint(files_changed, hint):
+            logger.info(
+                "%s candidate PR %s for %s does NOT "
+                "intersect expected scope (paths=%r new_paths=%r "
+                "changed=%r); rejecting as not-an-implementation",
+                log_tag, pr_url, ticket_ident, hint.paths, hint.new_paths,
+                files_changed[:8],
+            )
+            return False
+        return True
+
     async def _find_recent_merged_pr_for(self, ticket_ident: str) -> Optional[str]:
         """Search ``salucallc/*`` for a merged PR citing ``ticket_ident``
         in title or body within the last ``_STALE_SWEEP_PR_LOOKBACK_SEC``,
@@ -8586,21 +8816,17 @@ class AutonomousBuildOrchestrator:
         verify scope, so we conservatively return None — the sweeper
         leaves it for human review rather than auto-flip on weak evidence.
 
+        2026-04-29 federation misfire: the path-intersection check is now
+        shared with ``_ticket_has_merged_pr`` via
+        ``_pr_intersects_expected_scope``; both code paths now agree on
+        what counts as evidence-of-implementation.
+
         Tests stub this via ``self._gh_pr_search_fn`` to avoid live HTTP.
         ``self._gh_pr_files_fn`` separately stubs the file fetch used by
         the new intersection check.
         """
         if not ticket_ident:
             return None
-
-        # Resolve the ticket's plan-doc code so we can look up the hint.
-        # ``self.graph`` is populated by the wave loop before any sweep
-        # runs; if it's not yet built (early-startup race), skip rather
-        # than guess.
-        graph = getattr(self, "graph", None)
-        ticket = graph.get_by_identifier(ticket_ident) if graph else None
-        code = (getattr(ticket, "code", "") or "").upper().strip()
-        hint = _TARGET_HINTS.get(code) if code else None
 
         candidate_urls = await self._search_recent_merged_pr_urls(
             ticket_ident,
@@ -8611,36 +8837,10 @@ class AutonomousBuildOrchestrator:
         # Walk candidates in search-rank order, returning the first that
         # passes the file-overlap check.
         for url in candidate_urls:
-            if hint is None:
-                # No hint to compare against. Refuse to auto-flip — the
-                # whole point of the tightening rule is to require
-                # positive evidence, and a code-search hit on a PR with
-                # no scope contract isn't enough.
-                logger.info(
-                    "[stale-sweep] candidate PR %s found for %s but no "
-                    "_TARGET_HINTS entry exists for code %r; refusing to "
-                    "auto-flip on weak evidence",
-                    url, ticket_ident, code,
-                )
-                continue
-            files_changed = await self._fetch_pr_files(url)
-            if files_changed is None:
-                logger.debug(
-                    "[stale-sweep] file fetch failed for %s (ticket %s); "
-                    "skipping this candidate",
-                    url, ticket_ident,
-                )
-                continue
-            if not self._pr_files_match_hint(files_changed, hint):
-                logger.info(
-                    "[stale-sweep] candidate PR %s for %s does NOT "
-                    "intersect expected scope (paths=%r new_paths=%r "
-                    "changed=%r); rejecting as not-an-implementation",
-                    url, ticket_ident, hint.paths, hint.new_paths,
-                    files_changed[:8],
-                )
-                continue
-            return url
+            if await self._pr_intersects_expected_scope(
+                url, ticket_ident, log_tag="[stale-sweep]",
+            ):
+                return url
         return None
 
     async def _search_recent_merged_pr_urls(
@@ -8735,28 +8935,45 @@ class AutonomousBuildOrchestrator:
         self, ticket_ident: str,
     ) -> Optional[str]:
         """Return the URL of a merged PR mentioning ``ticket_ident`` in
-        title or body within the lookback window, else None.
+        title or body within the lookback window AND whose changed files
+        intersect the ticket's ``_TARGET_HINTS`` expected scope, else None.
 
         Pre-flight check used by the dispatch loop in ``_dispatch_wave``:
         if a builder is about to be fired for a ticket whose PR has
-        already merged, we mark the ticket MERGED_GREEN and skip dispatch
-        instead of wasting a build cycle. Reuses the existing
-        ``_search_recent_merged_pr_urls`` helper (the looser raw search
-        also driven by the test-only ``_gh_pr_search_fn`` stub) so we do
-        not maintain a parallel GitHub-search code path.
+        already merged AND that PR is the actual implementation, we mark
+        the ticket MERGED_GREEN and skip dispatch instead of wasting a
+        build cycle.
 
-        Note: this deliberately does NOT layer on the file-overlap
-        intersection check ``_find_recent_merged_pr_for`` applies — that
-        check is a *stale-sweep* tightening rule (PRs that only edit
-        ``_TARGET_HINTS`` are not evidence of implementation). For
-        pre-flight builder-skip we trust a merged-PR-mention as enough
-        signal: the merge bot already gated on Hawkman APPROVE before
-        merging, so the ticket has shipped by definition.
+        Path-intersection check (2026-04-29 fix): historically this
+        helper accepted any merged PR that mentioned the ticket in title
+        or body, even if the PR only edited an unrelated file (e.g. a
+        plan-doc, a sibling ticket's `_TARGET_HINTS` entry, or a
+        retrospective comment in another PR's body). The federation
+        wave-1 02:33:25Z misfire (SAL-3566/3567/3568 falsely flipped to
+        Done off PR #302, which only mentioned them in its body while
+        editing unrelated migrations) made the same-file inconsistency
+        explicit: the stale-sweep matcher already ran this check via
+        ``_find_recent_merged_pr_for``; the dispatch-loop pre-flight did
+        not. Both paths now share ``_pr_intersects_expected_scope`` so a
+        PR is only treated as evidence-of-implementation when its
+        ``files_changed`` overlaps ``hint.paths ∪ hint.new_paths``.
+
+        Conservative NO_HINT behaviour: tickets whose code is not in
+        ``_TARGET_HINTS`` cannot be scope-verified, so this helper now
+        returns None for them (rather than auto-skipping on a
+        title-mention). The dispatch loop will then dispatch fresh; if
+        the ticket really has shipped, the post-build PR-create flow or
+        the next stale-sweep tick will reconcile it.
+
+        Reuses ``_search_recent_merged_pr_urls`` for the search step and
+        ``_pr_intersects_expected_scope`` for the per-candidate check —
+        both shared with the stale-sweep matcher so the two code paths
+        cannot drift again.
 
         Results are cached per-ticket for ``MERGED_PR_CACHE_TTL_SEC`` so
         a 16-ticket wave doesn't fire 16 Search calls every 45s tick.
-        Tests stub the round-trip via ``self._gh_pr_search_fn`` (shared
-        with the stale-sweep helpers).
+        Tests stub the round-trip via ``self._gh_pr_search_fn`` and
+        ``self._gh_pr_files_fn``.
         """
         if not ticket_ident:
             return None
@@ -8783,7 +9000,12 @@ class AutonomousBuildOrchestrator:
         url: Optional[str] = None
         try:
             urls = await self._search_recent_merged_pr_urls(ticket_ident)
-            url = urls[0] if urls else None
+            for candidate in urls:
+                if await self._pr_intersects_expected_scope(
+                    candidate, ticket_ident, log_tag="[merged-skip]",
+                ):
+                    url = candidate
+                    break
         except Exception:
             logger.exception(
                 "[merged-skip] PR search raised for %s; treating as "

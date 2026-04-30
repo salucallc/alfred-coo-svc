@@ -114,12 +114,25 @@ KNOWN_EPICS: frozenset[str] = frozenset(
 # parsed to code='', triggering the NO_HINT (unresolved) escalation block
 # and burning the wave-gate (kickoffs 0de3e2be + dae5a5c0, both crashed
 # 2026-04-29 with green=0/excused=N).
+#
+# wave-1 silent-complete fix follow-up (2026-04-29 evening): added CO-W{N}-X
+# (Cockpit Consumer UX) and AI-W{N}-X (Agent Ingest) wave-keyed codes so
+# SAL-3591/3592/3593 (Cockpit-UX wave-1) and SAL-3609/3610/3611/3612
+# (Agent-Ingest wave-1) parse to a non-empty ticket.code and pick up their
+# `_TARGET_HINTS` entries. Cockpit titles use the long form
+# "[Cockpit Consumer UX W1-A] ..." which `_parse_code` normalises before
+# regex search; Agent-Ingest titles use the bare "[W1-A] ..." form, so
+# `_parse_code` discriminates by inspecting the ticket's labels (presence
+# of `track:agent-ingest` triggers the AI- normalisation) — see callers
+# in `build_ticket_graph`. Mirrors the PR #302 pattern.
 _CODE_RE = re.compile(
     r"\b("
     r"(?:TIR|ALT|FLEET|OPS|SS|AB|MC|SG|C|D|E|F|H)[-_]?\d{1,3}[A-Za-z]?"
     r"|AD[-_][a-h]"
     r"|MSSP[-_]EX[-_][A-Za-z]"
     r"|MSSP[-_]FED[-_]W\d[-_][A-Za-z]"
+    r"|CO[-_]W\d[-_][A-Za-z]"
+    r"|AI[-_]W\d[-_][A-Za-z]"
     r")\b",
     re.IGNORECASE,
 )
@@ -284,7 +297,7 @@ def _parse_critical_path(labels: Sequence[str]) -> bool:
     return False
 
 
-def _parse_code(title: str) -> str:
+def _parse_code(title: str, labels: Optional[Sequence[str]] = None) -> str:
     """Pull the short epic code (TIR-01, SS-08, F08, ...) out of the title.
 
     Preserves the original separator format so plan-doc greps match
@@ -301,6 +314,17 @@ def _parse_code(title: str) -> str:
     pick up their `_TARGET_HINTS` entries instead of NO_HINT-escalating
     every wave-1 builder. The MSSP-EX-A style already uses dashes and
     matches directly via the new regex branch.
+
+    wave-1 silent-complete fix follow-up (2026-04-29 evening): the
+    Cockpit Consumer UX track uses titles like
+    "[Cockpit Consumer UX W1-A] ..." (long form with the track name
+    inline), and the Agent Ingest track uses the bare "[W1-A] ..." form.
+    To disambiguate Agent-Ingest's bare bracket prefix from any other
+    "[W1-A]" usage that might appear elsewhere (today there is none, but
+    we don't want to be a hostage to that), we accept an optional
+    ``labels`` argument and normalise "[W<N>-<X>]" -> "AI-W<N>-<X>" only
+    when ``track:agent-ingest`` is present. Cockpit's long-form prefix
+    is unambiguous and is normalised unconditionally.
     """
     if not title:
         return ""
@@ -312,6 +336,29 @@ def _parse_code(title: str) -> str:
         title,
         flags=re.IGNORECASE,
     )
+    # Normalise "[Cockpit Consumer UX W<N>-<X>]" -> "CO-W<N>-<X>" so the
+    # regex can extract the cockpit-track wave code as a single token.
+    # The long-form bracket prefix is unambiguous and unique to this
+    # track, so this normalisation is unconditional.
+    normalised = re.sub(
+        r"\[\s*Cockpit\s+Consumer\s+UX\s+W(\d+)[-_]([A-Za-z])\s*\]",
+        r"CO-W\1-\2",
+        normalised,
+        flags=re.IGNORECASE,
+    )
+    # Normalise bare "[W<N>-<X>]" -> "AI-W<N>-<X>" ONLY when this ticket
+    # carries the ``track:agent-ingest`` label. Without the label-gate
+    # this regex would over-match unrelated tickets that happen to use a
+    # bare wave bracket; gating on the track label keeps the
+    # normalisation surgical to the Agent-Ingest project.
+    label_set = {(lbl or "").strip().lower() for lbl in (labels or [])}
+    if "track:agent-ingest" in label_set:
+        normalised = re.sub(
+            r"\[\s*W(\d+)[-_]([A-Za-z])\s*\]",
+            r"AI-W\1-\2",
+            normalised,
+            flags=re.IGNORECASE,
+        )
     m = _CODE_RE.search(normalised)
     if not m:
         return ""
@@ -397,7 +444,7 @@ async def build_ticket_graph(
         ticket = Ticket(
             id=uuid,
             identifier=identifier,
-            code=_parse_code(title),
+            code=_parse_code(title, labels=labels),
             title=title,
             wave=_parse_wave(labels),
             epic=_parse_epic(labels),
