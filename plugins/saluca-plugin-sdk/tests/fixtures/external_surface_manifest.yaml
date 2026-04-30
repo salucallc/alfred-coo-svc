@@ -1,3 +1,5 @@
-name: example-surface
-scope: private
-description: "Test surface"
+kind: ExternalSurface
+surface_id: "surface-abc"
+scope: "global"
+config:
+  param: "value"

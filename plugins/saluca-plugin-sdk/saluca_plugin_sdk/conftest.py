@@ -1,6 +1,5 @@
-import os
 import pytest
 
 @pytest.fixture
-def soulkey():
-    return os.getenv("SOULKEY", "testkey")
+def dummy_soulkey():
+    return "dummy-soulkey"

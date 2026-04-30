@@ -1,13 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "saluca-plugin-sdk"
 version = "0.1.0"
-description = "Saluca Plugin SDK"
+description = "Saluca plugin SDK"
+license = {text = "PolyForm-Noncommercial-1.0.0"}
+authors = [{name = "Saluca LLC"}]
+readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
 
-[tool.setuptools]
-package-dir = { "" = "saluca_plugin_sdk" }
-
-[build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+[project.urls]
+"Homepage" = "https://github.com/salucallc/alfred-coo-svc"

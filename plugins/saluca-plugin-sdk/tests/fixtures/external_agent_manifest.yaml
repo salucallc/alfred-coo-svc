@@ -1,3 +1,7 @@
-name: example-agent
-scope: public
-version: "1.0"
+kind: ExternalAgent
+agent_id: "agent-123"
+capabilities:
+  - "read"
+  - "write"
+metadata:
+  owner: "team"

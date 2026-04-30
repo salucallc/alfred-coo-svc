@@ -1,21 +1,25 @@
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any, Dict
 
 @dataclass
 class AgentCapabilities:
-    capabilities: List[str]
+    supports_inbound: bool
+    supports_outbound: bool
 
 @dataclass
 class RegistrationResult:
-    success: bool
-    details: Any = None
+    agent_id: str
+    capabilities: AgentCapabilities
+    metadata: Dict[str, Any] | None = None
 
 @dataclass
 class DispatchResult:
     success: bool
-    response: Any = None
+    details: Dict[str, Any] | None = None
 
 @dataclass
 class AuditEvent:
     event_type: str
-    payload: dict
+    payload: Dict[str, Any]
+    timestamp: str

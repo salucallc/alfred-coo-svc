@@ -1,35 +1,40 @@
-from abc import ABC, abstractmethod
-from typing import Any
+import abc
+from typing import Any, Dict
 
-class SalucaPlugin(ABC):
+class SalucaPlugin(abc.ABC):
+    """
+    Base class for Saluca plugins.
+    Subclasses must set `direction` to one of "inbound", "outbound", "bidirectional".
+    Depending on the direction they must implement the corresponding dispatch methods.
+    """
+
     direction: str
 
-    @abstractmethod
+    @abc.abstractmethod
     def discover(self) -> Any:
         ...
 
-    @abstractmethod
+    @abc.abstractmethod
     def register(self, *args, **kwargs) -> Any:
         ...
 
-    @abstractmethod
-    def lifecycle(self, action: str) -> Any:
+    @abc.abstractmethod
+    def lifecycle(self, *args, **kwargs) -> Any:
         ...
 
-    @abstractmethod
-    def audit_hook(self, event: Any) -> Any:
+    @abc.abstractmethod
+    def audit_hook(self, event: "AuditEvent") -> Any:
         ...
 
-    @abstractmethod
+    @abc.abstractmethod
     def unregister(self) -> Any:
         ...
 
-    # Optional methods overridden based on direction
-    def dispatch_inbound(self, agent_id: str, task: Any, scope: Any) -> Any:
-        raise NotImplementedError("dispatch_inbound not implemented")
+    def dispatch_inbound(self, agent_id: str, task: Dict[str, Any], scope: str) -> Any:
+        raise NotImplementedError("Inbound dispatch not implemented for this plugin")
 
-    def dispatch_outbound(self, agent_id: str, action: Any, scope: Any) -> Any:
-        raise NotImplementedError("dispatch_outbound not implemented")
+    def dispatch_outbound(self, agent_id: str, action: Dict[str, Any], scope: str) -> Any:
+        raise NotImplementedError("Outbound dispatch not implemented for this plugin")
 
 # Legacy alias
 AgentPlugin = SalucaPlugin
