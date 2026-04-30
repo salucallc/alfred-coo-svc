@@ -1,18 +1,42 @@
 import pytest
-import yaml
-from saluca_plugin_sdk.manifest_validator import validate_external_agent, validate_external_surface, ValidationError
+from saluca_plugin_sdk.manifest_validator import validate_manifest
 
-def load_yaml(path):
-    with open(path) as f:
-        return yaml.safe_load(f)
+valid_agent = {
+    "kind": "ExternalAgent",
+    "agent_id": "agent123",
+    "capabilities": ["read", "write"],
+    "scope": "global",
+}
+
+invalid_agent = {
+    "kind": "ExternalAgent",
+    "agent_id": "agent123",
+    "capabilities": ["read"],
+    "scope": "unknown",
+}
+
+valid_surface = {
+    "kind": "ExternalSurface",
+    "surface_id": "surf456",
+    "description": "test surface",
+    "scope": "local",
+}
+
+invalid_surface = {
+    "kind": "ExternalSurface",
+    "surface_id": "surf456",
+    "description": "test",
+    "scope": "bad",
+}
+
 
 def test_valid_manifests():
-    agent = load_yaml("plugins/saluca-plugin-sdk/tests/fixtures/external_agent_manifest.yaml")
-    surface = load_yaml("plugins/saluca-plugin-sdk/tests/fixtures/external_surface_manifest.yaml")
-    assert validate_external_agent(agent)
-    assert validate_external_surface(surface)
+    assert validate_manifest(valid_agent) == []
+    assert validate_manifest(valid_surface) == []
 
-def test_invalid_manifest():
-    bad = {"kind": "ExternalAgent", "agent_id": 123}
-    with pytest.raises(ValidationError):
-        validate_external_agent(bad)
+
+def test_invalid_manifests():
+    errors = validate_manifest(invalid_agent)
+    assert any("invalid scope enum" in e for e in errors)
+    errors2 = validate_manifest(invalid_surface)
+    assert any("invalid scope enum" in e for e in errors2)

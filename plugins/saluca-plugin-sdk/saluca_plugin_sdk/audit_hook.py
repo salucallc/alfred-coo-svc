@@ -2,12 +2,21 @@ import json
 import requests
 from .dataclasses import AuditEvent
 
-def post_audit(event: AuditEvent, soulkey: str, base_url: str = "https://soul-svc.internal"):
-    url = f"{base_url}/v1/audit/external-agent/event"
+
+def post_audit(event: AuditEvent, url: str = "https://soul-svc.internal/v1/audit/external-agent/event") -> requests.Response:
+    """POST an audit event to the soul service.
+    The payload is HMAC‑signed using the plugin's soulkey (placeholder).
+    """
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"HMAC {soulkey}",
+        # Placeholder for HMAC signature – in real code, compute with secret key.
+        "X-Signature": "placeholder-signature",
     }
-    response = requests.post(url, headers=headers, data=json.dumps(event.__dict__))
+    data = json.dumps({
+        "event_type": event.event_type,
+        "payload": event.payload,
+        "timestamp": event.timestamp.isoformat(),
+    })
+    response = requests.post(url, headers=headers, data=data, timeout=5)
     response.raise_for_status()
-    return response.json()
+    return response

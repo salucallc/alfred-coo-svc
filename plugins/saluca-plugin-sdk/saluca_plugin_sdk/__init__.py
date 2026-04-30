@@ -1,5 +1,5 @@
-"""
-Saluca Plugin SDK
+"""Top-level package for saluca-plugin-sdk.
+Provides the SalucaPlugin abstract base class and related dataclasses.
 """
 
 from .agent_plugin import SalucaPlugin, AgentPlugin

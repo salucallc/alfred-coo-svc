@@ -1,5 +1,4 @@
 kind: ExternalSurface
-surface_id: "surface-abc"
-scope: "global"
-config:
-  param: "value"
+surface_id: test-surface
+description: test surface
+scope: local

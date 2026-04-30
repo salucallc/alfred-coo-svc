@@ -1,7 +1,6 @@
 kind: ExternalAgent
-agent_id: "agent-123"
+agent_id: test-agent
 capabilities:
-  - "read"
-  - "write"
-metadata:
-  owner: "team"
+  - read
+  - write
+scope: global

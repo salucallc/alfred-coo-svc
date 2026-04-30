@@ -1,16 +1,24 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "saluca-plugin-sdk"
 version = "0.1.0"
 description = "Saluca plugin SDK"
-license = {text = "PolyForm-Noncommercial-1.0.0"}
-authors = [{name = "Saluca LLC"}]
 readme = "README.md"
+license = {text = "PolyForm-Noncommercial-1.0.0"}
+authors = [{name = "Saluca LLC", email = "dev@saluca.com"}]
 requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+]
 dependencies = []
 
 [project.urls]
-"Homepage" = "https://github.com/salucallc/alfred-coo-svc"
+Homepage = "https://github.com/salucallc/saluca-plugin-sdk"
+
+[tool.setuptools.packages.find]
+where = ["saluca_plugin_sdk"]
