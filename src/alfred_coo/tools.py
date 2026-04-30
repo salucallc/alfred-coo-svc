@@ -707,6 +707,22 @@ _VALID_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
 _ALLOWED_ORGS = frozenset({"salucallc", "saluca-labs", "cristianxruvalcaba-coder"})
 
 
+#: SAL-3741: pin the git binary to an absolute path so propose_pr /
+#: update_pr never trip the FileNotFoundError-on-'git' bug observed
+#: 2026-04-30 across SAL-3594/3595/3596/3548/3571 wave-2 dispatches.
+#: Symptom: asyncio.create_subprocess_exec with cmd=[_GIT_BIN, ...] raised
+#: FileNotFoundError mid-session even though /usr/bin/git existed and
+#: PATH was set in env. The model misinterpreted the error as "lacks
+#: git binary" and called linear_create_issue → ESCALATED → wave-gate
+#: mass-excused crash. Earlier dispatches (SAL-3613/3614/3615) shipped
+#: PRs fine, so the issue is environmental drift, not a permanent gap.
+#: Pinning the absolute path bypasses PATH lookup entirely.
+#:
+#: Override via the ``ALFRED_GIT_BIN`` env var if the daemon runs on a
+#: host where git lives elsewhere (e.g. /usr/local/bin/git on macOS).
+_GIT_BIN = os.environ.get("ALFRED_GIT_BIN") or "/usr/bin/git"
+
+
 def _git_env() -> Dict[str, str]:
     """Environment for git subprocess calls — identity + token-embedded URL support."""
     env = os.environ.copy()
@@ -714,6 +730,11 @@ def _git_env() -> Dict[str, str]:
     env.setdefault("GIT_AUTHOR_EMAIL", "alfred-coo@saluca.com")
     env.setdefault("GIT_COMMITTER_NAME", "Alfred COO Daemon")
     env.setdefault("GIT_COMMITTER_EMAIL", "alfred-coo@saluca.com")
+    # SAL-3741: if PATH is somehow missing from os.environ at runtime
+    # (which shouldn't happen but did empirically — see _GIT_BIN comment),
+    # ensure git's directory is on the env PATH as a defensive belt.
+    if "PATH" not in env or "/usr/bin" not in env.get("PATH", ""):
+        env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
     return env
 
 
@@ -803,14 +824,14 @@ async def propose_pr(
     env = _git_env()
 
     rc, out, err = await _run(
-        ["git", "clone", "--depth", "50", "--branch", base_branch, clone_url, str(workspace)],
+        [_GIT_BIN, "clone", "--depth", "50", "--branch", base_branch, clone_url, str(workspace)],
         env=env,
     )
     if rc != 0:
         return {"error": "git clone failed", "stderr": err[:500]}
 
     rc, _, err = await _run(
-        ["git", "checkout", "-B", branch], cwd=workspace, env=env,
+        [_GIT_BIN, "checkout", "-B", branch], cwd=workspace, env=env,
     )
     if rc != 0:
         return {"error": "git checkout -B failed", "stderr": err[:500]}
@@ -824,19 +845,19 @@ async def propose_pr(
         target.write_text(content, encoding="utf-8", newline="\n")
         written.append(rel_path)
 
-    rc, _, err = await _run(["git", "add", *written], cwd=workspace, env=env)
+    rc, _, err = await _run([_GIT_BIN, "add", *written], cwd=workspace, env=env)
     if rc != 0:
         return {"error": "git add failed", "stderr": err[:500]}
 
     msg = commit_message or f"{title}\n\nAuthored by Alfred COO daemon."
     rc, _, err = await _run(
-        ["git", "commit", "-m", msg], cwd=workspace, env=env,
+        [_GIT_BIN, "commit", "-m", msg], cwd=workspace, env=env,
     )
     if rc != 0:
         return {"error": "git commit failed", "stderr": err[:500]}
 
     rc, _, err = await _run(
-        ["git", "push", "-u", "origin", branch], cwd=workspace, env=env,
+        [_GIT_BIN, "push", "-u", "origin", branch], cwd=workspace, env=env,
     )
     if rc != 0:
         return {"error": "git push failed", "stderr": err[:500]}
@@ -1042,14 +1063,14 @@ async def update_pr(
     env = _git_env()
 
     rc, _, err = await _run(
-        ["git", "clone", "--no-checkout", "--filter=blob:none", clone_url, str(workspace)],
+        [_GIT_BIN, "clone", "--no-checkout", "--filter=blob:none", clone_url, str(workspace)],
         env=env,
     )
     if rc != 0:
         return {"error": "git clone failed", "stderr": err[:500]}
 
     rc, _, err = await _run(
-        ["git", "fetch", "origin", branch], cwd=workspace, env=env,
+        [_GIT_BIN, "fetch", "origin", branch], cwd=workspace, env=env,
     )
     if rc != 0:
         return {
@@ -1058,7 +1079,7 @@ async def update_pr(
         }
 
     rc, _, err = await _run(
-        ["git", "checkout", "-B", branch, f"origin/{branch}"],
+        [_GIT_BIN, "checkout", "-B", branch, f"origin/{branch}"],
         cwd=workspace, env=env,
     )
     if rc != 0:
@@ -1076,12 +1097,12 @@ async def update_pr(
         target.write_text(content, encoding="utf-8", newline="\n")
         written.append(rel_path)
 
-    rc, _, err = await _run(["git", "add", *written], cwd=workspace, env=env)
+    rc, _, err = await _run([_GIT_BIN, "add", *written], cwd=workspace, env=env)
     if rc != 0:
         return {"error": "git add failed", "stderr": err[:500]}
 
     rc, _, err = await _run(
-        ["git", "commit", "-m", commit_message], cwd=workspace, env=env,
+        [_GIT_BIN, "commit", "-m", commit_message], cwd=workspace, env=env,
     )
     if rc != 0:
         # "nothing to commit" is a distinct failure — the caller passed files
@@ -1090,9 +1111,9 @@ async def update_pr(
         # can adjust.
         return {"error": "git commit failed", "stderr": err[:500]}
 
-    push_cmd = ["git", "push", "origin", branch]
+    push_cmd = [_GIT_BIN, "push", "origin", branch]
     if force_push:
-        push_cmd = ["git", "push", "--force-with-lease", "origin", branch]
+        push_cmd = [_GIT_BIN, "push", "--force-with-lease", "origin", branch]
     rc, _, err = await _run(push_cmd, cwd=workspace, env=env)
     if rc != 0:
         hint = (
@@ -1108,7 +1129,7 @@ async def update_pr(
 
     # Capture the pushed sha for the return envelope.
     rc, sha_out, err = await _run(
-        ["git", "rev-parse", "HEAD"], cwd=workspace, env=env,
+        [_GIT_BIN, "rev-parse", "HEAD"], cwd=workspace, env=env,
     )
     pushed_sha = (sha_out or "").strip()
     if rc != 0 or not pushed_sha:

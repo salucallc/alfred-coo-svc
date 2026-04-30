@@ -1453,10 +1453,10 @@ async def test_update_pr_pushes_to_existing_branch(monkeypatch, tmp_path):
         calls.append(list(cmd))
         # Simulate a real clone by creating the workspace directory so
         # subsequent file writes succeed.
-        if cmd[:2] == ["git", "clone"]:
+        if cmd[1:2] == ["clone"]:
             import pathlib
             pathlib.Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
-        if cmd[:2] == ["git", "rev-parse"]:
+        if cmd[1:2] == ["rev-parse"]:
             return 0, "deadbeefcafefeed1234\n", ""
         return 0, "", ""
     monkeypatch.setattr(t, "_run", _fake_run)
@@ -1475,7 +1475,11 @@ async def test_update_pr_pushes_to_existing_branch(monkeypatch, tmp_path):
     assert result["pr_number"] == 59
     assert result["commit_url"].endswith("/commit/deadbeefcafefeed1234")
 
-    cmd_strs = [" ".join(c) for c in calls]
+    # SAL-3741: _GIT_BIN now resolves to /usr/bin/git absolute path so
+    # PATH lookup is bypassed mid-session. Strip it for assertion clarity.
+    def _strip(c):
+        return c.replace("/usr/bin/git ", "git ", 1)
+    cmd_strs = [_strip(" ".join(c)) for c in calls]
     joined = " | ".join(cmd_strs)
     assert any(c.startswith("git clone") for c in cmd_strs), joined
     assert any(
@@ -1550,11 +1554,11 @@ async def test_update_pr_rejects_missing_branch(monkeypatch, tmp_path):
     monkeypatch.setattr(t.urllib.request, "urlopen", _fake_urlopen)
 
     async def _fake_run(cmd, cwd=None, env=None):
-        if cmd[:2] == ["git", "clone"]:
+        if cmd[1:2] == ["clone"]:
             import pathlib
             pathlib.Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
             return 0, "", ""
-        if cmd[:2] == ["git", "fetch"]:
+        if cmd[1:2] == ["fetch"]:
             return 1, "", (
                 "fatal: couldn't find remote ref feature/sal-2615-x"
             )
