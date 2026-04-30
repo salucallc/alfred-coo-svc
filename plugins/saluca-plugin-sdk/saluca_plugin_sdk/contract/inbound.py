@@ -1,1 +1,2 @@
-# Placeholder for inbound contract definitions used by the test suite.\n# The actual contract validation is performed by the SDK test runner.\n
+# Define contract interfaces for inbound plugins.
+# In a real implementation this would contain type hints and validation.

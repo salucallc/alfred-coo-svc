@@ -1,1 +1,5 @@
-name: saluca-plugin-echo-inbound\nversion: 0.1.0\ndirection: inbound\nentry_point: saluca_plugin_echo_inbound.plugin:EchoInboundPlugin\n
+name: saluca-plugin-echo-inbound
+version: 0.1.0
+description: Inbound echo plugin for Saluca.
+author: Saluca LLC <dev@saluca.com>
+direction: inbound
