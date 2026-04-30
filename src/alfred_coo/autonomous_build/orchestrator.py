@@ -283,7 +283,18 @@ DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 # AB-08: hard cap on REQUEST_CHANGES → respawn cycles. Tickets that blow the
 # cap are marked FAILED; the wave gate's existing critical-path + soft-green
 # logic handles the rest.
-MAX_REVIEW_CYCLES = 3
+#
+# Gate F (2026-04-30, post-Phase-2 wave-2 review pattern audit): lowered
+# from 3 → 2. Real-world data from soul-svc PR #66 (SAL-3569) showed
+# Hawkman REQUEST_CHANGES with the same gate failures across cycles 1, 2,
+# and 3 — fix-rounds were not actually addressing the prior feedback.
+# Each extra cycle costs ~30-90 minutes of pipeline time + budget for
+# zero net progress. With Gate A (APE/V byte-equal pre-flight) + the
+# 4-tool persona prompt + worked example, cycle-1 reject rate should
+# drop materially; the remaining cycles should be on harder-to-fix
+# substantive issues where 2 attempts is enough to either land the fix
+# or surface that human review is needed.
+MAX_REVIEW_CYCLES = 2
 
 # AB-08: compiled regexes for verdict extraction. Safety-net only — the
 # explicit pr_review tool-call path (see _extract_verdict) has higher

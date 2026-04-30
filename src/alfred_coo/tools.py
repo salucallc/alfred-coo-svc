@@ -649,6 +649,73 @@ def _fetch_linear_acceptance_criteria(
     return _extract_acceptance_lines(description)
 
 
+def _gate_a_apev_byte_match(
+    body: Optional[str],
+    *,
+    branch: Optional[str] = None,
+    title: Optional[str] = None,
+    pr_url: Optional[str] = None,
+    files: Optional[Mapping[str, str]] = None,
+    linear_fetcher: Optional[Callable[[Optional[str]], Optional[str]]] = None,
+) -> Optional[str]:
+    """Gate A (autonomy): verify the Linear ticket's APE/V acceptance
+    section appears byte-for-byte in the PR body.
+
+    Hawkman GATE 1 does a verbatim substring match against the Linear
+    ticket body's ``## APE/V Acceptance (machine-checkable)`` section.
+    The auto-inject in ``_maybe_inject_apev_citation`` only fires when
+    the *heading* is absent — paraphrased headings like
+    ``## APE/V Citation`` or ``## Acceptance criteria`` skip the inject
+    AND fail Hawkman GATE 1 → REQUEST_CHANGES → wasted cycle.
+
+    This gate runs AFTER auto-inject and BEFORE the GitHub API call.
+    Returns ``None`` to pass, or a string error to abort propose_pr.
+
+    Fail-open conditions (gate is silent, returns None):
+      - No ticket code parseable from branch/title/pr_url/body
+      - Linear API key unset (fetcher returns None)
+      - Linear has no acceptance section for this ticket
+      - Network glitch fetching from Linear
+
+    These all reduce to "we couldn't fetch canonical text", which is
+    not the same as "builder shipped wrong text". Better to ship a PR
+    and let Hawkman do the deeper check than to block on infra.
+    """
+    if not body:
+        return (
+            "GATE_A_APEV_EMPTY_BODY: PR body is empty; "
+            "Hawkman GATE 1 will REQUEST_CHANGES."
+        )
+    ticket_code = _extract_ticket_code(branch, title, pr_url, body)
+    if not ticket_code:
+        return None  # fail-open: can't identify the ticket
+    fetcher = linear_fetcher or _fetch_linear_acceptance_criteria
+    canonical = fetcher(ticket_code)
+    if not canonical:
+        return None  # fail-open: no canonical source
+    canonical = canonical.strip()
+    if not canonical:
+        return None
+    if canonical in body:
+        return None  # PASS: byte-substring present
+    # Try a slightly looser comparison: collapse runs of whitespace.
+    # Hawkman's actual regex tolerates trailing-whitespace normalisation
+    # but not bullet rewrites or word reordering, so this is a small
+    # safety margin — not a substitute for verbatim copy.
+    canon_normal = re.sub(r"[ \t]+\n", "\n", canonical).strip()
+    body_normal = re.sub(r"[ \t]+\n", "\n", body)
+    if canon_normal and canon_normal in body_normal:
+        return None
+    preview = canonical[:400] + ("..." if len(canonical) > 400 else "")
+    return (
+        f"GATE_A_APEV_NOT_VERBATIM: the canonical Linear acceptance "
+        f"section for {ticket_code} is not present byte-for-byte in the "
+        f"PR body. Hawkman GATE 1 will REQUEST_CHANGES. Re-emit the PR "
+        f"body with a `## APE/V Acceptance (machine-checkable)` section "
+        f"containing exactly:\n\n{preview}"
+    )
+
+
 def _maybe_inject_apev_citation(
     body: Optional[str],
     *,
@@ -873,6 +940,17 @@ async def propose_pr(
     body = _maybe_inject_apev_citation(
         body, files=files, branch=branch, title=title
     )
+
+    # Gate A (autonomy gate): verify the canonical Linear APE/V section
+    # is byte-equal in the PR body. Auto-inject above only fires when
+    # the heading is *absent*; paraphrased headings escape it AND fail
+    # Hawkman GATE 1. Catching here saves a full review cycle per PR.
+    # Fail-open on infra issues — see _gate_a_apev_byte_match.
+    gate_a_err = _gate_a_apev_byte_match(
+        body, branch=branch, title=title, files=files,
+    )
+    if gate_a_err:
+        return {"error": gate_a_err}
 
     # Open the PR via GitHub REST API (avoids gh CLI, which needs a writable
     # $HOME for its config — the daemon runs with systemd ProtectHome=true).
@@ -1151,6 +1229,16 @@ async def update_pr(
                 pr_url=pr_url,
                 is_fix_round=True,
             )
+            # Gate A on update_pr: the fix-round MUST still carry a
+            # byte-equal APE/V citation. update_pr is allowed to skip
+            # auto-inject (so the builder owns the body on respawn) but
+            # MUST NOT lose the citation between rounds — that's exactly
+            # the cycle-3-still-missing pattern from soul-svc PR #66.
+            gate_a_err = _gate_a_apev_byte_match(
+                body, branch=branch, title=title, pr_url=pr_url,
+            )
+            if gate_a_err:
+                return {"error": gate_a_err}
 
         patch_payload: Dict[str, Any] = {}
         if title is not None:
