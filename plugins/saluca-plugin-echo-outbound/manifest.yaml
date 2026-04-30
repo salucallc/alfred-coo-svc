@@ -1,0 +1,6 @@
+name: saluca-plugin-echo-outbound
+version: 0.1.0
+description: Outbound echo plugin for Saluca.
+direction: outbound
+outbound_actions:
+  - echo.send
