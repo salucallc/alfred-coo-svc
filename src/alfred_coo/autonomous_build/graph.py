@@ -405,8 +405,14 @@ _TARGET_BLOCK_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
-# Recognise ``key: value`` lines in the target block.
-_TARGET_KV_RE = re.compile(r"^\s*(?P<key>[a-zA-Z_]+)\s*:\s*(?P<val>.*?)\s*$")
+# Recognise ``key: value`` lines in the target block. SAL-3740: allow an
+# optional parenthetical between the key and the colon — the path-fix sub
+# emitted lines like ``new_paths (you will CREATE all of these — ...):``
+# which broke the strict ``key:`` form and silently dropped 13 of 14
+# wave-2 tickets into NO_HINT, mass-crashing four Phase 2 kickoffs.
+_TARGET_KV_RE = re.compile(
+    r"^\s*(?P<key>[a-zA-Z_]+)(?:\s*\([^)]*\))?\s*:\s*(?P<val>.*?)\s*$"
+)
 
 # Recognise list items under ``paths:`` / ``new_paths:`` (``  - some/path``
 # or ``* some/path``). Linear's markdown renderer round-trips bullets

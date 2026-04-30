@@ -3066,10 +3066,9 @@ _TargetHintResolver = Callable[[Ticket], Optional["TargetHint"]]
 
 def _resolve_via_body(ticket: Ticket) -> Optional["TargetHint"]:
     """Tier 1: parse the ticket's Linear body for a ``## Target`` block."""
+    body = getattr(ticket, "body", "") or ""
     try:
-        parsed = _parse_target_from_ticket_body(
-            getattr(ticket, "body", "") or "",
-        )
+        parsed = _parse_target_from_ticket_body(body)
     except Exception:
         logger.exception(
             "_parse_target_from_ticket_body crashed for %s; "
@@ -3078,6 +3077,22 @@ def _resolve_via_body(ticket: Ticket) -> Optional["TargetHint"]:
         )
         return None
     if parsed is None:
+        # SAL-3740: surface the silent-parse-fail case so format drift in
+        # ticket bodies (e.g. `new_paths (prose):` instead of
+        # `new_paths:`) is visible at INFO level instead of being masked
+        # by the registry/NO_HINT fallback. Only log when the body
+        # actually had a Target heading — otherwise the missing-block
+        # case (no Target heading at all) is the legitimate "fall to
+        # registry" path and shouldn't spam the log.
+        if body and re.search(r"(?im)^\#\#\s*Target\s*$", body):
+            logger.warning(
+                "[hint-parse] %s has a ## Target block but the parser "
+                "returned None; falling back to registry. Check the "
+                "block for format drift (canonical keys: owner, repo, "
+                "paths, new_paths, base_branch, branch_hint, notes; "
+                "list items must be `- item` or `* item`).",
+                getattr(ticket, "identifier", "?"),
+            )
         return None
     try:
         return TargetHint(**parsed)
