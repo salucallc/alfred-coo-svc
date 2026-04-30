@@ -3790,6 +3790,24 @@ class AutonomousBuildOrchestrator:
             # tick lets us break the moment in-flight drains.
             await self._check_cancel_signal()
 
+            # SAL-2893 · orphan-active reconcile BEFORE in_flight is
+            # computed so a daemon restart that inherited Linear-active
+            # tickets from a prior crashed run doesn't burn a full
+            # cadence cycle (or worse, ``STUCK_CHILD_FORCE_FAIL_SEC``)
+            # before the wave can dispatch. The reconcile runs again
+            # inside ``_poll_children`` for in-process orphans (e.g.
+            # mid-tick child id mutation races), so we don't lose
+            # coverage by hoisting the call. Best-effort: a transport
+            # failure inside the helper is logged + falls back to the
+            # legacy 30-min window without raising.
+            try:
+                await self._reconcile_orphan_active()
+            except Exception:
+                logger.exception(
+                    "SAL-2893 pre-tick orphan-active reconcile crashed; "
+                    "continuing — _poll_children will retry"
+                )
+
             # ── select ready ────────────────────────────────────────────
             in_flight = self._in_flight_for_wave(wave_n)
             ready = self._select_ready(wave_tickets, in_flight)
@@ -4647,6 +4665,58 @@ class AutonomousBuildOrchestrator:
 
     # ── child polling + state transitions ───────────────────────────────────
 
+    async def _fetch_active_mesh_titles(self) -> Optional[List[str]]:
+        """SAL-2893 · best-effort fetch of currently-active mesh task titles.
+
+        Used by ``_reconcile_orphan_active`` to verify whether a ticket
+        with Linear-status active but no in-process ``child_task_id``
+        actually has a live mesh builder behind it. Pulls the
+        ``claimed`` + ``pending`` lifecycles (i.e. anything still doing
+        work) and returns the union of titles. ``completed``/``failed``
+        are intentionally excluded — those tasks are terminal and prove
+        the orphan is dead, not alive.
+
+        Returns ``None`` on transport failure so callers can fall back
+        to the legacy 30-min stuck-for window rather than blindly
+        force-resetting an orphan whose live status we couldn't verify.
+        """
+        titles: List[str] = []
+        for status in ("claimed", "pending"):
+            try:
+                tasks = await self.mesh.list_tasks(status=status, limit=200)
+            except Exception:
+                logger.exception(
+                    "SAL-2893: mesh.list_tasks(%s) failed during "
+                    "orphan-active reconcile; falling back to legacy "
+                    "stuck-for window",
+                    status,
+                )
+                return None
+            for t in tasks or []:
+                if isinstance(t, dict):
+                    title = t.get("title") or ""
+                    if title:
+                        titles.append(title)
+        return titles
+
+    @staticmethod
+    def _ticket_has_live_mesh_task(
+        ticket: Ticket, active_mesh_titles: List[str],
+    ) -> bool:
+        """Return True if any active mesh-task title carries this ticket's
+        identifier (e.g. ``[wave-1] [ops] SAL-3566 OPS-14 — ...``).
+
+        Substring match — child task titles always embed
+        ``ticket.identifier`` verbatim per ``_child_task_title``.
+        """
+        if not ticket.identifier:
+            return False
+        ident = ticket.identifier
+        for title in active_mesh_titles:
+            if ident in title:
+                return True
+        return False
+
     async def _reconcile_orphan_active(self) -> List[Ticket]:
         """AB-17-y · force-fail tickets stuck in active state with no
         ``child_task_id``.
@@ -4663,11 +4733,27 @@ class AutonomousBuildOrchestrator:
         all 91 soul checkpoints. Watchdog reported ``in_flight=1
         ready=0`` for 70+ minutes.
 
-        Force-fails any active-state ticket whose
-        ``_ticket_transition_ts`` (last status-change clock) is older
-        than ``STUCK_CHILD_FORCE_FAIL_SEC``. Sub-threshold orphans are
-        intentionally tolerated so the dispatch loop has a chance to
-        re-attach a child via ``_dispatch_child`` on the next tick.
+        SAL-2893 (2026-04-30): the legacy implementation force-failed
+        orphan-active tickets only after ``STUCK_CHILD_FORCE_FAIL_SEC``
+        (30 min) had elapsed since the last status transition. That
+        threshold defended against false-positives from the in-process
+        race where ``_dispatch_child`` was mid-flight, but it also kept
+        cross-kickoff zombies stuck for the full 30 min on every restart.
+        Reproduction tonight (2026-04-30 ~01:35 UTC, federation kickoff
+        ad345ebb): SAL-3566/3567/3568 carried over Linear "In Progress"
+        from a prior crashed run, the new orchestrator counted them as
+        ``in_flight=3`` and refused wave-1 dispatch for 16+ minutes
+        until manual Linear flip-back to Backlog.
+
+        New behaviour: query the live mesh state once per tick. If NO
+        ``claimed`` + ``pending`` mesh task title contains the ticket
+        identifier, the orphan is provably dead → reconcile this tick
+        without waiting on the 30-min window. If a live mesh task IS
+        found (we lost the child_task_id but the builder is genuinely
+        running) the legacy 30-min behaviour applies. If the mesh
+        query fails entirely, we fall back to the legacy window so a
+        transient transport blip doesn't stampede every active ticket
+        into FAILED.
 
         Returns the list of tickets force-failed this tick (empty if
         none) so the caller can roll them into ``_poll_children``'s
@@ -4675,6 +4761,10 @@ class AutonomousBuildOrchestrator:
         """
         now = time.time()
         forced: List[Ticket] = []
+
+        # SAL-2893: inventory orphan candidates first so we only pay the
+        # mesh.list_tasks round-trip when we have something to verify.
+        candidates: List[Ticket] = []
         for ticket in self.graph.nodes.values():
             if ticket.status not in ACTIVE_TICKET_STATES:
                 continue
@@ -4682,17 +4772,49 @@ class AutonomousBuildOrchestrator:
                 # Has a child id — AB-17-x's loop will handle it. We
                 # only want to catch the orphan-active class here.
                 continue
+            candidates.append(ticket)
+
+        if not candidates:
+            return forced
+
+        active_titles = await self._fetch_active_mesh_titles()
+
+        for ticket in candidates:
             entered_ts = self._ticket_transition_ts.get(ticket.id)
             stuck_for = (now - entered_ts) if entered_ts else 0.0
-            if stuck_for <= STUCK_CHILD_FORCE_FAIL_SEC:
-                # Recently restored / freshly transitioned — give the
-                # dispatch loop a chance to re-attach a child task.
-                continue
-            logger.warning(
-                "AB-17-y: orphan-active %s (%s) — no child_task_id "
-                "for %.0fs; force-failing",
-                ticket.identifier, ticket.status.value, stuck_for,
+
+            # SAL-2893: mesh-state shortcut. Skip the 30-min window
+            # entirely when we can prove no live builder is associated
+            # with this ticket. Only applies when the mesh query
+            # succeeded; on transport failure ``active_titles is None``
+            # we fall back to the legacy window unchanged.
+            mesh_proven_dead = (
+                active_titles is not None
+                and not self._ticket_has_live_mesh_task(ticket, active_titles)
             )
+
+            if not mesh_proven_dead and stuck_for <= STUCK_CHILD_FORCE_FAIL_SEC:
+                # Either (a) mesh has a live task carrying our identifier
+                # (lost child_task_id but builder still running — give
+                # AB-17-x's hard-timeout 30-min window a chance to act)
+                # or (b) we couldn't verify mesh state at all (transport
+                # blip — keep the safe legacy threshold). Either way, no
+                # action this tick.
+                continue
+
+            if mesh_proven_dead and stuck_for <= STUCK_CHILD_FORCE_FAIL_SEC:
+                logger.warning(
+                    "[reconcile] reset %s (%s) from Linear-active "
+                    "(no active mesh task; stuck_for=%.0fs)",
+                    ticket.identifier, ticket.status.value, stuck_for,
+                )
+            else:
+                logger.warning(
+                    "AB-17-y: orphan-active %s (%s) — no child_task_id "
+                    "for %.0fs; force-failing",
+                    ticket.identifier, ticket.status.value, stuck_for,
+                )
+
             ticket.status = TicketStatus.FAILED
             # SAL-2870 phantom-child carve-out (2026-04-26): tag the
             # failure so the retry sweep routes this STRAIGHT to PENDING.
@@ -4708,6 +4830,10 @@ class AutonomousBuildOrchestrator:
                     f"no_child_task_id: ticket in active status with "
                     f"no dispatched_child_tasks entry for "
                     f"{int(stuck_for)}s"
+                    + (
+                        " (mesh-state confirmed no live builder)"
+                        if mesh_proven_dead else ""
+                    )
                 ),
             )
             await self._update_linear_state(ticket, "Backlog")
