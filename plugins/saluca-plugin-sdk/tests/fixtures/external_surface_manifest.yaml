@@ -1,0 +1,4 @@
+kind: ExternalSurface
+surface_id: test-surface
+description: test surface
+scope: local

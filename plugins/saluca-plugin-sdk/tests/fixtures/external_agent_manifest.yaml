@@ -1,0 +1,6 @@
+kind: ExternalAgent
+agent_id: test-agent
+capabilities:
+  - read
+  - write
+scope: global
