@@ -34,6 +34,7 @@ from alfred_coo.autonomous_build.orchestrator import (
     _VERDICT_REQUEST_CHANGES_RE,
     _render_target_block,
 )
+from alfred_coo.autonomous_build.state import OrchestratorState
 
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -527,6 +528,134 @@ def test_extract_pr_url_from_summary():
     result = {"summary": "opened https://github.com/salucallc/foo/pull/42 today"}
     url = AutonomousBuildOrchestrator._extract_pr_url(result)
     assert url == "https://github.com/salucallc/foo/pull/42"
+
+
+# ── SAL-3807 wave-retry kickoff ─────────────────────────────────────────────
+
+
+def test_parse_payload_wave_retry_budget_default():
+    """SAL-3807: wave_retry_budget defaults to 2 (3 total attempts)."""
+    orch = _mk_orchestrator(kickoff_desc={"linear_project_id": "p1"})
+    orch._parse_payload()
+    assert orch.wave_retry_budget == 2
+
+
+def test_parse_payload_wave_retry_budget_override():
+    """SAL-3807: explicit wave_retry_budget override accepted."""
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1", "wave_retry_budget": 5,
+    })
+    orch._parse_payload()
+    assert orch.wave_retry_budget == 5
+
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1", "wave_retry_budget": 0,
+    })
+    orch._parse_payload()
+    assert orch.wave_retry_budget == 0
+
+
+def test_parse_payload_wave_retry_budget_clamps_negative_to_zero():
+    """SAL-3807: negative budgets clamp to 0 (don't allow weird underflow)."""
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1", "wave_retry_budget": -5,
+    })
+    orch._parse_payload()
+    assert orch.wave_retry_budget == 0
+
+
+def test_parse_payload_wave_retry_budget_non_numeric_falls_back_to_default():
+    """SAL-3807: malformed values fall back to default 2."""
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1", "wave_retry_budget": "not-a-number",
+    })
+    orch._parse_payload()
+    assert orch.wave_retry_budget == 2
+
+
+def test_is_retriable_wave_fail_green_ratio_message():
+    """SAL-3807: wave below threshold (no critical-path) is retriable."""
+    exc = RuntimeError(
+        "wave 2 failed: green_ratio=0.00 < 0.50 and 3 non-critical failure(s)"
+    )
+    assert AutonomousBuildOrchestrator._is_retriable_wave_fail(exc) is True
+
+
+def test_is_retriable_wave_fail_critical_path_not_retriable():
+    """SAL-3807: critical-path failures are NOT retriable — retry won't help
+    if a blocker ticket needs human work."""
+    exc = RuntimeError(
+        "wave 1 has 1 critical-path failure(s): SAL-3567"
+    )
+    assert AutonomousBuildOrchestrator._is_retriable_wave_fail(exc) is False
+
+
+def test_is_retriable_wave_fail_zero_scoreable_not_retriable():
+    """SAL-3807: zero-scoreable means orchestrator state is corrupt or
+    grounding gap — retrying won't fix that."""
+    exc = RuntimeError(
+        "wave 2 failed: zero scoreable tickets (all REPO_MISSING-filtered)"
+    )
+    assert AutonomousBuildOrchestrator._is_retriable_wave_fail(exc) is False
+
+
+def test_is_retriable_wave_fail_unrelated_runtime_error_not_retriable():
+    """SAL-3807: defensive — random RuntimeError without green_ratio token
+    isn't tagged retriable."""
+    exc = RuntimeError("unrelated crash: kaboom")
+    assert AutonomousBuildOrchestrator._is_retriable_wave_fail(exc) is False
+
+
+@pytest.mark.asyncio
+async def test_schedule_wave_retry_kickoff_queues_with_decremented_budget():
+    """SAL-3807: when called, queues a new mesh task with budget-1 in
+    the payload and a [wave-retry budget=N] suffix on the title."""
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1", "wave_retry_budget": 3},
+        mesh=mesh,
+    )
+    orch._parse_payload()
+    orch.state = OrchestratorState(kickoff_task_id=orch.task_id)
+
+    exc = RuntimeError(
+        "wave 2 failed: green_ratio=0.00 < 0.50 and 4 non-critical failure(s)"
+    )
+    await orch._schedule_wave_retry_kickoff(2, exc)
+
+    # Exactly one fresh kickoff queued.
+    assert len(mesh.created) == 1
+    rec = mesh.created[0]
+    assert "[wave-retry budget=2]" in rec["title"]
+
+    # Payload carries the decremented budget + parent ref + reason.
+    payload = json.loads(rec["description"])
+    assert payload["wave_retry_budget"] == 2
+    assert payload["parent_kickoff_task_id"] == orch.task_id
+    assert payload["retry_for_wave"] == 2
+    assert "green_ratio=" in payload["retry_reason"]
+    # Original payload fields preserved (linear_project_id is the canary).
+    assert payload["linear_project_id"] == "p1"
+
+
+@pytest.mark.asyncio
+async def test_schedule_wave_retry_kickoff_records_state_event():
+    """SAL-3807: state event records budget_remaining + wave for telemetry."""
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={"linear_project_id": "p1", "wave_retry_budget": 1},
+        mesh=mesh,
+    )
+    orch._parse_payload()
+    orch.state = OrchestratorState(kickoff_task_id=orch.task_id)
+
+    await orch._schedule_wave_retry_kickoff(
+        3, RuntimeError("wave 3 failed: green_ratio=0.20 < 0.99 …"),
+    )
+
+    event_kinds = [e.kind for e in orch.state.events]
+    assert "wave_retry_scheduled" in event_kinds
+    assert "wave_retry_kickoff_queued" in event_kinds
 
 
 def test_extract_pr_url_from_tool_calls():
