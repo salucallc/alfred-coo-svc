@@ -6,7 +6,7 @@ comma-separated strings (friendlier for env files).
 """
 
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     log_format: str = "json"
     slack_bot_token: str = ""
     slack_batcave_channel: str = "C0ASAKFTR1C"
+    # Slack log forwarder (see src/alfred_coo/slack_log_handler.py). Opt-in:
+    # `setup_logging` only attaches the handler when a token resolves from
+    # SLACK_BOT_TOKEN_ALFRED / SLACK_BOT_TOKEN env. The channel default is
+    # #batcave; override via SLACK_LOG_CHANNEL_ID.
+    slack_log_bot_token: Optional[str] = None
+    slack_log_channel_id: str = "C0ASAKFTR1C"
     daily_budget_usd: float = 200.0
 
     model_config = SettingsConfigDict(
