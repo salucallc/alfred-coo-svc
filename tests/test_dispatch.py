@@ -1248,12 +1248,17 @@ def test_select_model_legacy_tag_still_works_for_unmapped_persona(monkeypatch, t
     persona = _MiniPersona("default")
     assert select_model(task, persona) == "qwen3-coder:480b-cloud"
 
+    # SAL-3787: tag:strategy used to hardcode-return deepseek-v3.2:cloud.
+    # Now routes through _resolve_safe_fallback; for an unmapped persona
+    # (no entry in _PERSONA_ROLE_MAP) the resolver returns the static
+    # safe default _SAFE_FALLBACK_DEFAULT = "gpt-oss:120b-cloud".
     task2 = {"title": "[persona:default] [tag:strategy] hello"}
-    assert select_model(task2, persona) == "deepseek-v3.2:cloud"
+    assert select_model(task2, persona) == "gpt-oss:120b-cloud"
 
-    # No tag, no registry, no preferred -> hard default
+    # No tag, no registry, no preferred -> safe-fallback default (was
+    # the deepseek hardcode pre-SAL-3787).
     persona_no_pref = _MiniPersona("default", preferred=None)
-    assert select_model({"title": "[persona:default] x"}, persona_no_pref) == "deepseek-v3.2:cloud"
+    assert select_model({"title": "[persona:default] x"}, persona_no_pref) == "gpt-oss:120b-cloud"
 
 
 def test_select_model_registry_fallback_to_persona_preferred(monkeypatch, tmp_path):
