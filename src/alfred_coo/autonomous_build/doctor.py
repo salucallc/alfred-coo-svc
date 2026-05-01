@@ -39,6 +39,15 @@ from typing import Any, Optional
 
 import httpx
 
+from .doctor_metrics import (
+    DEFAULT_BASELINE_WINDOW_SEC,
+    build_snapshot_from_doctor,
+    compute_baseline,
+    format_baseline_summary,
+    load_recent_snapshots,
+    metrics_path_from_env,
+    record_snapshot,
+)
 from .playbooks import DEFAULT_PLAYBOOKS, PlaybookResult
 
 
@@ -278,6 +287,7 @@ def format_slack_message(
     report: ScanReport,
     daemon_head: str = "",
     playbook_results: list[PlaybookResult] | None = None,
+    baseline_line: str = "",
 ) -> str:
     """Render a tight Slack digest of a scan report.
 
@@ -285,6 +295,11 @@ def format_slack_message(
     playbooks are silent and the surveillance scan finds nothing, the
     digest collapses to ``Substrate quiet.`` so the channel doesn't get
     noised up by every empty tick.
+
+    ``baseline_line`` is a Phase 3a optional one-liner (already
+    indented two spaces) showing baseline-soak progress or summary
+    percentiles. Always rendered when supplied so the operator can see
+    the metric stream is alive even on otherwise-quiet ticks.
     """
     duration_s = max(0.0, report.finished_at - report.started_at)
     started_iso = datetime.fromtimestamp(report.started_at, tz=timezone.utc).strftime("%H:%M:%SZ")
@@ -300,7 +315,13 @@ def format_slack_message(
 
     surveillance_silent = not report.counters and not report.grounding_gaps
     if surveillance_silent and not playbook_lines:
-        return f"{head_line}\nNo failure-class signals in window. Substrate quiet."
+        # Even on a quiet tick we want to show the baseline line if we
+        # have one, so the metric stream is visibly alive. Slack-tight
+        # form: head + quiet line + (optional) baseline line.
+        body = "No failure-class signals in window. Substrate quiet."
+        if baseline_line:
+            return f"{head_line}\n{body}\n{baseline_line}"
+        return f"{head_line}\n{body}"
 
     lines = [head_line]
     interesting_kinds = (
@@ -324,6 +345,8 @@ def format_slack_message(
     if playbook_lines:
         lines.append("  playbooks:")
         lines.extend(playbook_lines)
+    if baseline_line:
+        lines.append(baseline_line)
     return "\n".join(lines)
 
 
@@ -449,6 +472,36 @@ class AlfredDoctorOrchestrator:
         playbook_results = await self._run_playbooks(linear_key=linear_key)
         report.finished_at = time.time()
 
+        # Phase 3a: capture this tick's metric snapshot + compute the
+        # rolling-window baseline. Read-only — no corrective action yet
+        # (Phase 3b lifts the baseline-deviation signal into action).
+        # All I/O is best-effort, swallowed exceptions, never breaks the
+        # surveillance loop.
+        baseline_line = ""
+        try:
+            metrics_path = metrics_path_from_env()
+            snapshot = build_snapshot_from_doctor(
+                started_at=report.started_at,
+                finished_at=report.finished_at,
+                counters=report.counters,
+                grounding_gaps=report.grounding_gaps,
+                playbook_results=playbook_results,
+                daemon_head=os.getenv("ALFRED_COO_HEAD", "")[:12],
+            )
+            record_snapshot(snapshot, path=metrics_path)
+            recent = load_recent_snapshots(
+                path=metrics_path,
+                since_ts=time.time() - DEFAULT_BASELINE_WINDOW_SEC,
+            )
+            baseline = compute_baseline(recent)
+            baseline_line = format_baseline_summary(
+                baseline, n_snapshots=len(recent),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "doctor: metric snapshot/baseline failed; continuing",
+            )
+
         slack_token = (
             os.getenv("SLACK_BOT_TOKEN_ALFRED")
             or os.getenv("SLACK_BOT_TOKEN")
@@ -458,6 +511,7 @@ class AlfredDoctorOrchestrator:
             report,
             daemon_head=os.getenv("ALFRED_COO_HEAD", "")[:7],
             playbook_results=playbook_results,
+            baseline_line=baseline_line,
         )
         await post_to_slack(slack_token, self.slack_channel, message)
 
