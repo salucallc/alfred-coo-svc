@@ -34,7 +34,22 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/alfred-coo /var/lib/alfred-coo
+# ReadWritePaths required while ProtectSystem=strict makes the rest of the
+# filesystem read-only:
+# - /var/log/alfred-coo, /var/lib/alfred-coo  — daemon's own state dir
+#   (artifacts/, workspaces/, doctor_metrics.jsonl, gh-config/, etc.)
+# - /var/lib/alfred-coo/workspaces            — explicit nested entry kept
+#   for the orchestrator's per-ticket worktrees (the parent already covers
+#   it but earlier deploys had this verbatim)
+# - /opt/v7-dashboard/journey                 — Phase 2 doctor playbook
+#   `refresh_dashboard_next_gate` rewrites the v7 dashboard's
+#   ``## Next Gate`` paragraph from live state every tick. Without this
+#   the playbook fails with EROFS each tick (visible as
+#   `refresh_dashboard_next_gate: write failed: OSError: [Errno 30]
+#   Read-only file system` in the journal). The directory is
+#   chgrp'd to alfredcoo + chmod'd g+w on the Oracle host so the
+#   daemon can write to it under this hardening profile.
+ReadWritePaths=/var/log/alfred-coo /var/lib/alfred-coo /var/lib/alfred-coo/workspaces /opt/v7-dashboard/journey
 
 [Install]
 WantedBy=multi-user.target
