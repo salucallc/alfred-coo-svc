@@ -4893,7 +4893,7 @@ class AutonomousBuildOrchestrator:
         # attempt 0. Empty / default values are skipped so the legacy
         # body shape is unchanged for runs that don't touch model
         # routing.
-        routing_block = self._render_model_routing_block()
+        routing_block = self._render_model_routing_block(ticket=ticket)
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -4923,7 +4923,9 @@ class AutonomousBuildOrchestrator:
             f"Linear issue first.\n"
         )
 
-    def _render_model_routing_block(self) -> str:
+    def _render_model_routing_block(
+        self, ticket: Optional[Ticket] = None,
+    ) -> str:
         """Render the ``<!-- model_routing: {...} -->`` propagation block
         for child task bodies, or empty string when there's nothing to
         propagate.
@@ -4935,6 +4937,19 @@ class AutonomousBuildOrchestrator:
         ``gpt-oss:120b-cloud`` even when the operator pinned a different
         model on the parent kickoff (the bug this fix closes).
 
+        SAL-3793 (2026-05-01): on retry dispatches (``dispatch_attempts > 0``)
+        the kickoff's ``model_routing.builder`` override is replaced with
+        ``builder_fallback_chain[attempt % len(chain)]`` so the silent_with_tools
+        recovery loop actually rotates through the chain. Without this rotation
+        the operator's kickoff override pins the same model across every
+        attempt and silent loops never escape the failing model. Reproduced
+        2026-05-01 wave-3 retry-1 (kickoff 9e335979): kimi looped http_get
+        on attempt 0, retry-budget sweep flipped to PENDING, attempt 1
+        dispatched with kimi AGAIN because the kickoff override won the
+        precedence dance even though the orchestrator's chain pointer had
+        advanced. Attempt 0 still honours the kickoff override (the operator's
+        explicit per-run pin) — only retries fall through to the chain.
+
         The block is parsed by ``dispatch._peek_kickoff_payload`` via the
         ``<!-- model_routing:`` marker; ``select_model`` then consults
         ``model_routing.<role>`` and ``builder_fallback_chain[0]`` in
@@ -4945,17 +4960,37 @@ class AutonomousBuildOrchestrator:
         Includes:
           * ``model_routing``: the role-keyed map captured from the
             kickoff payload's ``model_routing`` dict (operator-set).
+            Builder slot is overridden per-attempt for retries (see above).
           * ``builder_fallback_chain``: the chain head onward, but only
             when the operator overrode the default chain. The chain at
             attempt 0 is read by ``select_model`` when
             ``model_routing.builder`` is not set.
         """
         block: Dict[str, Any] = {}
+        routing: Dict[str, Any] = {}
         if (
             isinstance(self.model_routing_override, dict)
             and self.model_routing_override
         ):
-            block["model_routing"] = dict(self.model_routing_override)
+            routing.update(self.model_routing_override)
+        # SAL-3793: on retries, rotate the builder slot through the chain
+        # so the kickoff override doesn't pin the same model across every
+        # silent_with_tools loop. Attempt 0 keeps whatever the kickoff
+        # specified (or no override at all).
+        if (
+            ticket is not None
+            and ticket.dispatch_attempts > 0
+            and isinstance(self.builder_fallback_chain, tuple)
+            and self.builder_fallback_chain
+        ):
+            chain_idx = (
+                ticket.dispatch_attempts % len(self.builder_fallback_chain)
+            )
+            attempt_model = self.builder_fallback_chain[chain_idx]
+            if isinstance(attempt_model, str) and attempt_model:
+                routing["builder"] = attempt_model
+        if routing:
+            block["model_routing"] = routing
         # Only propagate the chain when it differs from the module
         # default; default-chain runs don't need a propagation block at
         # all (registry + persona default already produce the right
@@ -6436,6 +6471,20 @@ class AutonomousBuildOrchestrator:
         # Truncated envelopes from `_tool_loop` exhausting the cap. The
         # dispatcher's partial-return shape is unmistakable.
         if result.get("truncated") is True:
+            return True
+        # SAL-3793: PR #330 silent_with_tools early-abort. dispatch.py sets
+        # `silent_with_tools=True` when the same loop-risk tool was called
+        # the threshold number of iterations consecutively without any
+        # terminal tool firing — a model-cognition failure indistinguishable
+        # from MAX_TOOL_ITERATIONS truncation for recovery purposes.
+        # Without this branch the human-readable abort message in `content`
+        # (set by `_tool_loop` so operators can grep journal output) trips
+        # the non-empty-text check below and the recovery path never fires;
+        # the orchestrator's no_pr_url path then routes the ticket through
+        # the generic FAILED → BACKED_OFF retry which re-uses the SAME
+        # model and silent-loops forever. Reproduced 2026-05-01 wave-3
+        # retry-1 kickoff 9e335979 (kimi-k2-thinking:cloud http_get loop).
+        if result.get("silent_with_tools") is True:
             return True
         summary = result.get("summary")
         content = result.get("content")

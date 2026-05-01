@@ -971,6 +971,25 @@ async def test_poll_children_marks_failed_when_no_pr_url(monkeypatch):
         {"summary": "", "artifacts": [{"path": "x.md", "content": "..."}]},
         False, "empty_summary_with_artifacts",
     ),
+    # SAL-3793: PR #330 silent_with_tools=True must short-circuit to silent
+    # even when `content` carries the human-readable abort message (which
+    # would otherwise pass the non-empty-text check below).
+    (
+        {"silent_with_tools": True,
+         "silent_with_tools_tool": "http_get",
+         "content": "[silent_with_tools detected: 'http_get' called 4 "
+                    "iterations consecutively without terminal action; "
+                    "aborted early at iteration 4/16]",
+         "tool_calls": [{"name": "http_get"}, {"name": "http_get"}]},
+        True, "silent_with_tools_flag",
+    ),
+    # SAL-3793: silent_with_tools without supplementary content (defensive —
+    # main.py wrapping should always include content but not all upstreams
+    # might).
+    (
+        {"silent_with_tools": True},
+        True, "silent_with_tools_minimal",
+    ),
 ])
 def test_envelope_is_silent_complete_classification(envelope, expected, case):
     """SAL-2978: shape classifier covers truncated, empty-summary, non-dict
@@ -6693,6 +6712,147 @@ async def test_kickoff_model_routing_propagates_into_child_body(monkeypatch):
     end = body.find("-->", start)
     parsed = _json.loads(body[start:end].strip())
     assert parsed["model_routing"] == {"builder": "deepseek-v3.2:cloud"}
+
+
+# ── SAL-3793: per-attempt builder rotation after silent_with_tools ──────
+
+
+async def test_render_model_routing_rotates_builder_on_retry(monkeypatch):
+    """SAL-3793: on `dispatch_attempts > 0`, `_render_model_routing_block`
+    must override the kickoff `model_routing.builder` with the next slot
+    from `builder_fallback_chain` so silent_with_tools recovery actually
+    rotates models. Reproduces the 2026-05-01 wave-3 retry-1 failure mode:
+    operator pinned `model_routing.builder=kimi`, kimi looped http_get,
+    silent_with_tools fired, retry sweep flipped to PENDING, next dispatch
+    re-used kimi (same kickoff override won precedence) and silent-looped
+    forever. With this fix attempt 1 advances to chain[1].
+    """
+    import json as _json
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(
+        kickoff_desc={
+            "linear_project_id": "p1",
+            "model_routing": {"builder": "kimi-k2-thinking:cloud"},
+            "builder_fallback_chain": [
+                "kimi-k2-thinking:cloud",
+                "qwen3-coder:480b-cloud",
+                "gpt-oss:120b-cloud",
+            ],
+        },
+        mesh=mesh,
+    )
+    orch._parse_payload()
+
+    t = _t("u-3793", "SAL-9999", "CO-W3-X", 3, "other", size="M", estimate=2)
+    _seed_graph(orch, [t])
+
+    async def _noop_update(ticket, state_name):
+        return None
+    monkeypatch.setattr(orch, "_update_linear_state", _noop_update)
+
+    async def _noop_verify(code_key, hint):
+        return VerificationResult(
+            code=code_key, hint=hint, status=HintStatus.UNVERIFIED,
+            repo_exists=True, path_results=tuple(), error=None,
+            verified_at=0.0,
+        )
+    monkeypatch.setattr(orch, "_verify_hint", _noop_verify)
+
+    # Attempt 0: kickoff override wins.
+    await orch._dispatch_child(t)
+    body0 = mesh.created[-1]["description"]
+    start = body0.find("<!-- model_routing:") + len("<!-- model_routing:")
+    end = body0.find("-->", start)
+    parsed0 = _json.loads(body0[start:end].strip())
+    assert parsed0["model_routing"] == {"builder": "kimi-k2-thinking:cloud"}, (
+        "attempt 0 must honour the kickoff override (operator's explicit pin)"
+    )
+    # `_dispatch_child` increments `dispatch_attempts` from 0 -> 1.
+    assert t.dispatch_attempts == 1
+
+    # Simulate the silent_with_tools recovery: orchestrator resets
+    # child_task_id + dispatched_at + status before next dispatch.
+    t.child_task_id = None
+    t.dispatched_at = None
+    t.status = TicketStatus.PENDING
+    orch._release_in_flight_dispatch(t)
+
+    # Attempt 1: chain[1] (qwen) must override the kickoff override.
+    await orch._dispatch_child(t)
+    body1 = mesh.created[-1]["description"]
+    start = body1.find("<!-- model_routing:") + len("<!-- model_routing:")
+    end = body1.find("-->", start)
+    parsed1 = _json.loads(body1[start:end].strip())
+    assert parsed1["model_routing"] == {"builder": "qwen3-coder:480b-cloud"}, (
+        f"attempt 1 must rotate to chain[1] qwen3-coder, got: "
+        f"{parsed1.get('model_routing')}"
+    )
+    assert t.dispatch_attempts == 2
+
+    # Attempt 2: chain[2] (gpt-oss).
+    t.child_task_id = None
+    t.dispatched_at = None
+    t.status = TicketStatus.PENDING
+    orch._release_in_flight_dispatch(t)
+    await orch._dispatch_child(t)
+    body2 = mesh.created[-1]["description"]
+    start = body2.find("<!-- model_routing:") + len("<!-- model_routing:")
+    end = body2.find("-->", start)
+    parsed2 = _json.loads(body2[start:end].strip())
+    assert parsed2["model_routing"] == {"builder": "gpt-oss:120b-cloud"}, (
+        f"attempt 2 must rotate to chain[2] gpt-oss, got: "
+        f"{parsed2.get('model_routing')}"
+    )
+
+
+def test_render_model_routing_attempt_zero_keeps_kickoff_override():
+    """Defensive: attempt 0 must NOT clobber the kickoff override even
+    when a chain is configured. The chain rotation only applies on
+    retries (`dispatch_attempts > 0`).
+    """
+    import json as _json
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "model_routing": {"builder": "kimi-k2-thinking:cloud"},
+        "builder_fallback_chain": [
+            "kimi-k2-thinking:cloud",
+            "qwen3-coder:480b-cloud",
+        ],
+    })
+    orch._parse_payload()
+    t = _t("u-3793b", "SAL-9998", "CO-W3-Y", 3, "other", size="M", estimate=2)
+    # Fresh ticket, dispatch_attempts == 0 by default.
+    block_str = orch._render_model_routing_block(ticket=t)
+    assert "<!-- model_routing:" in block_str
+    body = block_str
+    start = body.find("<!-- model_routing:") + len("<!-- model_routing:")
+    end = body.find("-->", start)
+    parsed = _json.loads(body[start:end].strip())
+    assert parsed["model_routing"] == {"builder": "kimi-k2-thinking:cloud"}
+
+
+def test_render_model_routing_retry_without_kickoff_override_uses_chain():
+    """When the operator did NOT set `model_routing.builder` but DID
+    override `builder_fallback_chain`, attempt 0 has no `model_routing`
+    block (only the chain) and attempt 1+ injects builder=chain[N].
+    """
+    import json as _json
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "builder_fallback_chain": [
+            "kimi-k2-thinking:cloud",
+            "qwen3-coder:480b-cloud",
+        ],
+    })
+    orch._parse_payload()
+    t = _t("u-3793c", "SAL-9997", "CO-W3-Z", 3, "other", size="M", estimate=2)
+    t.dispatch_attempts = 1
+    block_str = orch._render_model_routing_block(ticket=t)
+    body = block_str
+    start = body.find("<!-- model_routing:") + len("<!-- model_routing:")
+    end = body.find("-->", start)
+    parsed = _json.loads(body[start:end].strip())
+    assert parsed["model_routing"] == {"builder": "qwen3-coder:480b-cloud"}
 
 
 # ── on_all_green actions (SAL-3713) ────────────────────────────────────────
