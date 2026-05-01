@@ -431,6 +431,39 @@ def _pick_model_for_role(
     return role_block.get("last_resort") or role_block["primary"]
 
 
+def _registry_role_last_resort(role: str) -> Optional[str]:
+    """Return the registry's `roles.<role>.last_resort` for the given role.
+
+    SAL-3782 (2026-05-01): the dispatcher's `call()` / `call_with_tools()`
+    fallback path historically hardcoded `"deepseek-v3.2:cloud"` as its
+    safety net. Per `reference_deepseek_tool_use_quirk` deepseek emits
+    Anthropic XML in `message.content` instead of OpenAI `tool_calls`,
+    which makes verdict / tool-result extraction impossible. This helper
+    lets the dispatcher prefer the registry's per-role last_resort
+    (canonical: `gpt-oss:120b-cloud` for builder/qa/orchestrator) over
+    the deepseek hardcode.
+
+    Returns None when:
+      * the registry is absent (no file on disk and no cached copy), OR
+      * the role is unknown in the registry, OR
+      * `roles.<role>.last_resort` is missing.
+
+    The caller is expected to fall back to a static safe default
+    (`gpt-oss:120b-cloud`) on None — NEVER deepseek-v3.2:cloud.
+    """
+    reg = _load_model_registry()
+    if reg is None:
+        return None
+    roles = reg.get("roles") or {}
+    role_block = roles.get(role)
+    if not isinstance(role_block, dict):
+        return None
+    lr = role_block.get("last_resort")
+    if isinstance(lr, str) and lr:
+        return lr
+    return None
+
+
 def record_hard_timeout(role: str) -> bool:
     """Increment the consecutive-hard-timeout counter for `role`.
 
