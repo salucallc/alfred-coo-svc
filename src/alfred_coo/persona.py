@@ -660,7 +660,13 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "string in your `summary`."
         ),
         preferred_model="gpt-oss:120b-cloud",
-        fallback_model="deepseek-v3.2:cloud",
+        # 2026-04-30: deepseek-v3.2:cloud emits Anthropic XML
+        # `<function_calls>` in `content` instead of OpenAI tool_calls (see
+        # reference_deepseek_tool_use_quirk memory). When kimi 500'd on
+        # cc5cfb0e Hawkman review, the dispatcher fell over to deepseek and
+        # the verdict was never extracted. gpt-oss:120b-cloud has clean
+        # tool-call format and is the registry's qa last_resort.
+        fallback_model="gpt-oss:120b-cloud",
         topics=[
             "qa",
             "test",
@@ -703,7 +709,10 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "broader remediation."
         ),
         preferred_model="qwen3-coder:480b-cloud",
-        fallback_model="deepseek-v3.2:cloud",
+        # 2026-04-30: same deepseek tool-call quirk as hawkman-qa-a (above).
+        # Reviewer personas need a fallback that emits OpenAI tool_calls
+        # cleanly. gpt-oss:120b-cloud is the safest choice.
+        fallback_model="gpt-oss:120b-cloud",
         topics=[
             "security",
             "attack-vector",
