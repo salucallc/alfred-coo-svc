@@ -157,3 +157,49 @@ async def test_state_endpoint_returns_canonical_shape():
     assert body["recent_merges"][0]["pr_number"] == 290
     # ≤2KB target — assert generously to avoid flakiness.
     assert len(json.dumps(body)) < 4096
+
+
+@pytest.mark.asyncio
+async def test_fetch_mesh_sessions_logs_exception_class_when_str_empty(
+    monkeypatch, caplog,
+):
+    """Regression: ``mesh sessions fetch failed:`` with empty tail used to
+    leak through the cockpit-router warnings stream because exceptions
+    like ``httpx.ReadTimeout`` and ``CancelledError`` produce empty
+    ``str(e)`` and the original log line was just ``"%s" % e``.
+
+    The fixed line names the exception class explicitly so a future
+    operator can diagnose the root cause from log output alone."""
+    import logging as _logging
+
+    class _SilentError(Exception):
+        """``str(self)`` returns empty — mimics ``httpx.ReadTimeout``,
+        ``httpx.PoolTimeout``, and ``asyncio.CancelledError``."""
+
+        def __str__(self) -> str:
+            return ""
+
+    class _RaisingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, *args, **kwargs):
+            raise _SilentError()
+
+    monkeypatch.setattr(
+        "alfred_coo.cockpit_router.httpx.AsyncClient",
+        lambda *a, **kw: _RaisingClient(),
+    )
+    caplog.set_level(_logging.WARNING, logger="alfred_coo.cockpit_router")
+
+    out = await cockpit_router._fetch_mesh_sessions(
+        "http://x", "k", timeout=0.1,
+    )
+    assert out == []
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("mesh sessions fetch failed" in m for m in msgs)
+    assert any("_SilentError" in m for m in msgs), msgs
+    assert any("<no message>" in m for m in msgs), msgs

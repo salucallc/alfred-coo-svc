@@ -140,7 +140,15 @@ async def _fetch_mesh_sessions(
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
-        logger.warning("mesh sessions fetch failed: %s", e)
+        # Surface the exception class even when ``str(e)`` is empty.
+        # ``httpx.ReadTimeout`` / ``httpx.PoolTimeout`` / ``CancelledError``
+        # (during daemon shutdown) all have empty ``str(e)``, which made
+        # the original "%s" log line read ``mesh sessions fetch failed:`` —
+        # a useless tail with no exception class to diagnose against.
+        logger.warning(
+            "mesh sessions fetch failed: %s: %s",
+            type(e).__name__, str(e) or "<no message>",
+        )
         return []
     sessions = data.get("sessions", []) if isinstance(data, dict) else []
     out: List[Dict[str, Any]] = []
