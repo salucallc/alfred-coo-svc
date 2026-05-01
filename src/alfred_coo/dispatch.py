@@ -107,6 +107,35 @@ def _is_retryable_infra_error(exc: BaseException) -> bool:
 MAX_TOOL_ITERATIONS = 20
 
 
+# SAL-3781 (2026-05-01): silent_with_tools early-abort.
+#
+# Failure mode observed in retry-8 (gpt-oss:120b-cloud, SAL-3596): builder
+# called http_get 16 times consecutively, never invoked propose_pr, hit
+# MAX_TOOL_ITERATIONS=16 and returned partial. ~50%+ of gpt-oss builder
+# dispatches exhibit this pattern under load (registry-documented baseline).
+# Each silent attempt wastes ~75s of wall time and a retry-budget slot.
+#
+# Detection: track consecutive iterations whose dominant tool name is in
+# `_NONTERMINAL_LOOP_RISK_TOOLS`. When the counter reaches the threshold
+# and no terminal tool (propose_pr / update_pr / pr_review) has fired yet,
+# abort early with `silent_with_tools=True` in the result envelope so the
+# orchestrator can surface the failure to its retry / fallback-chain logic
+# without waiting for the full iteration budget.
+#
+# The non-terminal set is conservative — only tools we've actually observed
+# looping. Other read-only tools (linear_list_*, pr_files_get) are not in
+# the set yet to avoid false-positives on legitimate batch-read patterns;
+# add them here when a real loop is observed in production.
+_SILENT_WITH_TOOLS_THRESHOLD = 4
+_NONTERMINAL_LOOP_RISK_TOOLS: frozenset[str] = frozenset({"http_get"})
+_TERMINAL_TOOL_NAMES: frozenset[str] = frozenset({
+    "propose_pr",
+    "update_pr",
+    "pr_review",
+    "github_merge_pr",
+})
+
+
 def iteration_cap_for_size(size_label: str | None) -> int:
     """Return the tool-iteration cap for a ticket's size label.
 
@@ -744,6 +773,14 @@ class Dispatcher:
         total_in = 0
         total_out = 0
         tool_call_log: list[dict] = []
+        # SAL-3781: silent_with_tools tracking. `consecutive_loop_tool` is the
+        # tool name being repeated; counter resets on any other tool name.
+        # `terminal_tool_called` latches True the first time a tool from
+        # `_TERMINAL_TOOL_NAMES` fires — once it does, early-abort is disabled
+        # for the remainder of the dispatch (the model is making real progress).
+        consecutive_loop_tool: str | None = None
+        consecutive_loop_count = 0
+        terminal_tool_called = False
 
         # SAL-2978: explicit log line confirming the iteration counter starts
         # at 0 on every fresh dispatch. The counter is loop-local (the
@@ -776,11 +813,15 @@ class Dispatcher:
                 }
 
             messages.append(msg)
+            iteration_tool_names: list[str] = []
             for call in tool_calls:
                 call_id = call.get("id") or ""
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
                 args_json = fn.get("arguments") or "{}"
+                iteration_tool_names.append(name)
+                if name in _TERMINAL_TOOL_NAMES:
+                    terminal_tool_called = True
                 spec = tool_index.get(name)
                 if spec is None:
                     result_str = json.dumps({"error": f"unknown tool: {name}"})
@@ -797,6 +838,56 @@ class Dispatcher:
                     "tool_call_id": call_id,
                     "content": result_str,
                 })
+
+            # SAL-3781: update silent_with_tools counter at end of iteration.
+            # An iteration counts as a "loop tick" only when EVERY tool_call in
+            # it shares the same name AND that name is in the loop-risk set.
+            # Mixed iterations or terminal-tool iterations reset the counter.
+            unique_names = set(iteration_tool_names)
+            iteration_signature = (
+                next(iter(unique_names))
+                if len(unique_names) == 1
+                else None
+            )
+            if (
+                iteration_signature is not None
+                and iteration_signature in _NONTERMINAL_LOOP_RISK_TOOLS
+                and not terminal_tool_called
+            ):
+                if iteration_signature == consecutive_loop_tool:
+                    consecutive_loop_count += 1
+                else:
+                    consecutive_loop_tool = iteration_signature
+                    consecutive_loop_count = 1
+            else:
+                consecutive_loop_tool = None
+                consecutive_loop_count = 0
+
+            if consecutive_loop_count >= _SILENT_WITH_TOOLS_THRESHOLD:
+                logger.warning(
+                    "silent_with_tools detected: '%s' called %d iterations "
+                    "consecutively without terminal tool; aborting at "
+                    "iteration %d/%d",
+                    consecutive_loop_tool,
+                    consecutive_loop_count,
+                    iteration + 1,
+                    effective_cap,
+                )
+                return {
+                    "content": (
+                        f"[silent_with_tools detected: '{consecutive_loop_tool}' "
+                        f"called {consecutive_loop_count} iterations consecutively "
+                        f"without terminal action; aborted early at iteration "
+                        f"{iteration + 1}/{effective_cap}]"
+                    ),
+                    "tokens_in": total_in,
+                    "tokens_out": total_out,
+                    "model_used": model,
+                    "tool_calls": tool_call_log,
+                    "iterations": iteration + 1,
+                    "silent_with_tools": True,
+                    "silent_with_tools_tool": consecutive_loop_tool,
+                }
 
         # AB-17-m: log the EFFECTIVE cap (size-aware) not the module ceiling so
         # operators can tell "size-S hit 12" vs "size-L hit 20" at a glance.

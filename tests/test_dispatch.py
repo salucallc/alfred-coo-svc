@@ -553,6 +553,185 @@ async def test_run_tool_loop_clamps_override_at_ceiling(
     assert result["iterations"] == MAX_TOOL_ITERATIONS
 
 
+# ── SAL-3781: silent_with_tools early-abort ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_silent_with_tools_aborts_on_repeated_http_get(
+    monkeypatch, dispatcher, ctx, caplog,
+):
+    """gpt-oss looping http_get without ever calling propose_pr is the
+    canonical silent_with_tools failure. The loop should abort early at the
+    threshold (4 consecutive same-tool iterations) instead of running to
+    MAX_TOOL_ITERATIONS, returning ``silent_with_tools=True`` so the
+    orchestrator can route the failure into its retry/fallback logic.
+    """
+    import logging as _logging
+    from alfred_coo.tools import ToolSpec
+    from alfred_coo.dispatch import _SILENT_WITH_TOOLS_THRESHOLD
+
+    http_get_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_x",
+                    "function": {
+                        "name": "http_get",
+                        "arguments": "{\"url\": \"https://example.com\"}",
+                    },
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    transport = _RecordingTransport(responses=[http_get_response] * 30)
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _http_get_handler(**kwargs) -> dict:
+        return {"status": 200, "body": "..."}
+
+    tool = ToolSpec(
+        name="http_get",
+        description="fetch URL",
+        parameters={"type": "object", "properties": {}},
+        handler=_http_get_handler,
+    )
+
+    with caplog.at_level(_logging.WARNING, logger="alfred_coo.dispatch"):
+        result = await dispatcher.call_with_tools(
+            "gpt-oss:120b-cloud",
+            "sys",
+            "prompt",
+            tools=[tool],
+            context=ctx,
+            max_iterations=20,
+        )
+
+    assert result.get("silent_with_tools") is True
+    assert result.get("silent_with_tools_tool") == "http_get"
+    assert result["iterations"] == _SILENT_WITH_TOOLS_THRESHOLD
+    assert len(transport.requests) == _SILENT_WITH_TOOLS_THRESHOLD
+    warnings = [
+        r.message for r in caplog.records
+        if r.levelno == _logging.WARNING and "silent_with_tools" in r.message
+    ]
+    assert warnings, "expected a silent_with_tools warning"
+
+
+@pytest.mark.asyncio
+async def test_silent_with_tools_does_not_fire_when_terminal_tool_called(
+    monkeypatch, dispatcher, ctx,
+):
+    """If propose_pr fires at any point, silent_with_tools detection must
+    stay disabled for the rest of the dispatch — even if http_get loops
+    afterward (legitimate post-propose investigation).
+    """
+    from alfred_coo.tools import ToolSpec
+
+    propose_pr_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_p",
+                    "function": {
+                        "name": "propose_pr",
+                        "arguments": "{}",
+                    },
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    http_get_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_h",
+                    "function": {
+                        "name": "http_get",
+                        "arguments": "{}",
+                    },
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    transport = _RecordingTransport(
+        responses=[propose_pr_response] + [http_get_response] * 10
+    )
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _handler(**kwargs) -> dict:
+        return {"ok": True}
+
+    tools = [
+        ToolSpec(name="http_get", description="x", parameters={"type": "object", "properties": {}}, handler=_handler),
+        ToolSpec(name="propose_pr", description="x", parameters={"type": "object", "properties": {}}, handler=_handler),
+    ]
+
+    result = await dispatcher.call_with_tools(
+        "gpt-oss:120b-cloud", "sys", "prompt",
+        tools=tools, context=ctx, max_iterations=8,
+    )
+
+    # Should run to max_iterations (truncated) without silent_with_tools flag,
+    # because propose_pr fired in iteration 1.
+    assert result.get("silent_with_tools") is not True
+    assert result["iterations"] == 8
+
+
+@pytest.mark.asyncio
+async def test_silent_with_tools_does_not_fire_for_non_loop_risk_tool(
+    monkeypatch, dispatcher, ctx,
+):
+    """A tool not in `_NONTERMINAL_LOOP_RISK_TOOLS` (currently only http_get
+    is in the set) must NOT trigger silent_with_tools, even if called in a
+    long loop — that's the existing test_run_tool_loop contract on
+    `demo_tool`. This test guards against accidental over-broadening.
+    """
+    from alfred_coo.tools import ToolSpec
+
+    demo_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_d",
+                    "function": {"name": "demo_tool", "arguments": "{}"},
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    transport = _RecordingTransport(responses=[demo_response] * 30)
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _handler(**kwargs) -> dict:
+        return {"ok": True}
+
+    tool = ToolSpec(
+        name="demo_tool", description="x",
+        parameters={"type": "object", "properties": {}},
+        handler=_handler,
+    )
+
+    result = await dispatcher.call_with_tools(
+        "qwen3-coder:480b-cloud", "sys", "prompt",
+        tools=[tool], context=ctx, max_iterations=6,
+    )
+
+    assert result.get("silent_with_tools") is not True
+    assert result["iterations"] == 6
+    assert result.get("truncated") is True
+
+
 # ── main._peek_size_label + _builder_iteration_cap ──────────────────────
 
 
