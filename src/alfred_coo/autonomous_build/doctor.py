@@ -39,6 +39,8 @@ from typing import Any, Optional
 
 import httpx
 
+from .playbooks import DEFAULT_PLAYBOOKS, PlaybookResult
+
 
 logger = logging.getLogger("alfred_coo.autonomous_build.doctor")
 
@@ -272,15 +274,32 @@ async def scan_linear_grounding_gaps(
             report.add("linear_grounding_gap_filed", detail=ident)
 
 
-def format_slack_message(report: ScanReport, daemon_head: str = "") -> str:
-    """Render a tight Slack digest of a scan report."""
+def format_slack_message(
+    report: ScanReport,
+    daemon_head: str = "",
+    playbook_results: list[PlaybookResult] | None = None,
+) -> str:
+    """Render a tight Slack digest of a scan report.
+
+    ``playbook_results`` are appended after the scan section. When all
+    playbooks are silent and the surveillance scan finds nothing, the
+    digest collapses to ``Substrate quiet.`` so the channel doesn't get
+    noised up by every empty tick.
+    """
     duration_s = max(0.0, report.finished_at - report.started_at)
     started_iso = datetime.fromtimestamp(report.started_at, tz=timezone.utc).strftime("%H:%M:%SZ")
     head_line = (
         f"[doctor scan {started_iso} · {duration_s:.1f}s"
         f"{' · ' + daemon_head if daemon_head else ''}]"
     )
-    if not report.counters and not report.grounding_gaps:
+
+    playbook_results = playbook_results or []
+    playbook_lines: list[str] = []
+    for pr in playbook_results:
+        playbook_lines.extend(pr.render_digest_lines())
+
+    surveillance_silent = not report.counters and not report.grounding_gaps
+    if surveillance_silent and not playbook_lines:
         return f"{head_line}\nNo failure-class signals in window. Substrate quiet."
 
     lines = [head_line]
@@ -302,6 +321,9 @@ def format_slack_message(report: ScanReport, daemon_head: str = "") -> str:
         lines.append("  sample journal lines:")
         for s in report.notable_lines[:3]:
             lines.append(f"    · {s}")
+    if playbook_lines:
+        lines.append("  playbooks:")
+        lines.extend(playbook_lines)
     return "\n".join(lines)
 
 
@@ -423,6 +445,8 @@ class AlfredDoctorOrchestrator:
             since_ts=self.last_scan_ts,
             report=report,
         )
+
+        playbook_results = await self._run_playbooks(linear_key=linear_key)
         report.finished_at = time.time()
 
         slack_token = (
@@ -431,7 +455,9 @@ class AlfredDoctorOrchestrator:
             or getattr(self.settings, "slack_bot_token", "")
         )
         message = format_slack_message(
-            report, daemon_head=os.getenv("ALFRED_COO_HEAD", "")[:7],
+            report,
+            daemon_head=os.getenv("ALFRED_COO_HEAD", "")[:7],
+            playbook_results=playbook_results,
         )
         await post_to_slack(slack_token, self.slack_channel, message)
 
@@ -441,6 +467,16 @@ class AlfredDoctorOrchestrator:
         await asyncio.sleep(self.interval_seconds)
         await self._queue_next_kickoff(now_ts=report.finished_at)
 
+        playbook_summary = {
+            pr.kind: {
+                "found": pr.candidates_found,
+                "acted": pr.actions_taken,
+                "skipped": pr.actions_skipped,
+                "errors": len(pr.errors),
+                "dry_run": pr.dry_run,
+            }
+            for pr in playbook_results
+        }
         await self.mesh.complete(
             self.task_id,
             session_id=self.settings.soul_session_id,
@@ -452,8 +488,38 @@ class AlfredDoctorOrchestrator:
                 ),
                 "counters": report.counters,
                 "grounding_gaps": report.grounding_gaps[:20],
+                "playbooks": playbook_summary,
             },
         )
+
+    async def _run_playbooks(
+        self, *, linear_key: str,
+    ) -> list[PlaybookResult]:
+        """Invoke each registered playbook, swallowing per-playbook errors.
+
+        Playbooks are gated behind ``payload.playbooks_enabled=true`` so
+        the surveillance loop can ship + bake before any mutation runs.
+        ``payload.playbook_dry_run`` defaults to True (safety-first); set
+        it false in the kickoff payload once dry-run digests look clean.
+        """
+        if self.payload.get("playbooks_enabled") is not True:
+            return []
+        dry_run = bool(self.payload.get("playbook_dry_run", True))
+        results: list[PlaybookResult] = []
+        for pb in DEFAULT_PLAYBOOKS:
+            try:
+                pr = await pb.execute(
+                    linear_api_key=linear_key, dry_run=dry_run,
+                )
+                results.append(pr)
+            except Exception as e:  # noqa: BLE001 — never break the loop
+                logger.exception("doctor: playbook %s raised", pb.kind)
+                results.append(PlaybookResult(
+                    kind=pb.kind,
+                    dry_run=dry_run,
+                    errors=[f"{type(e).__name__}: {str(e)[:80]}"],
+                ))
+        return results
 
     async def _queue_next_kickoff(self, *, now_ts: float) -> None:
         """Self-perpetuate. The next kickoff carries the same config plus

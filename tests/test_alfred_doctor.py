@@ -32,6 +32,7 @@ from alfred_coo.autonomous_build.doctor import (
     scan_journal_via_subprocess,
     scan_mesh_recent_tasks,
 )
+from alfred_coo.autonomous_build.playbooks import PlaybookResult
 from alfred_coo.persona import get_persona
 
 
@@ -298,6 +299,37 @@ def test_format_slack_message_noisy_window():
     assert "SAL-3819" in msg and "SAL-3823" in msg
 
 
+def test_format_slack_message_includes_playbook_results():
+    """Playbook results render under a ``playbooks:`` header so a quiet
+    surveillance scan with active playbook output still emits a digest."""
+    report = ScanReport(started_at=time.time())
+    report.finished_at = report.started_at + 0.7
+    pr = PlaybookResult(
+        kind="hydrate_apev_headings",
+        candidates_found=3,
+        actions_taken=0,
+        dry_run=True,
+        notable=["would hydrate SAL-3001", "would hydrate SAL-3002"],
+    )
+    msg = format_slack_message(report, playbook_results=[pr])
+    assert "playbooks:" in msg
+    assert "[dry] hydrate_apev_headings" in msg
+    assert "found=3" in msg
+    assert "would hydrate SAL-3001" in msg
+
+
+def test_format_slack_message_silent_playbooks_collapse_to_quiet():
+    """When playbooks have nothing to report and surveillance is quiet,
+    digest collapses to ``Substrate quiet.`` — no noise from empty
+    playbook lines."""
+    report = ScanReport(started_at=time.time())
+    report.finished_at = report.started_at + 0.5
+    pr = PlaybookResult(kind="hydrate_apev_headings", dry_run=True)
+    msg = format_slack_message(report, playbook_results=[pr])
+    assert "Substrate quiet" in msg
+    assert "playbooks:" not in msg
+
+
 # ── End-to-end run (with fakes) ─────────────────────────────────────────────
 
 
@@ -387,6 +419,121 @@ async def test_doctor_run_queues_next_tick_and_completes_current(monkeypatch):
     assert comp["status"] == "completed"
     assert "summary" in comp["result"]
     assert "counters" in comp["result"]
+
+
+@pytest.mark.asyncio
+async def test_run_playbooks_skipped_when_flag_missing(monkeypatch):
+    """Playbooks are gated behind ``payload.playbooks_enabled=true``.
+    When the flag is absent or false, ``_run_playbooks`` returns ``[]``
+    without invoking any playbook ``execute``."""
+    mesh = _FakeMeshFull()
+    task = {
+        "id": "doc-no-pb",
+        "title": "[persona:alfred-doctor] surveillance tick",
+        "description": json.dumps({
+            "interval_seconds": 60,
+            "last_scan_ts": time.time() - 60.0,
+        }),
+    }
+    persona = get_persona("alfred-doctor")
+    settings = _FakeSettings()
+
+    invoked: list[str] = []
+
+    class _SpyPlaybook:
+        kind = "spy"
+        max_actions_per_tick = 5
+
+        async def execute(self, *, linear_api_key, dry_run):
+            invoked.append("ran")
+            return PlaybookResult(kind=self.kind, dry_run=dry_run)
+
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.doctor.DEFAULT_PLAYBOOKS",
+        [_SpyPlaybook()],
+    )
+
+    orch = AlfredDoctorOrchestrator(
+        task=task, persona=persona, mesh=mesh, soul=None,
+        dispatcher=None, settings=settings,
+    )
+    orch.payload = json.loads(task["description"])
+    results = await orch._run_playbooks(linear_key="key")
+    assert results == []
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_run_playbooks_invoked_when_flag_set(monkeypatch):
+    """When ``playbooks_enabled=true`` is in the payload, registered
+    playbooks fire and their results are returned. ``playbook_dry_run``
+    defaults True (safety-first) so untouched payloads stay dry."""
+    mesh = _FakeMeshFull()
+    persona = get_persona("alfred-doctor")
+    settings = _FakeSettings()
+
+    received_dry: list[bool] = []
+
+    class _SpyPlaybook:
+        kind = "spy"
+        max_actions_per_tick = 5
+
+        async def execute(self, *, linear_api_key, dry_run):
+            received_dry.append(dry_run)
+            return PlaybookResult(
+                kind=self.kind,
+                candidates_found=2,
+                dry_run=dry_run,
+            )
+
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.doctor.DEFAULT_PLAYBOOKS",
+        [_SpyPlaybook()],
+    )
+
+    orch = AlfredDoctorOrchestrator(
+        task={"id": "doc-pb-on", "title": "x", "description": "{}"},
+        persona=persona, mesh=mesh, soul=None,
+        dispatcher=None, settings=settings,
+    )
+    orch.payload = {"playbooks_enabled": True}
+    results = await orch._run_playbooks(linear_key="k")
+    assert len(results) == 1
+    assert results[0].candidates_found == 2
+    assert received_dry == [True]
+
+
+@pytest.mark.asyncio
+async def test_run_playbooks_swallows_playbook_crash(monkeypatch):
+    """A playbook's ``execute`` raising must NOT break the chain.
+    The doctor returns a PlaybookResult with the error recorded so the
+    digest still surfaces the crash."""
+    mesh = _FakeMeshFull()
+    persona = get_persona("alfred-doctor")
+    settings = _FakeSettings()
+
+    class _CrashingPlaybook:
+        kind = "crasher"
+        max_actions_per_tick = 5
+
+        async def execute(self, *, linear_api_key, dry_run):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.doctor.DEFAULT_PLAYBOOKS",
+        [_CrashingPlaybook()],
+    )
+
+    orch = AlfredDoctorOrchestrator(
+        task={"id": "doc-crash-pb", "title": "x", "description": "{}"},
+        persona=persona, mesh=mesh, soul=None,
+        dispatcher=None, settings=settings,
+    )
+    orch.payload = {"playbooks_enabled": True}
+    results = await orch._run_playbooks(linear_key="k")
+    assert len(results) == 1
+    assert results[0].kind == "crasher"
+    assert any("RuntimeError" in e for e in results[0].errors)
 
 
 @pytest.mark.asyncio
