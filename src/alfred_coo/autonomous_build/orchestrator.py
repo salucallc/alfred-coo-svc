@@ -3738,7 +3738,25 @@ class AutonomousBuildOrchestrator:
                 )
                 self.state.record_event("wave_exit_canceled", wave=wave)
                 break
-            await self._wait_for_wave_gate(wave)
+            try:
+                await self._wait_for_wave_gate(wave)
+            except RuntimeError as wave_exc:
+                # SAL-3807: queue a fresh kickoff (budget decremented) on a
+                # retriable wave-gate failure so the daemon auto-refires
+                # without operator intervention. Then re-raise to let the
+                # existing terminal-cleanup path run.
+                if (
+                    self._is_retriable_wave_fail(wave_exc)
+                    and self.wave_retry_budget > 0
+                ):
+                    try:
+                        await self._schedule_wave_retry_kickoff(wave, wave_exc)
+                    except Exception:
+                        logger.exception(
+                            "[wave-retry] scheduling fresh kickoff failed; "
+                            "wave will NOT auto-retry"
+                        )
+                raise
             self.state.record_event("wave_exit", wave=wave)
             await checkpoint(self.state, self.soul, self.task_id)
 
@@ -3801,6 +3819,19 @@ class AutonomousBuildOrchestrator:
             self.budget_usd = float(budget.get("max_usd") or DEFAULT_BUDGET_USD)
         except (TypeError, ValueError):
             self.budget_usd = DEFAULT_BUDGET_USD
+
+        # Wave retry budget. On a retriable wave-gate failure (green_ratio
+        # below threshold but no critical-path failures), the orchestrator
+        # queues a fresh kickoff with this counter decremented before
+        # raising terminal. Daemon claims the new kickoff and the wave
+        # retries on a clean orchestrator. 0 = current terminal-only
+        # behaviour. Default 2 = up to 3 total wave attempts per kickoff.
+        try:
+            self.wave_retry_budget = int(payload.get("wave_retry_budget", 2))
+            if self.wave_retry_budget < 0:
+                self.wave_retry_budget = 0
+        except (TypeError, ValueError):
+            self.wave_retry_budget = 2
 
         # Cadence.
         status_cadence = payload.get("status_cadence") or {}
@@ -8004,6 +8035,90 @@ class AutonomousBuildOrchestrator:
         # Silent-retry counter is per-review-attempt, not per-ticket. A
         # fresh child gets a fresh silent-retry budget.
         ticket.silent_review_retries = 0
+
+    # ── wave-retry (SAL-3807) ───────────────────────────────────────────────
+
+    @staticmethod
+    def _is_retriable_wave_fail(exc: Exception) -> bool:
+        """Decide whether a wave-gate RuntimeError represents a retriable
+        failure worth queuing a fresh kickoff for.
+
+        Retriable: green_ratio fell below threshold but no critical-path
+        ticket blew up. These are usually caused by upstream model/gateway
+        flakes, transient infra, or partial chain rotation — re-running
+        the wave on a clean orchestrator gives the chain another shot.
+
+        NOT retriable: critical-path failure (a blocker ticket failed —
+        retrying will keep failing until the ticket substance changes) or
+        zero-scoreable-tickets (orchestrator state is corrupt).
+        """
+        msg = str(exc)
+        msg_lower = msg.lower()
+        if "critical-path" in msg_lower:
+            return False
+        if "zero scoreable tickets" in msg_lower:
+            return False
+        return "green_ratio=" in msg
+
+    async def _schedule_wave_retry_kickoff(
+        self, wave_n: int, exc: Exception,
+    ) -> None:
+        """SAL-3807: queue a fresh autonomous-build kickoff carrying the
+        same payload with `wave_retry_budget` decremented by 1.
+
+        The daemon claims the new kickoff via its normal task-claim loop
+        (no scheduling delay needed). The new orchestrator's startup
+        in-progress sweep handles any stuck Linear states.
+
+        Raises only on mesh-API failure; the caller wraps that in a try/
+        except so a queue-failure does not mask the original wave-gate
+        exception.
+        """
+        new_payload = dict(self.payload or {})
+        new_payload["wave_retry_budget"] = self.wave_retry_budget - 1
+        new_payload["parent_kickoff_task_id"] = self.task_id
+        new_payload["retry_reason"] = str(exc)[:300]
+        new_payload["retry_for_wave"] = wave_n
+
+        orig_title = str(self.task.get("title") or "autonomous_build kickoff")
+        new_title = (
+            f"{orig_title} [wave-retry budget="
+            f"{self.wave_retry_budget - 1}]"
+        )
+
+        logger.warning(
+            "[wave-retry] wave=%d failed (%.120s); queuing fresh kickoff "
+            "with wave_retry_budget=%d",
+            wave_n, str(exc), self.wave_retry_budget - 1,
+        )
+        self.state.record_event(
+            "wave_retry_scheduled",
+            wave=wave_n,
+            budget_remaining=self.wave_retry_budget - 1,
+            reason=str(exc)[:300],
+        )
+
+        resp = await self.mesh.create_task(
+            title=new_title,
+            description=json.dumps(new_payload),
+            from_session_id=self.settings.soul_session_id,
+        )
+        if not isinstance(resp, dict) or not resp.get("id"):
+            raise RuntimeError(
+                f"mesh create_task returned no id for wave-retry kickoff: {resp!r}"
+            )
+
+        new_kickoff_id = str(resp["id"])
+        logger.warning(
+            "[wave-retry] queued fresh kickoff %s for wave=%d (budget=%d remaining)",
+            new_kickoff_id, wave_n, self.wave_retry_budget - 1,
+        )
+        self.state.record_event(
+            "wave_retry_kickoff_queued",
+            new_kickoff_id=new_kickoff_id,
+            wave=wave_n,
+            budget_remaining=self.wave_retry_budget - 1,
+        )
 
     # ── wave gate ───────────────────────────────────────────────────────────
 
