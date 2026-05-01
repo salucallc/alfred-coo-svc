@@ -94,7 +94,17 @@ class Playbook:
         *,
         linear_api_key: str,
         dry_run: bool,
+        **_extra: Any,
     ) -> PlaybookResult:
+        """Execute one tick of the playbook.
+
+        ``**_extra`` exists so the doctor can pass forward-compat
+        context (``mesh``, ``settings``, ``soul``, etc.) without
+        breaking older playbooks that don't accept those names.
+        Subclasses that DO need the extras name them in their own
+        signature and keep ``**_extra`` for forward-compat with
+        future doctor updates.
+        """
         raise NotImplementedError(
             "Playbook subclasses must implement execute()"
         )
