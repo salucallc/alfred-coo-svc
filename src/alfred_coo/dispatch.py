@@ -796,6 +796,11 @@ class Dispatcher:
         # for the remainder of the dispatch (the model is making real progress).
         consecutive_loop_tool: str | None = None
         consecutive_loop_count = 0
+        # SAL-3802 (args-aware): track args of consecutive same-tool calls.
+        # silent_with_tools only trips when there's a duplicate args entry in
+        # the run, so legitimate verification (3 http_gets to 3 different
+        # paths) doesn't false-positive.
+        consecutive_loop_args: list[str] = []
         terminal_tool_called = False
 
         # SAL-2978: explicit log line confirming the iteration counter starts
@@ -830,12 +835,14 @@ class Dispatcher:
 
             messages.append(msg)
             iteration_tool_names: list[str] = []
+            iteration_tool_args: list[str] = []
             for call in tool_calls:
                 call_id = call.get("id") or ""
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
                 args_json = fn.get("arguments") or "{}"
                 iteration_tool_names.append(name)
+                iteration_tool_args.append(args_json)
                 if name in _TERMINAL_TOOL_NAMES:
                     terminal_tool_called = True
                 spec = tool_index.get(name)
@@ -872,14 +879,26 @@ class Dispatcher:
             ):
                 if iteration_signature == consecutive_loop_tool:
                     consecutive_loop_count += 1
+                    consecutive_loop_args.extend(iteration_tool_args)
                 else:
                     consecutive_loop_tool = iteration_signature
                     consecutive_loop_count = 1
+                    consecutive_loop_args = list(iteration_tool_args)
             else:
                 consecutive_loop_tool = None
                 consecutive_loop_count = 0
+                consecutive_loop_args = []
 
-            if consecutive_loop_count >= _SILENT_WITH_TOOLS_THRESHOLD:
+            # SAL-3802 (args-aware): require both a count threshold AND a
+            # repeated-args signal before tripping. 3 http_gets to 3 distinct
+            # URLs is verification, not a loop.
+            has_duplicate_args = (
+                len(consecutive_loop_args) > len(set(consecutive_loop_args))
+            )
+            if (
+                consecutive_loop_count >= _SILENT_WITH_TOOLS_THRESHOLD
+                and has_duplicate_args
+            ):
                 logger.warning(
                     "silent_with_tools detected: '%s' called %d iterations "
                     "consecutively without terminal tool; aborting at "
