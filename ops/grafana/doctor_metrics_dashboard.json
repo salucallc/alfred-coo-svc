@@ -1,0 +1,307 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+      "description": "Seconds since the most recent doctor tick. Green if <360s (chain alive within 1 cadence + 1min slack); red if older.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 360},
+              {"color": "red", "value": 900}
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "max_over_time({logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" | unwrap metric_scan_duration_s [1h]) - max_over_time({logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" | unwrap metric_scan_duration_s [1h])",
+          "legendFormat": "tick age",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Last Doctor Tick (age)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+      "description": "Total doctor ticks observed in the last 7d. Below ~30 means baseline soak isn't usefully populated yet.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 30},
+              {"color": "green", "value": 100}
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "count_over_time({logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" [7d])",
+          "legendFormat": "ticks (7d)",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "Baseline Soak (ticks in 7d)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+      "description": "Sum of failure-class counters this hour. ANY non-zero value is a signal worth checking — spikes may indicate a regression worth investigating.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "orange", "value": 5},
+              {"color": "red", "value": 10}
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "sum_over_time({logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" | unwrap metric_counters_total [1h])",
+          "legendFormat": "failure events (1h)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Failure-Class Events (1h)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+      "description": "Most recent daemon HEAD reported by the doctor. Compare against `git rev-parse --short HEAD` on Oracle to confirm deploy state matches the commit you expect to be running.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        }
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "id": 4,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^metric_daemon_head$/", "values": false},
+        "textMode": "value"
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "{logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Daemon HEAD (last tick)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+      "description": "Doctor scan duration percentiles over time. P50 should hover stable; P95 spikes indicate soul-svc or journal latency excursions.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "duration",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {"type": "linear"},
+            "showPoints": "auto",
+            "spanNulls": true
+          },
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "s"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "id": 5,
+      "options": {
+        "legend": {"calcs": ["last", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "quantile_over_time(0.5, {logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" | unwrap metric_scan_duration_s [15m])",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "quantile_over_time(0.95, {logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" | unwrap metric_scan_duration_s [15m])",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "title": "Scan Duration (P50 / P95)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+      "description": "Failure-class counter total per tick. Look for sustained non-zero stretches; the doctor catches these with surveillance, but the dashboard surfaces them visually.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "events",
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "gradientMode": "none",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"mode": "none"}
+          },
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "id": 6,
+      "options": {
+        "legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "sum_over_time({logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" | unwrap metric_counters_total [5m])",
+          "legendFormat": "all counters",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "sum_over_time({logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\" | unwrap metric_grounding_gaps [5m])",
+          "legendFormat": "grounding gaps",
+          "refId": "B"
+        }
+      ],
+      "title": "Failure-Class Events Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+      "description": "Raw doctor metric tick stream. One JSON line per tick. Click into a row to expand the full counters + playbook_summary fields. Use this when a graph above shows an anomaly and you need to drill into the exact tick.",
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 12},
+      "id": 7,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki-alfred-coo"},
+          "expr": "{logger=\"alfred_coo.autonomous_build.doctor_metrics\"} | json | metric_event=\"tick\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Recent Tick Stream",
+      "type": "logs"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["alfred-coo", "doctor", "phase-3"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Alfred-COO Doctor Metrics",
+  "uid": "alfred-coo-doctor-metrics",
+  "version": 1,
+  "weekStart": ""
+}
