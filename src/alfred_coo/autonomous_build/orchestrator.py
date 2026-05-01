@@ -9534,15 +9534,36 @@ class AutonomousBuildOrchestrator:
             )
             return str(review_task_id)
 
-        # No existing review on the mesh — fire one. Synthesize a
-        # placeholder pr_url if the ticket lacks one (typical for a
-        # rehydrated ticket whose prior orchestrator run never persisted
-        # `state.pr_urls` for this PR); `_dispatch_review` interpolates
-        # this string into the review-task body.
+        # No existing review on the mesh — fire one. Resolve a real PR
+        # html_url so Hawkman's `pr_files_get` can fetch the diff.
+        # Historical bug (2026-05-01, retry-9): the placeholder
+        # `https://github.com/salucallc/_/pull/{n}` shipped to Hawkman as
+        # a literal `_` repo name, causing every inherited-PR review to
+        # 404 with "repository path '_' invalid (404)". The fix searches
+        # GitHub for the PR by ticket identifier and stashes the
+        # canonical html_url; falls back to the ticket's existing
+        # `pr_url` (typical when state was persisted) or a sentinel that
+        # _dispatch_review can detect and abort cleanly.
         if not ticket.pr_url:
-            ticket.pr_url = (
-                f"https://github.com/salucallc/_/pull/{existing_pr}"
+            resolved_url = await self._resolve_inherited_pr_html_url(
+                ticket.identifier, existing_pr,
             )
+            if resolved_url:
+                ticket.pr_url = resolved_url
+            else:
+                # Defensive sentinel — _dispatch_review will still build
+                # a body with this URL, and Hawkman will REQUEST_CHANGES
+                # cleanly on the 404; better than silently dropping the
+                # review or constructing a placeholder that masquerades
+                # as valid.
+                logger.warning(
+                    "[inherited-pr] could not resolve html_url for %s "
+                    "PR #%d; review will likely 404",
+                    ticket.identifier, existing_pr,
+                )
+                ticket.pr_url = (
+                    f"https://github.com/UNKNOWN_REPO/pull/{existing_pr}"
+                )
         try:
             await self._dispatch_review(ticket)
         except Exception:
@@ -9566,6 +9587,98 @@ class AutonomousBuildOrchestrator:
                 pr_number=existing_pr,
             )
         return fired_id
+
+    async def _resolve_inherited_pr_html_url(
+        self, ticket_ident: str, pr_number: int,
+    ) -> Optional[str]:
+        """Resolve the canonical GitHub html_url for an inherited PR.
+
+        Used by ``_fire_review_for_inherited_pr`` when the rehydrated
+        ticket lacks ``ticket.pr_url`` (typical: prior orchestrator run
+        didn't persist ``state.pr_urls`` before crashing). Searches the
+        salucallc org for an open PR matching ``ticket_ident`` and
+        returns the first item whose number matches ``pr_number``.
+
+        Returns ``None`` when:
+          - GITHUB_TOKEN is unset (test/dev environment),
+          - the search returns no items,
+          - no matching item is found for ``pr_number``,
+          - the network call raises.
+
+        Best-effort: callers must handle ``None`` and fall back to a
+        sentinel URL so the review-task body is at least well-formed.
+
+        Test seam: ``self._gh_pr_open_search_fn`` (when set) is called
+        in place of the live GitHub search; the stub is expected to
+        return a payload list shaped like the live ``items`` array
+        (each item having ``number`` and ``html_url`` keys).
+        """
+        stub = self._gh_pr_open_search_fn
+        if stub is not None:
+            try:
+                payload = await stub(ticket_ident)
+            except Exception:
+                logger.exception(
+                    "[inherited-pr-url] stub raised for %s",
+                    ticket_ident,
+                )
+                return None
+            items = payload if isinstance(payload, list) else (
+                (payload or {}).get("items") or []
+            )
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("number") == pr_number:
+                    url = item.get("html_url")
+                    if isinstance(url, str) and url:
+                        return url
+            return None
+
+        token = os.environ.get("GITHUB_TOKEN") or ""
+        if not token:
+            logger.debug(
+                "[inherited-pr-url] GITHUB_TOKEN unset; cannot resolve "
+                "html_url for %s PR #%d",
+                ticket_ident, pr_number,
+            )
+            return None
+
+        q = f"org:salucallc is:pr {ticket_ident}"
+        params = {"q": q, "per_page": "10"}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "saluca-alfred/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    "https://api.github.com/search/issues",
+                    params=params,
+                    headers=headers,
+                )
+                if r.status_code != 200:
+                    logger.warning(
+                        "[inherited-pr-url] GitHub search returned %d "
+                        "for %s",
+                        r.status_code, ticket_ident,
+                    )
+                    return None
+                items = (r.json() or {}).get("items") or []
+                for item in items:
+                    if item.get("number") == pr_number:
+                        url = item.get("html_url")
+                        if isinstance(url, str) and url:
+                            return url
+                return None
+        except Exception:
+            logger.exception(
+                "[inherited-pr-url] GitHub search raised for %s",
+                ticket_ident,
+            )
+            return None
 
     # ── SAL-3038 PR-exists short-circuit (2026-04-28) ───────────────────────
 
