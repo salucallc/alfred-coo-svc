@@ -74,3 +74,36 @@ def test_registry_entry_consistent_with_legacy_alias():
     b = get_persona("alfred-coo-a")
     assert a is b
     assert "BLOCKING REQUIREMENT" in a.system_prompt
+
+
+def test_alfred_coo_a_has_http_get_hard_cap():
+    """SAL-3802: builder must be told 2-consecutive http_get is the cap.
+    The soft "after your 4th http_get" guidance was insufficient — 6/6
+    fleet dispatches 2026-05-01 bailed on http_get x4 with zero
+    propose_pr calls. The HARD CAP block makes the rule unambiguous."""
+    p = get_persona("alfred-coo-a")
+    prompt = p.system_prompt
+    assert "HARD CAP on http_get" in prompt, (
+        "alfred-coo-a system_prompt is missing the HARD CAP on http_get "
+        "block. This block is the SAL-3802 fix and must be present "
+        "verbatim so the cap is unambiguous to all builder models."
+    )
+    assert "at most 2 CONSECUTIVE http_get calls" in prompt, (
+        "HARD CAP block must state the 2-consecutive-call cap verbatim."
+    )
+
+
+def test_alfred_coo_a_has_linear_create_issue_not_an_escape_rule():
+    """SAL-3795: builder must be told linear_create_issue is reserved for
+    real grounding gaps, not as an escape from hard tasks. 2026-05-01
+    fleet ran into legitimate AND illegitimate uses of the tool; this
+    rule helps the model self-discriminate before tool-calling."""
+    p = get_persona("alfred-coo-a")
+    prompt = p.system_prompt
+    assert "linear_create_issue is NOT an escape" in prompt, (
+        "alfred-coo-a system_prompt is missing the linear_create_issue "
+        "NOT-an-escape rule. This is the SAL-3795 persona-prompt fix."
+    )
+    # The rule must articulate the self-check question that gates the call.
+    assert "could I write a reasonable propose_pr from what I have" in prompt
+
