@@ -622,6 +622,128 @@ async def test_silent_with_tools_aborts_on_repeated_http_get(
 
 
 @pytest.mark.asyncio
+async def test_silent_with_tools_does_not_fire_for_distinct_args_verification(
+    monkeypatch, dispatcher, ctx,
+):
+    """SAL-3802 args-aware: 3 http_get calls to 3 DIFFERENT URLs is
+    legitimate path verification (Step 2 of alfred-coo-a persona), not a
+    loop. silent_with_tools must NOT trip when args are all distinct.
+
+    Regression guard: pre-args-aware behavior counted any 3 consecutive
+    same-tool calls as a loop, blocking builders from verifying multiple
+    new_paths.
+    """
+    from alfred_coo.tools import ToolSpec
+
+    def _http_get_response(url: str) -> dict:
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": f"call_{url[-1]}",
+                        "function": {
+                            "name": "http_get",
+                            "arguments": json.dumps({"url": url}),
+                        },
+                    }],
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    # 5 distinct URLs followed by an empty-tool_calls response so the loop
+    # exits cleanly (mimics builder finishing verification then committing
+    # to a textual response — not propose_pr but also not a loop).
+    transport = _RecordingTransport(responses=[
+        _http_get_response("https://a/1"),
+        _http_get_response("https://a/2"),
+        _http_get_response("https://a/3"),
+        _http_get_response("https://a/4"),
+        _http_get_response("https://a/5"),
+        _plain_response("verified all paths"),
+    ])
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _handler(**kwargs) -> dict:
+        return {"status": 200, "body": "..."}
+
+    tool = ToolSpec(
+        name="http_get", description="x",
+        parameters={"type": "object", "properties": {}}, handler=_handler,
+    )
+
+    result = await dispatcher.call_with_tools(
+        "gpt-oss:120b-cloud", "sys", "prompt",
+        tools=[tool], context=ctx, max_iterations=10,
+    )
+
+    # 5 distinct-URL fetches must NOT trip silent_with_tools.
+    assert result.get("silent_with_tools") is not True
+    assert result["content"] == "verified all paths"
+
+
+@pytest.mark.asyncio
+async def test_silent_with_tools_fires_when_args_repeat_within_run(
+    monkeypatch, dispatcher, ctx, caplog,
+):
+    """SAL-3802 args-aware: even 3 distinct URL fetches followed by a
+    repeat trips silent_with_tools — the duplicate signals a loop pattern
+    (e.g., builder oscillating between two URLs hoping for clarity).
+    """
+    import logging as _logging
+    from alfred_coo.tools import ToolSpec
+
+    def _r(url: str) -> dict:
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_x",
+                        "function": {
+                            "name": "http_get",
+                            "arguments": json.dumps({"url": url}),
+                        },
+                    }],
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    # A, B, A — at iteration 3 we have count=3 (>= threshold 3) AND a
+    # duplicate (A repeats). Should trip.
+    transport = _RecordingTransport(responses=[
+        _r("https://a/1"),
+        _r("https://a/2"),
+        _r("https://a/1"),
+        _r("https://a/9"),  # tail, shouldn't be reached
+    ])
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _handler(**kwargs) -> dict:
+        return {"status": 200, "body": "..."}
+
+    tool = ToolSpec(
+        name="http_get", description="x",
+        parameters={"type": "object", "properties": {}}, handler=_handler,
+    )
+
+    with caplog.at_level(_logging.WARNING, logger="alfred_coo.dispatch"):
+        result = await dispatcher.call_with_tools(
+            "gpt-oss:120b-cloud", "sys", "prompt",
+            tools=[tool], context=ctx, max_iterations=10,
+        )
+
+    assert result.get("silent_with_tools") is True
+    assert result.get("silent_with_tools_tool") == "http_get"
+    # Tripped on iteration 3 (the repeat), not later.
+    assert result["iterations"] == 3
+
+
+@pytest.mark.asyncio
 async def test_silent_with_tools_does_not_fire_when_terminal_tool_called(
     monkeypatch, dispatcher, ctx,
 ):
