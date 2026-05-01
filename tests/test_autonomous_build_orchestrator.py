@@ -7321,3 +7321,253 @@ async def test_on_all_green_no_longer_dispatches_mesh_tasks(monkeypatch):
 
     # No mesh tasks should be created — direct API call instead.
     assert len(mesh.created) == 0
+
+
+# ── Pre-dispatch APE/V hydration gate ──────────────────────────────────────
+#
+# These tests cover ``_hydrate_apev_pre_dispatch`` — the structural fix
+# that ensures every ticket the orchestrator dispatches has the canonical
+# ``## APE/V Acceptance (machine-checkable)`` heading in its body BEFORE
+# the wave loop begins. Replaces the fragile "AI follows Step 1 rule"
+# path with "system guarantees state".
+
+
+class _FakePostClient:
+    """Minimal post-only AsyncClient stand-in for hydrate gate tests.
+
+    ``mutation_handler`` is invoked per .post() with the parsed body
+    variables; return either ``{"data": {"issueUpdate": {"success": True}}}``
+    for a happy path or raise to simulate per-ticket failure.
+    """
+
+    def __init__(self, mutation_handler=None):
+        self.mutation_handler = mutation_handler or (
+            lambda variables: {"data": {"issueUpdate": {"success": True}}}
+        )
+        self.posts: list[dict] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, *, headers, content):
+        body = json.loads(content.decode())
+        self.posts.append({"url": url, "vars": body.get("variables")})
+        payload = self.mutation_handler(body.get("variables") or {})
+        return _FakeResp(200, payload=payload)
+
+
+def _patch_post_client(monkeypatch, fake: _FakePostClient) -> None:
+    def factory(*args, **kwargs):
+        return fake
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.httpx.AsyncClient", factory,
+    )
+
+
+def _t_with_body(uuid, ident, code, wave, body, *, status=TicketStatus.PENDING) -> Ticket:
+    """Variant of ``_t`` that lets each test set ``Ticket.body`` directly so
+    we exercise hydration on cached graph state without faking Linear
+    list_project_issues."""
+    return Ticket(
+        id=uuid, identifier=ident, code=code, title=f"{ident} {code}",
+        wave=wave, epic="ops", size="M", estimate=1,
+        is_critical_path=False,
+        body=body,
+        status=status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_skips_when_no_project_id(monkeypatch):
+    """Empty linear_project_id → skip entirely, no httpx attempt."""
+    orch = _mk_orchestrator()
+    orch.linear_project_id = ""
+    _seed_graph(orch, [
+        _t_with_body("u1", "SAL-1", "F01", 0, "APE/V: foo"),
+    ])
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_skips_terminal_states(monkeypatch):
+    """MERGED_GREEN / FAILED / ESCALATED / ABANDONED tickets are not patched
+    even if they happen to lack the canonical heading."""
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    _seed_graph(orch, [
+        _t_with_body("u-merged", "SAL-1", "F01", 0, "APE/V: x", status=TicketStatus.MERGED_GREEN),
+        _t_with_body("u-failed", "SAL-2", "F02", 0, "APE/V: y", status=TicketStatus.FAILED),
+        _t_with_body("u-active", "SAL-3", "F03", 0, "APE/V: z", status=TicketStatus.PENDING),
+    ])
+    fake = _FakePostClient()
+    _patch_post_client(monkeypatch, fake)
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 1
+    # Only SAL-3's UUID appears in the mutation calls.
+    posted_ids = [p["vars"]["id"] for p in fake.posts]
+    assert posted_ids == ["u-active"]
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_idempotent_on_canonical_heading(monkeypatch):
+    """Tickets already carrying the canonical heading are skipped — re-running
+    on the same graph after a successful hydrate must not double-patch."""
+    from alfred_coo.autonomous_build.playbooks.hydrate_apev import CANONICAL_HEADING
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    body_already = (
+        "APE/V: foo\n\n"
+        + CANONICAL_HEADING
+        + "\n\nfoo\n"
+    )
+    _seed_graph(orch, [
+        _t_with_body("u-1", "SAL-1", "F01", 0, body_already),
+    ])
+    fake = _FakePostClient()
+    _patch_post_client(monkeypatch, fake)
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 0
+    assert fake.posts == []
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_skips_tickets_without_inline_apev(monkeypatch):
+    """No marker → nothing to hydrate; gate never patches a body it can't
+    transform."""
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    _seed_graph(orch, [
+        _t_with_body("u-1", "SAL-1", "F01", 0, "Some prose, no markers."),
+    ])
+    fake = _FakePostClient()
+    _patch_post_client(monkeypatch, fake)
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 0
+    assert fake.posts == []
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_patches_and_updates_in_memory_body(monkeypatch):
+    """Happy path: candidate is patched via Linear AND the in-memory
+    ticket.body is rewritten so subsequent dispatch uses the hydrated body
+    without re-fetching."""
+    from alfred_coo.autonomous_build.playbooks.hydrate_apev import CANONICAL_HEADING
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    _seed_graph(orch, [
+        _t_with_body(
+            "u-1", "SAL-1", "F01", 0,
+            "intro\n\nAPE/V: ship it\n\nmore prose",
+        ),
+    ])
+    fake = _FakePostClient()
+    _patch_post_client(monkeypatch, fake)
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 1
+    new_body = orch.graph.nodes["u-1"].body
+    assert CANONICAL_HEADING in new_body
+    assert "ship it" in new_body
+    # Patch landed on the right Linear UUID with the rewritten body.
+    assert fake.posts[0]["vars"]["id"] == "u-1"
+    assert CANONICAL_HEADING in fake.posts[0]["vars"]["body"]
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_caps_at_max(monkeypatch):
+    """Bounded by ``_PRE_DISPATCH_HYDRATE_MAX`` so a startup with 1000s of
+    unhydrated tickets can't drain Linear's rate budget. Excess tickets
+    stay unhydrated for the doctor playbook to pick up."""
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    orch._PRE_DISPATCH_HYDRATE_MAX = 3
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    tickets = [
+        _t_with_body(f"u-{i}", f"SAL-{i}", f"F{i:02}", 0, f"APE/V: v{i}")
+        for i in range(7)
+    ]
+    _seed_graph(orch, tickets)
+    fake = _FakePostClient()
+    _patch_post_client(monkeypatch, fake)
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 3
+    assert len(fake.posts) == 3
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_skips_when_no_api_key(monkeypatch):
+    """Missing LINEAR_API_KEY → return 0 without raising. Persona Step 1
+    fallback still catches these (defense-in-depth)."""
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("ALFRED_OPS_LINEAR_API_KEY", raising=False)
+    _seed_graph(orch, [
+        _t_with_body("u-1", "SAL-1", "F01", 0, "APE/V: foo"),
+    ])
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_swallows_per_ticket_failure(monkeypatch, caplog):
+    """A 500 / network error on one ticket must NOT stop the loop —
+    continue to the next ticket and return whatever count succeeded.
+
+    ``caplog`` redirects ``logger.exception`` output through pytest's
+    capture handler instead of the default stderr stream, sidestepping
+    the Python 3.12 + pluggy ``compact=True`` traceback formatter bug
+    that fires when logger output reaches the terminal during test
+    teardown."""
+    import logging as _logging
+    caplog.set_level(_logging.CRITICAL, logger="alfred_coo.autonomous_build.orchestrator")
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    _seed_graph(orch, [
+        _t_with_body("u-bad", "SAL-1", "F01", 0, "APE/V: a"),
+        _t_with_body("u-ok",  "SAL-2", "F02", 0, "APE/V: b"),
+    ])
+
+    def handler(variables):
+        if variables["id"] == "u-bad":
+            raise RuntimeError("simulated network glitch")
+        return {"data": {"issueUpdate": {"success": True}}}
+
+    fake = _FakePostClient(mutation_handler=handler)
+    _patch_post_client(monkeypatch, fake)
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 1
+    # Both attempts were made — failure didn't shortcircuit.
+    posted_ids = sorted(p["vars"]["id"] for p in fake.posts)
+    assert posted_ids == ["u-bad", "u-ok"]
+
+
+@pytest.mark.asyncio
+async def test_hydrate_pre_dispatch_handles_issueupdate_success_false(monkeypatch):
+    """A 200 response with ``success=false`` is logged as not-ok and the
+    ticket is left untouched in-memory (its body must NOT be rewritten
+    based on a server-rejected mutation)."""
+    orch = _mk_orchestrator()
+    orch.linear_project_id = "p-1"
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    _seed_graph(orch, [
+        _t_with_body("u-1", "SAL-1", "F01", 0, "APE/V: nope"),
+    ])
+    original_body = orch.graph.nodes["u-1"].body
+
+    fake = _FakePostClient(
+        mutation_handler=lambda v: {"data": {"issueUpdate": {"success": False}}}
+    )
+    _patch_post_client(monkeypatch, fake)
+    n = await orch._hydrate_apev_pre_dispatch()
+    assert n == 0
+    # In-memory body untouched — mutation rejected at the API layer.
+    assert orch.graph.nodes["u-1"].body == original_body

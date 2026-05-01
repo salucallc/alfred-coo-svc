@@ -3672,6 +3672,38 @@ class AutonomousBuildOrchestrator:
                 "_sweep_stale_in_progress crashed during startup; continuing"
             )
 
+        # Pre-dispatch APE/V hydration gate: structurally guarantee every
+        # ticket THIS orchestrator will dispatch carries the canonical
+        # ``## APE/V Acceptance (machine-checkable)`` heading in its body
+        # BEFORE the wave loop begins. Eliminates the failure class where
+        # builders dispatched on tickets-with-inline-prose-only fetch
+        # the (minipc-local, unfetchable) plan-doc URL and 404-escalate
+        # as grounding gaps. Removes the "Step 1 follow-rule" burden the
+        # persona prompt placed on the AI substrate (which qwen3-coder:480b
+        # repeatedly ignored — see PR #340 for the prompt fix that this
+        # gate makes structurally redundant).
+        #
+        # Best-effort, idempotent (presence-check on the canonical
+        # heading), updates the in-memory ticket.body so the dispatch path
+        # uses the hydrated body without an extra Linear round-trip.
+        try:
+            n = await self._hydrate_apev_pre_dispatch()
+            if n:
+                logger.info(
+                    "[pre-dispatch hydrate] hydrated %d tickets with canonical "
+                    "APE/V heading (project=%s)", n, self.linear_project_id,
+                )
+                self.state.record_event(
+                    "pre_dispatch_apev_hydrated",
+                    project_id=self.linear_project_id,
+                    count=n,
+                )
+        except Exception:
+            logger.exception(
+                "_hydrate_apev_pre_dispatch crashed during startup; "
+                "continuing (builders will fall back to persona Step 1 path)"
+            )
+
         # 4. Main wave loop.
         for wave in self.wave_order:
             self.state.current_wave = wave
@@ -9124,6 +9156,133 @@ class AutonomousBuildOrchestrator:
             )
             return False
         return True
+
+    async def _hydrate_apev_pre_dispatch(self) -> int:
+        """Inject the canonical APE/V heading into Linear bodies for every
+        non-terminal ticket in the current graph that needs it.
+
+        Walks ``self.graph.nodes.values()`` (already loaded by
+        ``_build_graph``), filters to non-terminal tickets where the
+        canonical ``## APE/V Acceptance (machine-checkable)`` heading is
+        absent but inline ``APE/V:`` prose is present, and patches each
+        ticket's Linear description in place. Updates the in-memory
+        ``ticket.body`` to match the new state so the rest of the run
+        uses the hydrated body without a re-fetch.
+
+        Returns the number of tickets patched (mostly for tests +
+        logging). Idempotent: tickets already carrying the canonical
+        heading are skipped. Best-effort: per-ticket failures are logged
+        and the loop continues; an httpx setup failure is logged and
+        the method returns whatever count it managed.
+
+        Bounded by ``_PRE_DISPATCH_HYDRATE_MAX`` (200 default) so a
+        weirdly-large project can't burn Linear's rate budget on one
+        startup. Tickets beyond the cap are left for the doctor's
+        ``hydrate_apev_headings`` playbook to pick up on a later 5-min
+        tick — both layers are complementary.
+        """
+        if not self.linear_project_id:
+            return 0
+
+        # Lazy import — avoids a startup-cost cycle and keeps the
+        # dependency direction clean (orchestrator → playbooks helpers,
+        # never the reverse).
+        from .playbooks.hydrate_apev import (
+            CANONICAL_HEADING,
+            _extract_apev_text,
+            _render_canonical_section,
+        )
+
+        candidates: list[tuple[str, str, str, str]] = []  # (uuid, ident, new_body, apev)
+        for ticket in self.graph.nodes.values():
+            if ticket.status in TERMINAL_STATES:
+                continue
+            body = ticket.body or ""
+            if CANONICAL_HEADING in body:
+                continue
+            apev = _extract_apev_text(body)
+            if not apev:
+                continue
+            new_body = body.rstrip() + _render_canonical_section(apev)
+            candidates.append((ticket.id, ticket.identifier, new_body, apev))
+
+        if not candidates:
+            return 0
+
+        if len(candidates) > self._PRE_DISPATCH_HYDRATE_MAX:
+            logger.warning(
+                "[pre-dispatch hydrate] %d tickets need hydration; "
+                "patching first %d (rest will be picked up by doctor "
+                "hydrate_apev_headings playbook)",
+                len(candidates), self._PRE_DISPATCH_HYDRATE_MAX,
+            )
+            candidates = candidates[: self._PRE_DISPATCH_HYDRATE_MAX]
+
+        key = os.environ.get("LINEAR_API_KEY") or os.environ.get(
+            "ALFRED_OPS_LINEAR_API_KEY"
+        )
+        if not key:
+            logger.warning(
+                "[pre-dispatch hydrate] LINEAR_API_KEY missing; "
+                "skipping (persona Step 1 path will catch these)",
+            )
+            return 0
+
+        mut = (
+            "mutation U($id: String!, $body: String!) { "
+            "issueUpdate(id: $id, input: { description: $body }) { success } }"
+        )
+        patched = 0
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                for uuid, ident, new_body, _apev in candidates:
+                    try:
+                        resp = await client.post(
+                            "https://api.linear.app/graphql",
+                            headers={
+                                "Authorization": key,
+                                "Content-Type": "application/json",
+                            },
+                            content=json.dumps(
+                                {"query": mut, "variables": {"id": uuid, "body": new_body}}
+                            ).encode(),
+                        )
+                        data = resp.json()
+                        ok = (
+                            (data.get("data") or {})
+                            .get("issueUpdate", {})
+                            .get("success")
+                        )
+                        if not ok:
+                            logger.warning(
+                                "[pre-dispatch hydrate] %s issueUpdate not ok: %s",
+                                ident, str(data)[:200],
+                            )
+                            continue
+                        # Reflect the mutation in the live graph so the
+                        # rest of the run uses the hydrated body.
+                        node = self.graph.nodes.get(uuid)
+                        if node is not None:
+                            node.body = new_body
+                        patched += 1
+                    except Exception:
+                        logger.exception(
+                            "[pre-dispatch hydrate] patch failed for %s; "
+                            "leaving original body and continuing", ident,
+                        )
+        except Exception:
+            logger.exception(
+                "[pre-dispatch hydrate] httpx client lifecycle failed; "
+                "returning partial count=%d", patched,
+            )
+        return patched
+
+    # Cap on per-startup hydrations. Set high enough that a fresh project
+    # with all-unhydrated tickets gets fully hydrated in one startup, low
+    # enough that a weirdly-large project can't drain Linear's rate
+    # budget on a single boot. The doctor's hydrate_apev_headings
+    # playbook (5-min cadence, 5/tick) catches anything left over.
+    _PRE_DISPATCH_HYDRATE_MAX: int = 200
 
     async def _sweep_stale_in_progress(self, project_id: str) -> int:
         """Find Linear tickets in ``project_id`` stuck in "In Progress" with
