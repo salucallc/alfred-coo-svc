@@ -126,7 +126,12 @@ MAX_TOOL_ITERATIONS = 20
 # looping. Other read-only tools (linear_list_*, pr_files_get) are not in
 # the set yet to avoid false-positives on legitimate batch-read patterns;
 # add them here when a real loop is observed in production.
-_SILENT_WITH_TOOLS_THRESHOLD = 4
+# SAL-3802: lowered from 4 to 3 after 2026-05-01 fleet refire showed kimi
+# and qwen ignore the persona-prompt "at most 2 consecutive http_get" rule
+# (PR #335). Substrate must enforce: 3rd consecutive same-tool call now
+# trips silent_with_tools detection, aligning the substrate cap with the
+# persona prompt's behavioural guidance.
+_SILENT_WITH_TOOLS_THRESHOLD = 3
 _NONTERMINAL_LOOP_RISK_TOOLS: frozenset[str] = frozenset({"http_get"})
 _TERMINAL_TOOL_NAMES: frozenset[str] = frozenset({
     "propose_pr",
