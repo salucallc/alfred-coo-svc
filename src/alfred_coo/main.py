@@ -990,6 +990,23 @@ async def main() -> None:
                     if result.get("tool_calls"):
                         complete_result["tool_calls"] = result.get("tool_calls")
                         complete_result["tool_iterations"] = result.get("iterations")
+                    # SAL-3792: surface PR #330's silent_with_tools early-abort
+                    # signal to the orchestrator's _poll_children. Without this
+                    # propagation the flag stays inside dispatch.py and the
+                    # orchestrator's `_envelope_is_silent_complete` predicate
+                    # misses the abort because the only signal it sees is the
+                    # human-readable abort message in `content` — which evaluates
+                    # as "non-empty" and therefore "not silent". Wave-3 retry-1
+                    # 2026-05-01 (kickoff 9e335979) reproduced this: kimi looped
+                    # http_get 4×, dispatch.py aborted at iteration 4/16, but the
+                    # orchestrator routed through the generic no_pr_url FAILED
+                    # branch instead of the silent_with_tools-specific
+                    # fallback-chain re-dispatch.
+                    if result.get("silent_with_tools") is True:
+                        complete_result["silent_with_tools"] = True
+                        looping_tool = result.get("silent_with_tools_tool")
+                        if looping_tool:
+                            complete_result["silent_with_tools_tool"] = looping_tool
                     await mesh.complete(
                         task["id"],
                         session_id=settings.soul_session_id,
