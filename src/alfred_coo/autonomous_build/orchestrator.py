@@ -3545,6 +3545,18 @@ class AutonomousBuildOrchestrator:
         # the kickoff parent task, not on spawned children).
         self.model_routing_override: Dict[str, str] = {}
 
+        # SAL-3799 (2026-05-01) · per-epic plan-doc URL overrides from the
+        # kickoff payload's ``plan_doc_urls`` field. Read by
+        # ``_resolve_plan_doc_url`` before the static ``_EPIC_TO_PLAN_FILE``
+        # mapping. Use case: project epics whose plan docs live outside
+        # alfred-coo-svc/plans/v1-ga/ (Cockpit-UX, MSSP federation, agent-
+        # ingest external surface) need a fetchable raw.githubusercontent
+        # URL the daemon can hand to builder children. Without this
+        # override the orchestrator silently routed unknown-epic tickets
+        # to ``G_autonomous_build_gap_closers.md`` and every builder
+        # correctly flagged the mismatch as a grounding gap.
+        self.plan_doc_url_overrides: Dict[str, str] = {}
+
         # AB-17-q · external cancel signal (SAL-2756, 2026-04-24).
         # An operator who PATCHes the kickoff task's lifecycle state to
         # ``failed`` (with ``result.cancel == True``, or just ``status ==
@@ -3913,6 +3925,31 @@ class AutonomousBuildOrchestrator:
             }
         else:
             self.model_routing_override = {}
+
+        # SAL-3799 (2026-05-01): per-epic plan-doc URL overrides. The
+        # kickoff payload's ``plan_doc_urls`` field is an epic-keyed map
+        # of fetchable raw.githubusercontent.com URLs read by
+        # ``_resolve_plan_doc_url`` before the static class mapping.
+        # Required for project epics whose plan docs live outside
+        # alfred-coo-svc/plans/v1-ga/ (Cockpit-UX, federation, agent-
+        # ingest external). Non-string keys/values are dropped with a
+        # WARN; whole field non-dict resets to {}. Empty/missing field
+        # behaves identically to legacy (no override layer applied).
+        plan_doc_urls = payload.get("plan_doc_urls")
+        if isinstance(plan_doc_urls, dict):
+            self.plan_doc_url_overrides = {
+                str(k): str(v)
+                for k, v in plan_doc_urls.items()
+                if isinstance(k, str) and isinstance(v, str) and v
+            }
+        else:
+            if plan_doc_urls is not None:
+                logger.warning(
+                    "ignoring non-dict plan_doc_urls=%r; expected "
+                    "Dict[str,str] mapping epic to fetchable URL",
+                    plan_doc_urls,
+                )
+            self.plan_doc_url_overrides = {}
 
         # AB-05: build the payload-configured tracker + cadence. Keep the
         # previously-constructed defaults if the payload omits a field so
@@ -4830,7 +4867,7 @@ class AutonomousBuildOrchestrator:
         ``(unresolved)`` block that tells the child to STOP and open a
         grounding-gap Linear issue per its Step 0 protocol.
         """
-        plan_doc = self._plan_doc_for_epic(ticket.epic)
+        plan_doc = self._resolve_plan_doc_url(ticket.epic)
         size_line = f"Size: {ticket.size}" if ticket.size else "Size: unspecified"
         cp_line = " CRITICAL-PATH" if ticket.is_critical_path else ""
         # AB-14 (SAL-2699): emit the plan-doc code verbatim so the child can
@@ -4894,6 +4931,25 @@ class AutonomousBuildOrchestrator:
         # body shape is unchanged for runs that don't touch model
         # routing.
         routing_block = self._render_model_routing_block(ticket=ticket)
+        # SAL-3799: when no plan-doc URL resolves for this ticket's epic,
+        # OMIT the ``## Plan doc context`` section entirely. Pre-fix the
+        # orchestrator emitted a ``Plan doc (fetch via http_get): <wrong
+        # URL>`` line pointing at G_autonomous_build_gap_closers.md for
+        # any unmapped epic; builders correctly fetched it, found no
+        # matching section, and bailed via grounding-gap escalation.
+        # Better to give the model no plan-doc reference than the wrong
+        # one — if the operator wants a plan-doc citation they pin one
+        # via the kickoff payload's ``plan_doc_urls`` field.
+        if plan_doc:
+            plan_doc_section = (
+                f"\n"
+                f"## Plan doc context\n"
+                f"Plan doc (fetch via http_get): {plan_doc}\n"
+                f"Pay attention to the section matching ticket code "
+                f"{ticket.code or ticket.identifier}.\n"
+            )
+        else:
+            plan_doc_section = ""
         return (
             f"Ticket: {ticket.identifier} ({ticket.code or 'no-code'}){cp_line}\n"
             f"Linear: https://linear.app/saluca/issue/{ticket.identifier}\n"
@@ -4908,11 +4964,7 @@ class AutonomousBuildOrchestrator:
             f"{target_block}"
             f"\n"
             f"{apev_block}"
-            f"\n"
-            f"## Plan doc context\n"
-            f"Plan doc (fetch via http_get): {plan_doc}\n"
-            f"Pay attention to the section matching ticket code "
-            f"{ticket.code or ticket.identifier}.\n"
+            f"{plan_doc_section}"
             f"\n"
             f"## Deliverable\n"
             f"Open ONE PR to the target Saluca repo on a feature branch named "
@@ -5106,18 +5158,55 @@ class AutonomousBuildOrchestrator:
     }
 
     @classmethod
-    def _plan_doc_for_epic(cls, epic: str) -> str:
+    def _plan_doc_for_epic(cls, epic: str) -> Optional[str]:
         """Return a raw.githubusercontent.com URL for the plan doc that
-        matches this ticket's epic. Child alfred-coo-a tasks run on Oracle
-        and must fetch the plan via `http_get`, so paths like
-        ``Z:/_planning/v1-ga/*.md`` (minipc-only) won't resolve. Fallback
-        for unknown epics points at the autonomous_build gap-closer plan
-        (G), which lists orchestrator-side fixes — safer than a 404.
+        matches this ticket's epic, or ``None`` when no v1-GA plan-doc
+        section maps to this epic.
+
+        Child alfred-coo-a tasks run on Oracle and must fetch the plan via
+        ``http_get``, so paths like ``Z:/_planning/v1-ga/*.md``
+        (minipc-only) won't resolve.
+
+        SAL-3799 (2026-05-01): previously this returned
+        ``G_autonomous_build_gap_closers.md`` for any unknown epic, which
+        sent Cockpit-UX builders (epic="other") to the wrong plan doc and
+        triggered grounding-gap escalations every dispatch (kimi correctly
+        flagged the mismatch as SAL-3798 on retry-3). Now returns ``None``
+        for unmapped epics; ``_child_task_body`` skips the
+        ``## Plan doc context`` section entirely when the resolver has no
+        URL. Operator-supplied per-epic overrides via the kickoff payload
+        ``plan_doc_urls`` field are consulted by
+        ``_resolve_plan_doc_url`` (instance method) before this classmethod
+        runs, so projects whose plan docs live outside alfred-coo-svc
+        (e.g. Cockpit-UX's ``Z:/_planning/consumer-ux-plan.md``, Saluca
+        federation plans) can still ship a fetchable URL through.
         """
-        filename = cls._EPIC_TO_PLAN_FILE.get(
-            epic, "G_autonomous_build_gap_closers.md"
-        )
+        filename = cls._EPIC_TO_PLAN_FILE.get(epic)
+        if filename is None:
+            return None
         return f"{cls._PLAN_DOC_BASE_URL}/{filename}"
+
+    def _resolve_plan_doc_url(self, epic: str) -> Optional[str]:
+        """Per-instance plan-doc URL resolver.
+
+        Precedence:
+          1. Kickoff payload override: ``plan_doc_urls[epic]`` from
+             ``self.plan_doc_url_overrides``. Operator-supplied; wins over
+             the static mapping. Use this for project epics whose plan
+             docs live outside alfred-coo-svc/plans/v1-ga/ (e.g.
+             Cockpit-UX, federation).
+          2. Static class mapping in ``_EPIC_TO_PLAN_FILE``. v1-GA-era
+             default for known epics (tiresias, aletheia, fleet, ops,
+             soul-gap).
+          3. ``None`` — no match. ``_child_task_body`` will OMIT the
+             ``## Plan doc context`` section rather than emit a wrong-
+             default URL that the builder will fetch and (correctly)
+             treat as a grounding-gap. SAL-3799.
+        """
+        override = self.plan_doc_url_overrides.get(epic)
+        if isinstance(override, str) and override:
+            return override
+        return self._plan_doc_for_epic(epic)
 
     # ── child polling + state transitions ───────────────────────────────────
 
