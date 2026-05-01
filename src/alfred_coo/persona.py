@@ -463,6 +463,34 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
         handler="AutonomousBuildOrchestrator",
     ),
 
+    # ── Alfred-doctor (substrate health surveillance, Phase 1) ──────────────
+    # Maps [persona:alfred-doctor]. Long-running orchestrator that scans
+    # the mesh, daemon journal, and Linear for fleet-failure patterns
+    # every N minutes (default 300s) and posts a digest to #batcave. No
+    # autonomous actions yet — read-only surveillance with self-perpetuating
+    # kickoff chain. Phase 2 will add bounded action playbooks
+    # (orphan-reset, false-positive grounding-gap cancellation).
+    "alfred-doctor": Persona(
+        name="alfred-doctor",
+        system_prompt=(
+            "You are Alfred-doctor, the substrate-health surveillance "
+            "agent. You run as a long-running orchestrator handler, not "
+            "via the tool-use loop, so this prompt is documentation only "
+            "— the actual scan logic lives in "
+            "alfred_coo.autonomous_build.doctor.AlfredDoctorOrchestrator."
+        ),
+        preferred_model=None,
+        fallback_model=None,
+        topics=[
+            "alfred-doctor",
+            "substrate-health",
+            "autonomous-ops",
+            "mission-control",
+        ],
+        tools=[],
+        handler="AlfredDoctorOrchestrator",
+    ),
+
     # ── R&D Cybersecurity — Cryptography (Atlantis, under Red Hood) ─────────
     # Maps [persona:riddler-crypto-a]. Replaces the old mr-terrific-a stub;
     # canonical DC_ORG_MAP assigns Mr. Terrific to VP Product, not crypto.

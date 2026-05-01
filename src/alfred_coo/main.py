@@ -220,6 +220,7 @@ def _is_already_running_orchestrator(task_id: str) -> bool:
 # persona class) can slot in without touching the resolver.
 _HANDLER_MODULES: tuple[str, ...] = (
     "alfred_coo.autonomous_build.orchestrator",
+    "alfred_coo.autonomous_build.doctor",
 )
 
 
