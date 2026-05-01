@@ -167,7 +167,9 @@ def iteration_cap_for_dispatch(
 #   3. Model registry: load `Z:/_planning/model_registry/registry.yaml`
 #      (or the canonical Oracle path) and pick `roles.<role>.primary`,
 #      where `<role>` is derived from the persona name.
-#   4. Fallback: persona.preferred_model, then "deepseek-v3.2:cloud".
+#   4. Fallback: persona.preferred_model, then `_resolve_safe_fallback`
+#      (registry's `roles.<role>.last_resort`, else `gpt-oss:120b-cloud`).
+#      SAL-3787: previously a hardcoded `"deepseek-v3.2:cloud"` literal.
 #
 # Registry failures (file missing, schema-invalid, role unmapped) ALL fall
 # through to (4) without raising; a hot-swap edit cannot crash dispatch.
@@ -351,7 +353,13 @@ def select_model(task: dict, persona) -> str:
 
     # (2) Legacy tag shortcuts.
     if "[tag:strategy]" in title:
-        return "deepseek-v3.2:cloud"
+        # SAL-3787: was hardcoded "deepseek-v3.2:cloud". deepseek emits
+        # Anthropic XML in message.content instead of OpenAI tool_calls,
+        # silently breaking tool-using callers (reference_deepseek_tool_use_quirk).
+        # Route through the registry-aware safe-fallback resolver so the
+        # role's last_resort wins; static safe default is gpt-oss:120b-cloud.
+        synthetic_ctx = DispatchContext(persona=getattr(persona, "name", "") or "")
+        return _resolve_safe_fallback(synthetic_ctx, "")
 
     # (3) Model registry.
     if role is not None:
@@ -377,7 +385,10 @@ def select_model(task: dict, persona) -> str:
     # (4) Fallback to persona default.
     if persona.preferred_model:
         return persona.preferred_model
-    return "deepseek-v3.2:cloud"
+    # SAL-3787: was hardcoded "deepseek-v3.2:cloud" — see comment at the
+    # tag:strategy branch above for why deepseek is unsafe as a fallback.
+    synthetic_ctx = DispatchContext(persona=getattr(persona, "name", "") or "")
+    return _resolve_safe_fallback(synthetic_ctx, "")
 
 
 # Tiny duplicate of _peek_linear_ticket from main.py — kept here to avoid an
