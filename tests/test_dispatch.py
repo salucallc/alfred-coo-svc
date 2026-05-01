@@ -561,10 +561,11 @@ async def test_silent_with_tools_aborts_on_repeated_http_get(
     monkeypatch, dispatcher, ctx, caplog,
 ):
     """gpt-oss looping http_get without ever calling propose_pr is the
-    canonical silent_with_tools failure. The loop should abort early at the
-    threshold (4 consecutive same-tool iterations) instead of running to
-    MAX_TOOL_ITERATIONS, returning ``silent_with_tools=True`` so the
-    orchestrator can route the failure into its retry/fallback logic.
+    canonical silent_with_tools failure. The loop should abort early at
+    the threshold (3 consecutive same-tool iterations as of SAL-3802)
+    instead of running to MAX_TOOL_ITERATIONS, returning
+    ``silent_with_tools=True`` so the orchestrator can route the failure
+    into its retry/fallback logic.
     """
     import logging as _logging
     from alfred_coo.tools import ToolSpec
