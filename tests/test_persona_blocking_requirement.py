@@ -107,3 +107,27 @@ def test_alfred_coo_a_has_linear_create_issue_not_an_escape_rule():
     # The rule must articulate the self-check question that gates the call.
     assert "could I write a reasonable propose_pr from what I have" in prompt
 
+
+def test_step_1_forbids_plan_doc_http_get_when_canonical_section_present():
+    """SAL-3823 (and SAL-3819, SAL-3820, SAL-3821): builders dispatched
+    against patched Linear bodies STILL escalated by calling http_get on
+    a plan-doc URL even though the canonical APE/V section was right
+    there in their task body. Step 1 must explicitly forbid the fallback
+    fetch when the canonical heading is already present.
+    """
+    p = get_persona("alfred-coo-a")
+    prompt = p.system_prompt
+    # The conditional structure (IF heading present → STOP, ELSE → fetch)
+    # must be unambiguous. Test for the load-bearing phrases.
+    assert "DO NOT call http_get on any plan-doc URL" in prompt, (
+        "alfred-coo-a Step 1 is missing the explicit prohibition on "
+        "plan-doc http_get when the canonical APE/V section is already "
+        "in the task body. This is the SAL-3823 fix — without it, "
+        "qwen3-coder:480b-cloud blindly fetches the plan-doc and bails "
+        "on the inevitable 404."
+    )
+    assert "FORBIDDEN" in prompt, (
+        "Step 1 must call the plan-doc fetch FORBIDDEN (caps) so the "
+        "rule reads as a hard constraint rather than a soft preference."
+    )
+
