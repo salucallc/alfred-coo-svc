@@ -719,11 +719,21 @@ def test_child_task_body_uses_repo_raw_plan_url():
             "http_get"
         )
 
-    # Unknown epic falls back to the autonomous_build gap-closer plan (G),
-    # which is safer than a 404 fallback.
+    # SAL-3799 (2026-05-01): unknown epic now OMITS the plan-doc section
+    # entirely instead of falling back to G_autonomous_build_gap_closers.md.
+    # Pre-fix the wrong-default URL caused builders on Cockpit-UX
+    # (epic="other") to fetch G, find no matching ticket-code section, and
+    # bail via grounding-gap escalation. Post-fix: omitting the section is
+    # safer than a wrong default; operator can pin a per-epic URL via the
+    # kickoff payload's `plan_doc_urls` field if the ticket needs one.
     unknown = _t("u-x", "SAL-X", "X-01", 1, "not-a-real-epic")
     body = orch._child_task_body(unknown)
-    assert f"{base}/G_autonomous_build_gap_closers.md" in body
+    assert "## Plan doc context" not in body, (
+        "unknown-epic body must NOT include the plan-doc section"
+    )
+    assert f"{base}/G_autonomous_build_gap_closers.md" not in body, (
+        "must not leak the wrong-default plan-doc URL on unmapped epics"
+    )
 
 
 # ── AB-14 (SAL-2699): child body must emit Plan-doc code grep anchor ───────
@@ -6853,6 +6863,125 @@ def test_render_model_routing_retry_without_kickoff_override_uses_chain():
     end = body.find("-->", start)
     parsed = _json.loads(body[start:end].strip())
     assert parsed["model_routing"] == {"builder": "qwen3-coder:480b-cloud"}
+
+
+# ── SAL-3799: plan-doc URL resolver — kickoff override + Optional return ─
+
+
+def test_plan_doc_for_epic_returns_none_for_unknown_epic():
+    """SAL-3799: pre-fix returned `G_autonomous_build_gap_closers.md` for
+    any unmapped epic, which sent Cockpit-UX (epic="other") builders to
+    the wrong plan doc and triggered grounding-gap escalations.
+    Post-fix: returns None for unmapped epics so `_child_task_body` can
+    omit the plan-doc section entirely.
+    """
+    assert AutonomousBuildOrchestrator._plan_doc_for_epic("other") is None
+    assert AutonomousBuildOrchestrator._plan_doc_for_epic("") is None
+    assert AutonomousBuildOrchestrator._plan_doc_for_epic("agent-ingest") is None
+
+
+def test_plan_doc_for_epic_known_epic_unchanged():
+    """v1-GA epics still resolve to their canonical plan doc URLs."""
+    url = AutonomousBuildOrchestrator._plan_doc_for_epic("tiresias")
+    assert url is not None
+    assert url.endswith("/A_tiresias_in_appliance.md")
+
+
+def test_resolve_plan_doc_url_kickoff_override_wins():
+    """Operator-supplied `plan_doc_urls[epic]` override beats the static
+    class mapping. Use case: Cockpit-UX needs to point at a fetchable URL
+    that doesn't live in alfred-coo-svc/plans/v1-ga/.
+    """
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "plan_doc_urls": {
+            "other": "https://raw.githubusercontent.com/salucallc/alfred-portal/master/docs/cockpit-ux-plan.md",
+            "tiresias": "https://example.com/override-tiresias.md",
+        },
+    })
+    orch._parse_payload()
+    assert orch._resolve_plan_doc_url("other") == \
+        "https://raw.githubusercontent.com/salucallc/alfred-portal/master/docs/cockpit-ux-plan.md"
+    # Override wins for known epics too — operator escape hatch.
+    assert orch._resolve_plan_doc_url("tiresias") == \
+        "https://example.com/override-tiresias.md"
+
+
+def test_resolve_plan_doc_url_falls_through_to_static_mapping():
+    """When the kickoff has no override for an epic, fall through to the
+    static `_EPIC_TO_PLAN_FILE` mapping unchanged.
+    """
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "plan_doc_urls": {"other": "https://example.com/cockpit.md"},
+    })
+    orch._parse_payload()
+    # `tiresias` not in override → static mapping.
+    url = orch._resolve_plan_doc_url("tiresias")
+    assert url and url.endswith("/A_tiresias_in_appliance.md")
+    # `other` IS in override → override wins.
+    assert orch._resolve_plan_doc_url("other") == "https://example.com/cockpit.md"
+    # Neither in override nor in static mapping → None.
+    assert orch._resolve_plan_doc_url("agent-ingest") is None
+
+
+def test_parse_payload_invalid_plan_doc_urls_warns_and_clears():
+    """Non-dict `plan_doc_urls` is logged and reset to empty so a typo in
+    the kickoff payload doesn't crash dispatch.
+    """
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "plan_doc_urls": "not-a-dict",  # operator typo
+    })
+    orch._parse_payload()
+    assert orch.plan_doc_url_overrides == {}
+
+
+async def test_child_task_body_omits_plan_doc_section_for_unmapped_epic(monkeypatch):
+    """SAL-3799 acceptance: when `_resolve_plan_doc_url` returns None,
+    `_child_task_body` must NOT emit the `## Plan doc context` section.
+    Pre-fix the body always carried a "Plan doc (fetch via http_get): ..."
+    line pointing at the wrong default; that's what kimi correctly flagged
+    via SAL-3798 grounding gap on retry-3 2026-05-01.
+    """
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        # No plan_doc_urls override; epic="other" hits the None path.
+    })
+    orch._parse_payload()
+    t = _t("u-3799a", "SAL-3597", "CO-W3-A", 3, "other", size="M", estimate=2)
+    body = orch._child_task_body(t)
+    assert "## Plan doc context" not in body, (
+        "unmapped-epic body must NOT include the plan-doc section"
+    )
+    assert "G_autonomous_build_gap_closers.md" not in body, (
+        "must not leak the wrong-default plan-doc URL"
+    )
+
+
+async def test_child_task_body_includes_plan_doc_section_when_resolver_returns_url(
+    monkeypatch,
+):
+    """When the resolver returns a URL (either via override or static
+    mapping), the body must still include the standard plan-doc section
+    so v1-GA builders keep working unchanged.
+    """
+    orch = _mk_orchestrator(kickoff_desc={
+        "linear_project_id": "p1",
+        "plan_doc_urls": {
+            "other": "https://raw.githubusercontent.com/saluca/cockpit/main/plan.md",
+        },
+    })
+    orch._parse_payload()
+    t = _t("u-3799b", "SAL-9001", "CO-W3-X", 3, "other", size="M", estimate=2)
+    body = orch._child_task_body(t)
+    assert "## Plan doc context" in body
+    assert "https://raw.githubusercontent.com/saluca/cockpit/main/plan.md" in body
+    # Static-mapping path also still works on a known epic.
+    t2 = _t("u-3799c", "SAL-9002", "TIR-99", 0, "tiresias", size="S", estimate=1)
+    body2 = orch._child_task_body(t2)
+    assert "## Plan doc context" in body2
+    assert "A_tiresias_in_appliance.md" in body2
 
 
 # ── on_all_green actions (SAL-3713) ────────────────────────────────────────
