@@ -426,6 +426,49 @@ def _default_context() -> DispatchContext:
     return _UNKNOWN_CONTEXT
 
 
+# SAL-3782 (2026-05-01): static safe fallback. NEVER deepseek-v3.2:cloud — see
+# `reference_deepseek_tool_use_quirk` memory. `gpt-oss:120b-cloud` is the
+# registry's canonical `last_resort` for builder/qa/orchestrator/docs roles.
+_SAFE_FALLBACK_DEFAULT = "gpt-oss:120b-cloud"
+
+
+def _resolve_safe_fallback(
+    context: Optional["DispatchContext"], primary_model: str
+) -> str:
+    """Resolve the per-call fallback model when the caller didn't supply one.
+
+    Precedence:
+      1. Registry's `roles.<role>.last_resort` for the persona's mapped role,
+         when both the persona-to-role mapping and the registry are available.
+      2. Static safe default (`gpt-oss:120b-cloud`).
+
+    The legacy `"deepseek-v3.2:cloud"` hardcode is intentionally NOT in the
+    chain — deepseek emits Anthropic XML in `message.content` instead of
+    OpenAI `tool_calls`, which silently breaks every tool-using caller (see
+    PR #327, SAL-3782). If the registry-picked last_resort happens to equal
+    `primary_model`, callers (`call()` / `call_with_tools()`) detect that
+    and re-raise; this helper does NOT need to special-case it.
+    """
+    persona_name = (
+        context.persona if context is not None else _UNKNOWN_CONTEXT.persona
+    )
+    role = _PERSONA_ROLE_MAP.get(persona_name)
+    if role is not None:
+        try:
+            from .autonomous_build.model_registry import _registry_role_last_resort
+            picked = _registry_role_last_resort(role)
+        except Exception as e:  # noqa: BLE001 — registry failures must not crash dispatch
+            logger.warning(
+                "registry last_resort lookup failed for role=%s: %s; "
+                "using static safe default",
+                role, e,
+            )
+            picked = None
+        if picked:
+            return picked
+    return _SAFE_FALLBACK_DEFAULT
+
+
 def _derive_gateway_base(gateway_url: str, ollama_url: str) -> str:
     """Resolve the gateway base URL.
 
@@ -576,7 +619,15 @@ class Dispatcher:
         try:
             return await self._call_model(model, system, prompt, context=context)
         except Exception:
-            fb = fallback_model or "deepseek-v3.2:cloud"
+            # SAL-3782 (2026-05-01): registry-aware fallback. Caller-supplied
+            # `fallback_model` still wins when present (persona default or
+            # operator override). Otherwise prefer the role's `last_resort`
+            # from `model_registry.yaml` over the legacy deepseek hardcode —
+            # deepseek emits Anthropic XML in `content` instead of OpenAI
+            # tool_calls (reference_deepseek_tool_use_quirk), which silently
+            # breaks every tool-using caller. Static safe default is
+            # gpt-oss:120b-cloud (the canonical registry last_resort).
+            fb = fallback_model or _resolve_safe_fallback(context, model)
             if fb == model:
                 raise
             result = await self._call_model(fb, system, prompt, context=context)
@@ -646,7 +697,14 @@ class Dispatcher:
                 context=context, max_iterations=max_iterations,
             )
         except Exception as e:
-            fb = fallback_model or "deepseek-v3.2:cloud"
+            # SAL-3782 (2026-05-01): registry-aware fallback (mirror of
+            # `call()` above). Tool-use loops are MORE sensitive to the
+            # deepseek XML-in-content quirk than plain `call()` because
+            # the loop re-feeds tool results, so a fallback to deepseek
+            # made tool-using ticket dispatch silently fail on primary
+            # error. Prefer the registry role's `last_resort`; static
+            # safe default is gpt-oss:120b-cloud.
+            fb = fallback_model or _resolve_safe_fallback(context, model)
             if fb == model:
                 raise
             logger.warning("tool-use primary %s failed (%s); retrying on %s", model, e, fb)

@@ -364,7 +364,15 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "    - [ ] ...verbatim Linear bullets...\n"
         ),
         preferred_model="gpt-oss:120b-cloud",
-        fallback_model="deepseek-v3.2:cloud",
+        # 2026-05-01 (SAL-3783): deepseek-v3.2:cloud emits Anthropic XML
+        # `<function_calls>` in `content` instead of OpenAI tool_calls (see
+        # reference_deepseek_tool_use_quirk + reference_qa_fallback_must_not_be_deepseek
+        # memories). For the BUILDER persona that lives or dies on
+        # propose_pr/update_pr tool emission, deepseek as fallback would
+        # silently break PR creation. Picked kimi-k2-thinking:cloud — it's
+        # the registry's builder.fallback_chain[0], verified clean tool-use
+        # format, and avoids `fb == model` (primary is gpt-oss:120b-cloud).
+        fallback_model="kimi-k2-thinking:cloud",
         topics=[
             "coo-daemon",
             "unified-plan",
@@ -446,7 +454,14 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "appropriate."
         ),
         preferred_model="qwen3-coder:480b-cloud",
-        fallback_model="deepseek-v3.2:cloud",
+        # 2026-05-01 (SAL-3783): deepseek-v3.2:cloud emits Anthropic XML
+        # `<function_calls>` in `content` instead of OpenAI tool_calls (see
+        # reference_deepseek_tool_use_quirk + reference_qa_fallback_must_not_be_deepseek
+        # memories). Riddler does pr_review which depends on structured
+        # tool emission. Mirrors the PR #327 hawkman/batgirl pattern:
+        # gpt-oss:120b-cloud is the registry qa.last_resort and has clean
+        # OpenAI tool_calls.
+        fallback_model="gpt-oss:120b-cloud",
         topics=[
             "pq",
             "sovereign-pq",
@@ -493,13 +508,30 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "the reviewer missing both of these — never again.\n"
             "\n"
             "GATE 1 — APE/V citation requirement.\n"
-            "The PR body MUST cite the acceptance lines verbatim from the plan "
-            "doc for the ticket (plans/v1-ga/*.md). Look for a fenced block or "
-            "quoted paragraph that reproduces the A/P/E/V acceptance criteria "
-            "from the plan doc. If that verbatim citation is absent, you MUST "
-            "pr_review with verdict REQUEST_CHANGES and reason exactly "
-            "'missing APE/V citation'. Do not approve a PR that cannot prove "
-            "its acceptance is grounded in the plan.\n"
+            "The PR body MUST cite the acceptance criteria from the Linear "
+            "ticket (canonical source) or the plan doc (plans/v1-ga/*.md). "
+            "Acceptable citation FORMATS, in order of preference:\n"
+            "  - A heading like `## APE/V Acceptance` (with or without "
+            "    parenthetical) followed by bullet lines matching Linear's "
+            "    A/P/E/V text. Linear stores acceptance as bullet lists; a "
+            "    PR body that mirrors that format byte-for-byte is the "
+            "    canonical citation. (Verified 2026-05-01 on SAL-3596 / "
+            "    PR #19: Linear stored bullets; mirrored bullets are valid.)\n"
+            "  - A fenced code block reproducing Linear's APE/V section "
+            "    verbatim (older convention; still acceptable).\n"
+            "  - A quoted paragraph reproducing the A/P/E/V text verbatim.\n"
+            "Validation rule: byte-verbatim substring match between the PR "
+            "body and Linear's `## APE/V Acceptance` (or `## Acceptance "
+            "criteria`) section. The HEADING wording need not match exactly "
+            "(`## APE/V Acceptance (machine-checkable)` and `## APE/V "
+            "Acceptance` are equivalent); the BODY content beneath must "
+            "match byte-verbatim. If the PR body is missing the citation "
+            "entirely OR contains only paraphrased criteria (semicolons "
+            "rewritten, words reordered, bullets dropped), pr_review with "
+            "verdict REQUEST_CHANGES and reason exactly 'missing APE/V "
+            "citation'. Do NOT reject solely on heading-wording variance "
+            "or block-format choice (bullets vs fenced) — only on actual "
+            "content drift from Linear/plan.\n"
             "\n"
             "GATE 2 — Diff-size cap for small tickets (size-S / size-M).\n"
             "Measure the total lines added in the PR (use pr_files_get and sum "
@@ -584,11 +616,26 @@ BUILTIN_PERSONAS: Dict[str, Persona] = {
             "the audit log). Reject with reason 'scaffolding only; "
             "behavior unimplemented'.\n"
             "\n"
+            "DEFAULT-TO-DEFERRED for runtime-only criteria. Many APE/V "
+            "criteria describe runtime behavior that the static diff alone "
+            "CANNOT prove: UI panel visibility under a specific mode, "
+            "200ms transition smoothness, end-to-end auth flow against a "
+            "live backend, JUnit-XML output of a harness run, browser "
+            "viewport assertions. For these, mark "
+            "DEFERRED-RUNTIME-VERIFICATION naming the harness that WOULD "
+            "verify (Playwright/vitest/F21/etc) — do NOT force them into "
+            "Evidence form by quoting unrelated diff lines, and do NOT "
+            "mark them UNEVIDENCED just because the diff doesn't contain "
+            "literal proof. UNEVIDENCED is reserved for criteria that "
+            "the diff SHOULD have implemented but didn't (e.g. ticket "
+            "demands a JSON schema and the diff has no schema file).\n"
+            "\n"
             "VERDICT FORMAT for Gate 4:\n"
-            "APPROVE only if every criterion has either (a) quoted "
+            "APPROVE if every criterion has either (a) quoted "
             "diff evidence or (b) explicit DEFERRED-RUNTIME-VERIFICATION. "
-            "REJECT (REQUEST_CHANGES) if any criterion is UNEVIDENCED, "
-            "or if any anti-pattern above is present, citing the "
+            "REJECT (REQUEST_CHANGES) only if a criterion is UNEVIDENCED "
+            "(missing implementation, not missing static evidence) or if "
+            "any anti-pattern above is present, citing the "
             "specific failing criterion and the missing evidence type.\n"
             "\n"
             "GATE 5 - Behavioral APE/V (code-vs-plan, tests-cover-changes, "
