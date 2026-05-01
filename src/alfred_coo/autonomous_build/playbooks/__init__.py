@@ -12,10 +12,12 @@ Adding a playbook:
 
 from .base import Playbook, PlaybookResult
 from .hydrate_apev import HydrateAPEVHeadingsPlaybook
+from .refresh_dashboard_next_gate import RefreshDashboardNextGatePlaybook
 
 
 DEFAULT_PLAYBOOKS: list[Playbook] = [
     HydrateAPEVHeadingsPlaybook(),
+    RefreshDashboardNextGatePlaybook(),
 ]
 
 
@@ -23,5 +25,6 @@ __all__ = [
     "Playbook",
     "PlaybookResult",
     "HydrateAPEVHeadingsPlaybook",
+    "RefreshDashboardNextGatePlaybook",
     "DEFAULT_PLAYBOOKS",
 ]

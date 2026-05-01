@@ -509,7 +509,9 @@ class AlfredDoctorOrchestrator:
         for pb in DEFAULT_PLAYBOOKS:
             try:
                 pr = await pb.execute(
-                    linear_api_key=linear_key, dry_run=dry_run,
+                    linear_api_key=linear_key,
+                    dry_run=dry_run,
+                    mesh=self.mesh,
                 )
                 results.append(pr)
             except Exception as e:  # noqa: BLE001 — never break the loop
@@ -519,6 +521,20 @@ class AlfredDoctorOrchestrator:
                     dry_run=dry_run,
                     errors=[f"{type(e).__name__}: {str(e)[:80]}"],
                 ))
+        # Always log a one-line per-playbook summary so the daemon journal
+        # records playbook activity even when the Slack digest collapses
+        # to ``Substrate quiet`` (i.e. all playbooks were silent). Without
+        # this line, a healthy chain looks identical in journal output to
+        # one whose playbooks-enabled flag silently isn't taking effect.
+        if results:
+            summary = ", ".join(
+                f"{pr.kind}=found:{pr.candidates_found}/acted:{pr.actions_taken}"
+                + (f"/err:{len(pr.errors)}" if pr.errors else "")
+                for pr in results
+            )
+            logger.info(
+                "alfred-doctor playbooks: dry_run=%s %s", dry_run, summary,
+            )
         return results
 
     async def _queue_next_kickoff(self, *, now_ts: float) -> None:

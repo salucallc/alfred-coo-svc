@@ -92,6 +92,7 @@ class HydrateAPEVHeadingsPlaybook(Playbook):
         *,
         linear_api_key: str,
         dry_run: bool,
+        **_extra: Any,
     ) -> PlaybookResult:
         result = PlaybookResult(kind=self.kind, dry_run=dry_run)
         if not linear_api_key:
