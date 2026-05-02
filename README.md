@@ -8,6 +8,7 @@ Headless COO daemon that claims tasks from the Saluca mesh, routes them by perso
 - `src/alfred_coo/fleet_gateway/server.py` — sidecar WebSocket bridge at `/v1/fleet/link`, bearer auth via `FLEET_GATEWAY_KEY`. Uvicorn entry: `uvicorn alfred_coo.fleet_gateway.server:app --port 8090`.
 - `src/alfred_coo/fleet_voice/server.py` — sidecar WebSocket gateway at `/v1/fleet/voice` for the ReSpeaker XVF3800 voice puck (SAL-3997..4019) and the Alfred PWA. Bearer auth via `FLEET_VOICE_KEY`; admin sessions snapshot at `GET /v1/fleet/voice/sessions` (auth via `FLEET_VOICE_ADMIN_KEY`). Accepts binary Opus frames + JSON control plane (`type`, `seq`, optional `payload`); server pings every 15s, closes 1011 on inactivity. Uvicorn entry: `uvicorn alfred_coo.fleet_voice.server:app --port 8091`.
 - `src/alfred_coo/fleet_voice/stt.py` (SAL-4003) — Whisper-1 STT adapter that decodes the per-session Opus accumulator, segments on WebRTC VAD, transcribes via OpenAI `/v1/audio/transcriptions`, and relays the transcript to soul-svc `/v1/overview/chat`. Lazy-imports `opuslib` + `webrtcvad` so the module loads on dev boxes without `libopus.dll` on PATH; install via the optional `voice` extra (`pip install -e '.[voice]'`) and ensure `libopus0` is present in the runtime image. Env knobs: `OPENAI_API_KEY`, `SOUL_API_KEY`, `SOUL_API_URL`, `FLEET_VOICE_VAD_AGGRESSIVENESS` (0..3, default 2), `FLEET_VOICE_MIN_SEGMENT_MS` (default 300), `FLEET_VOICE_MAX_GAP_MS` (default 400), `FLEET_VOICE_WHISPER_MODEL` (default `whisper-1`).
+- `src/alfred_coo/fleet_voice/tts.py` (SAL-4005) — OpenAI tts-1 streaming adapter. After `stt.post_to_soul` returns Alfred's reply, the gateway streams the text through `/v1/audio/speech` (`response_format=pcm`, OpenAI's container-free 24 kHz mono int16), resamples 24 kHz to 16 kHz with stdlib `audioop.ratecv` (state carried across chunks so frame boundaries do not click), encodes 20 ms frames to Opus at 32 kbps CBR, and pushes each packet to the WS as a binary frame bracketed by `audio_start` / `audio_end` envelopes. Lazy-imports `opuslib` for the same reason as `stt.py`. Env knobs: `OPENAI_API_KEY`, `FLEET_VOICE_TTS_MODEL` (default `tts-1`), `FLEET_VOICE_TTS_VOICE` (default `alloy`), `FLEET_VOICE_TTS_BITRATE_BPS` (default 32000), `FLEET_VOICE_TTS_FRAME_MS` (default 20), `FLEET_VOICE_TTS_HTTP_TIMEOUT_S` (default 30).
 
 ### fleet_voice control protocol
 
@@ -32,8 +33,16 @@ Outbound from gateway (text JSON):
 | `ping` | `{type:"ping", seq}` every 15 s; client must reply `pong` within 45 s. |
 | `ack` | `{type:"ack", seq, echo_type}` for unhandled control types and for `start_utterance` / `end_utterance` (before drain). |
 | `transcript` | `{type:"transcript", seq, text, source, segment_count}` after STT drain. `source` is `"start_utterance"`, `"end_utterance"`, or (later) `"auto_vad"`. |
-| `assistant_text` | `{type:"assistant_text", seq, text}` Alfred's reply from soul-svc. TTS encoding lands in SAL-4005; until then the device renders or queues plain text. |
-| `error` | `{type:"error", reason, seq, detail?}` on malformed JSON or pipeline failure. Socket stays open so the client can recover. |
+| `assistant_text` | `{type:"assistant_text", seq, text}` Alfred's reply from soul-svc. The same reply is then synthesized to Opus and streamed as binary frames (see `audio_start` / `audio_end`). |
+| `audio_start` (SAL-4005) | `{type:"audio_start", seq, format:"opus", sample_rate:16000, channels:1, frame_ms:20}` immediately before a binary Opus stream. The device should prep its decoder + jitter buffer on this signal. `seq` increments per-utterance and matches the trailing `audio_end`. |
+| `audio_end` (SAL-4005) | `{type:"audio_end", seq, frames, bytes}` after the last Opus binary frame for an utterance. `frames` and `bytes` let the device confirm jitter-buffer alignment; mismatch with what the decoder counted indicates a dropped frame. |
+| `error` | `{type:"error", reason, seq, detail?}` on malformed JSON or pipeline failure. STT failures carry `reason:"stt_drain_failed"`; TTS failures carry `stage:"tts"` plus `reason:"tts_synth_failed"`. Socket stays open so the client can recover. |
+
+Outbound from gateway (binary):
+
+| Stream | Shape |
+|---|---|
+| Voice TTS (SAL-4005) | One Opus packet per WS binary frame, 16 kHz mono, 20 ms / 32 kbps CBR, sandwiched between `audio_start` and `audio_end` envelopes (matching `seq`). The device receives self-describing Opus packets and feeds each one to its libopus decoder. The music path (SAL-4014/4015, P3) renegotiates to 48 kHz stereo / 96 kbps via a future `audio_format` control message. |
 - `src/alfred_coo/persona.py` — `BUILTIN_PERSONAS` registry; each entry bundles system prompt, preferred + fallback model, topic scope, and opt-in tool list.
 - `src/alfred_coo/dispatch.py` — model-agnostic caller; `select_model` resolves `[tag:code]` / `[tag:strategy]` overrides; `call_with_tools` runs the multi-turn tool loop (max 8 iterations) against Ollama or OpenRouter OpenAI-compatible endpoints.
 - `src/alfred_coo/tools.py` — five built-in tools (`linear_create_issue`, `slack_post`, `mesh_task_create`, `propose_pr`, `http_get`); each is an async handler with a JSON schema rendered to OpenAI function form.

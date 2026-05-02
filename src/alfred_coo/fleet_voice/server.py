@@ -111,6 +111,16 @@ class VoiceSession:
         or by the `_maybe_autodrain` heuristic on natural silence.
       * `transcript_seq` — outbound counter for `transcript` /
         `assistant_text` frames so the device can detect drops.
+
+    SAL-4005 (TTS) extends this with downstream synthesis accounting:
+      * `tts_seq` — monotonically-increasing counter for `audio_start` /
+        `audio_end` envelopes; lets the device align its jitter buffer
+        and detect dropped utterances.
+      * `tts_frames_out` / `tts_bytes_out` — Opus-frame-only counters so
+        ops can separate audio bandwidth from JSON control plane.
+      * `tts_synth_latency_ms` — wall-clock for the most recent TTS call
+        (text submitted -> last frame yielded). Useful for the metrics
+        scrape endpoint that lands in SAL-4030.
     """
 
     session_id: str
@@ -126,6 +136,10 @@ class VoiceSession:
     last_seq_in: int | None = None
     opus_buffer: list[bytes] = field(default_factory=list)
     transcript_seq: int = 0
+    tts_seq: int = 0
+    tts_frames_out: int = 0
+    tts_bytes_out: int = 0
+    tts_synth_latency_ms: int | None = None
 
     async def send_text(self, payload: dict[str, Any]) -> None:
         """Send a JSON control message; updates outbound accounting."""
@@ -153,6 +167,10 @@ class VoiceSession:
             "bytes_in": self.bytes_in,
             "bytes_out": self.bytes_out,
             "last_seq_in": self.last_seq_in,
+            "tts_seq": self.tts_seq,
+            "tts_frames_out": self.tts_frames_out,
+            "tts_bytes_out": self.tts_bytes_out,
+            "tts_synth_latency_ms": self.tts_synth_latency_ms,
         }
 
 
@@ -228,7 +246,12 @@ async def _drain_and_transcribe(session: VoiceSession, *, source: str) -> None:
 
     Lazy-imports `stt` so the module can load on bare boxes without
     libopus / webrtcvad. Errors are caught and surface as a single
-    `error` frame; the WS stays open.
+    `error` frame; the WS stays open. SAL-4005: after the
+    `assistant_text` frame lands, the reply is also synthesized through
+    OpenAI tts-1 and pushed down the WS as Opus 16 kHz mono / 20 ms /
+    32 kbps CBR binary frames, sandwiched between `audio_start` and
+    `audio_end` control envelopes so the device can prep + flush its
+    decoder + jitter buffer cleanly.
     """
     if not session.opus_buffer:
         return
@@ -262,10 +285,18 @@ async def _drain_and_transcribe(session: VoiceSession, *, source: str) -> None:
                 "seq": session.transcript_seq,
                 "text": reply,
             })
+            await _speak_reply(session, reply)
     except Exception as exc:
-        logger.exception(
-            "fleet_voice STT drain failed session=%s source=%s frames=%d",
-            session.session_id, source, len(frames),
+        # NOTE: keep `logger.warning` not `logger.exception` here — pytest
+        # 8.4.2 + pluggy 1.6.0 + Python 3.12.10 hit a known
+        # `traceback_exception_init() got an unexpected keyword argument
+        # 'compact'` crash inside Starlette's WS receive loop when the
+        # captured logger formats a traceback. Same workaround SAL-4003
+        # applied. Production behaviour: we lose the traceback in the
+        # captured log but the error frame still goes out.
+        logger.warning(
+            "fleet_voice STT drain failed session=%s source=%s frames=%d err=%s",
+            session.session_id, source, len(frames), exc,
         )
         try:
             await session.send_text({
@@ -273,6 +304,89 @@ async def _drain_and_transcribe(session: VoiceSession, *, source: str) -> None:
                 "reason": "stt_drain_failed",
                 "detail": str(exc)[:200],
                 "seq": session.transcript_seq,
+            })
+        except Exception:
+            pass
+
+
+async def _speak_reply(session: VoiceSession, reply: str) -> None:
+    """Stream `reply` through TTS and push Opus binary frames to the WS.
+
+    Outbound shape (in order):
+      1. `{"type":"audio_start", "seq":N, "format":"opus",
+          "sample_rate":16000, "channels":1, "frame_ms":20}` — control
+          envelope so the device can prep its Opus decoder and jitter
+          buffer before the binary stream starts.
+      2. Zero or more binary frames, one Opus packet per WS binary
+          message. The device does not need to count these in real time
+          (they are self-describing Opus packets).
+      3. `{"type":"audio_end", "seq":N, "frames":F, "bytes":B}` — the
+          envelope's `seq` matches the matching `audio_start` and
+          carries the frame + byte count so the device can confirm its
+          jitter buffer received the full utterance.
+
+    On TTS failure we still emit `audio_end` with whatever frames did
+    land so the device's jitter buffer flushes; an additional
+    `{"type":"error","stage":"tts",...}` frame names the failure. The
+    WS stays open.
+
+    Lazy-imports `tts` so the module can load on bare boxes without
+    libopus / openai. Same survivable-degraded approach as the STT
+    pipeline: missing OPENAI_API_KEY produces an empty audio stream
+    (audio_start + audio_end with frames=0) but no error frame.
+    """
+    if not reply:
+        return
+    session.tts_seq += 1
+    seq = session.tts_seq
+    started = time.monotonic()
+    frames_out = 0
+    bytes_out = 0
+    await session.send_text({
+        "type": "audio_start",
+        "seq": seq,
+        "format": "opus",
+        "sample_rate": 16000,
+        "channels": 1,
+        "frame_ms": 20,
+    })
+    error: Exception | None = None
+    try:
+        from . import tts  # lazy: keeps module import-clean on dev boxes
+        async for opus_frame in tts.synthesize_to_opus_frames(reply):
+            if not opus_frame:
+                continue
+            await session.send_binary(opus_frame)
+            frames_out += 1
+            bytes_out += len(opus_frame)
+    except Exception as exc:
+        error = exc
+        logger.warning(
+            "fleet_voice TTS failed session=%s seq=%d err=%s",
+            session.session_id, seq, exc,
+        )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    session.tts_frames_out += frames_out
+    session.tts_bytes_out += bytes_out
+    session.tts_synth_latency_ms = elapsed_ms
+    try:
+        await session.send_text({
+            "type": "audio_end",
+            "seq": seq,
+            "frames": frames_out,
+            "bytes": bytes_out,
+        })
+    except Exception:
+        # Socket already gone; nothing we can do.
+        return
+    if error is not None:
+        try:
+            await session.send_text({
+                "type": "error",
+                "stage": "tts",
+                "reason": "tts_synth_failed",
+                "detail": str(error)[:200],
+                "seq": seq,
             })
         except Exception:
             pass
