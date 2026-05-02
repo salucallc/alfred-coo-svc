@@ -1,0 +1,1 @@
+# `register` Command\n\nRegisters a new agent with the system.\n\n## Usage\n\n```bash\nsaluca-cli register --name <agent-name>\n```\n\n## Examples\n\n```bash\nsaluca-cli register --name my-agent\n```\n

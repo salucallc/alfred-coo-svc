@@ -1,0 +1,1 @@
+# `unregister` Command\n\nUnregisters an existing agent.\n\n## Usage\n\n```bash\nsaluca-cli unregister --name <agent-name>\n```\n

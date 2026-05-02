@@ -1,0 +1,1 @@
+# `show` Command\n\nShows details for a specific agent.\n\n## Usage\n\n```bash\nsaluca-cli show --name <agent-name>\n```\n

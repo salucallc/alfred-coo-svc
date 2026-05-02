@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  alfred-coo:
+    image: alfred-coo:latest
+    ports:
+      - "8000:8000"
+  soul-svc:
+    image: soul-svc:latest
+    ports:
+      - "8001:8001"
+  tiresias:
+    image: tiresias:latest
+    ports:
+      - "8002:8002"

@@ -1,0 +1,1 @@
+# `list` Command\n\nLists all registered agents.\n\n## Usage\n\n```bash\nsaluca-cli list\n```\n
