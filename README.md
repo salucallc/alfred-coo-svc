@@ -5,6 +5,8 @@ Headless COO daemon that claims tasks from the Saluca mesh, routes them by perso
 ## Architecture
 
 - `src/alfred_coo/main.py` — poll → claim → dispatch → complete loop; loads persona-scoped soul memory as context; persists artifact paths + tool-call log on completion.
+- `src/alfred_coo/fleet_gateway/server.py` — sidecar WebSocket bridge at `/v1/fleet/link`, bearer auth via `FLEET_GATEWAY_KEY`. Uvicorn entry: `uvicorn alfred_coo.fleet_gateway.server:app --port 8090`.
+- `src/alfred_coo/fleet_voice/server.py` — sidecar WebSocket gateway at `/v1/fleet/voice` for the ReSpeaker XVF3800 voice puck (SAL-3997..4019) and the Alfred PWA. Bearer auth via `FLEET_VOICE_KEY`; admin sessions snapshot at `GET /v1/fleet/voice/sessions` (auth via `FLEET_VOICE_ADMIN_KEY`). Accepts opaque binary Opus frames + JSON control plane (`type`, `seq`, optional `payload`); server pings every 15s, closes 1011 on inactivity. STT/TTS adapters plug in via SAL-4003 / SAL-4005. Uvicorn entry: `uvicorn alfred_coo.fleet_voice.server:app --port 8091`.
 - `src/alfred_coo/persona.py` — `BUILTIN_PERSONAS` registry; each entry bundles system prompt, preferred + fallback model, topic scope, and opt-in tool list.
 - `src/alfred_coo/dispatch.py` — model-agnostic caller; `select_model` resolves `[tag:code]` / `[tag:strategy]` overrides; `call_with_tools` runs the multi-turn tool loop (max 8 iterations) against Ollama or OpenRouter OpenAI-compatible endpoints.
 - `src/alfred_coo/tools.py` — five built-in tools (`linear_create_issue`, `slack_post`, `mesh_task_create`, `propose_pr`, `http_get`); each is an async handler with a JSON schema rendered to OpenAI function form.
