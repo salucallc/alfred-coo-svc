@@ -532,3 +532,75 @@ def test_registry_hint_fallback_used_when_body_absent():
     finally:
         from alfred_coo.autonomous_build import orchestrator as orch_mod
         orch_mod._TARGET_HINTS.pop(sentinel, None)  # type: ignore[arg-type]
+
+
+def test_sentinel_placeholder_does_not_collide():
+    """Two tickets whose Target paths are placeholder sentinels (``TBD``,
+    ``N/A``, etc.) must NOT be treated as colliding on a real shared file.
+    Registry fallbacks for under-specified tickets often emit ``TBD`` as
+    a placeholder; left unfiltered, the collision detector treats every
+    such ticket as sharing the same "TBD" file and serializes them
+    indefinitely. Filter sentinel values out of the file_set entirely
+    so they never participate in the overlap test.
+    """
+    orch = _mk_orchestrator()
+    a = _ticket(
+        "ua", "SAL-1", "PLACEHOLDER-A",
+        body=_target_block(
+            "salucallc", "alfred-coo-svc",
+            new_paths=("TBD",),
+        ),
+    )
+    b = _ticket(
+        "ub", "SAL-2", "PLACEHOLDER-B",
+        body=_target_block(
+            "salucallc", "alfred-coo-svc",
+            new_paths=("TBD",),
+        ),
+    )
+    _seed_graph(orch, [a, b])
+    a.status = TicketStatus.DISPATCHED
+    # Both have TBD-only file_sets; should NOT collide.
+    assert orch._file_collision_for(b, [a]) is None
+
+    # Mixed case: real path on one side, sentinel on other → no collision.
+    c = _ticket(
+        "uc", "SAL-3", "REAL-PATH",
+        body=_target_block(
+            "salucallc", "alfred-coo-svc",
+            paths=("docker-compose.yml",),
+        ),
+    )
+    d = _ticket(
+        "ud", "SAL-4", "PLACEHOLDER-D",
+        body=_target_block(
+            "salucallc", "alfred-coo-svc",
+            new_paths=("n/a",),
+        ),
+    )
+    _seed_graph(orch, [c, d])
+    c.status = TicketStatus.DISPATCHED
+    assert orch._file_collision_for(d, [c]) is None
+
+    # Real overlap still wins.
+    e = _ticket(
+        "ue", "SAL-5", "REAL-A",
+        body=_target_block(
+            "salucallc", "alfred-coo-svc",
+            paths=("docker-compose.yml", "TBD"),
+        ),
+    )
+    f = _ticket(
+        "uf", "SAL-6", "REAL-B",
+        body=_target_block(
+            "salucallc", "alfred-coo-svc",
+            paths=("docker-compose.yml", "tbd"),
+        ),
+    )
+    _seed_graph(orch, [e, f])
+    e.status = TicketStatus.DISPATCHED
+    collision = orch._file_collision_for(f, [e])
+    assert collision is not None
+    blocker, shared = collision
+    assert blocker is e
+    assert shared == ("docker-compose.yml",)  # TBD/tbd filtered out
