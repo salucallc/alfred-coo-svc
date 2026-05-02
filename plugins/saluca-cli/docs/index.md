@@ -1,0 +1,1 @@
+# Saluca CLI Documentation\n\nWelcome to the Saluca CLI. This guide covers installation, usage, and command reference.\n\n## Commands\n\n- `register` – Register a new agent\n- `list` – List registered agents\n- `show` – Show details of an agent\n- `unregister` – Remove an agent\n- `rotate-soulkey` – Rotate the soulkey of an agent\n- `health` – Check system health\n

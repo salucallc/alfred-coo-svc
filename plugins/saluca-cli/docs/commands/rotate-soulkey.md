@@ -1,0 +1,1 @@
+# `rotate-soulkey` Command\n\nRotates the soulkey for an agent.\n\n## Usage\n\n```bash\nsaluca-cli rotate-soulkey --name <agent-name>\n```\n

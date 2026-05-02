@@ -1,0 +1,1 @@
+# `health` Command\n\nChecks the health of the system.\n\n## Usage\n\n```bash\nsaluca-cli health\n```\n
