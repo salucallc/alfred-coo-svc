@@ -135,6 +135,16 @@ class KickoffPayload(BaseModel):
     ack_message_ts: Optional[Any] = None
     ack_message_text: Optional[Any] = None
     acked_at: Optional[Any] = None
+
+    # SAL-2870 wave-retry self-spawned-kickoff metadata. Emitted by
+    # ``_queue_wave_retry_kickoff`` in orchestrator.py on every wave
+    # failure that still has retry budget. Without these fields whitelisted,
+    # SAL-3922's ``extra='forbid'`` validator dead-letters the retry
+    # kickoff before its first dispatch, defeating the entire wave-retry
+    # mechanism. Observed live 2026-05-02 23:16Z on AIO MC v1.1.0-rc1.
+    parent_kickoff_task_id: Optional[Any] = None
+    retry_reason: Optional[Any] = None
+    retry_for_wave: Optional[Any] = None
     # ``on_all_green`` accepts either a list of action strings (the
     # current canonical form, e.g. ``["tag v1.0.0-rc.7"]``) or a list
     # of dicts (reserved for future structured actions). We type as

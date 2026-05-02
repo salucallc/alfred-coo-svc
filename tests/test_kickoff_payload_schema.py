@@ -205,6 +205,34 @@ def test_informational_fields_accepted_without_warnings(caplog):
     )
 
 
+def test_wave_retry_self_spawned_metadata_accepted_without_warnings(caplog):
+    """SAL-2870 wave-retry self-spawned-kickoff metadata
+    (``parent_kickoff_task_id``, ``retry_reason``, ``retry_for_wave``)
+    must pass validation. Without these whitelisted, every wave-fail
+    retry kickoff dead-letters at parse and the wave-retry mechanism
+    is dead-on-arrival. Observed live 2026-05-02 23:16Z.
+    """
+    payload = {
+        "linear_project_id": "p1",
+        "wave_order": [1, 2, 3],
+        "wave_retry_budget": 1,
+        "parent_kickoff_task_id": "1261d755-8c41-4b0d-9696-88cf4fe35f0c",
+        "retry_reason": "wave 1 failed: green_ratio=0.00 < 0.90 and 4 non-critical failure(s)",
+        "retry_for_wave": 1,
+    }
+    with caplog.at_level(logging.WARNING):
+        out = validate_and_normalize_kickoff_payload(payload)
+    assert out["parent_kickoff_task_id"] == "1261d755-8c41-4b0d-9696-88cf4fe35f0c"
+    assert out["retry_for_wave"] == 1
+    assert "wave 1 failed" in out["retry_reason"]
+    warnings = [
+        r for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert warnings == [], (
+        f"wave-retry metadata must produce zero warnings; got {warnings!r}"
+    )
+
+
 # ── unknown-key rejection ──────────────────────────────────────────────────
 
 
