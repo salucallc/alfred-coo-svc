@@ -3570,6 +3570,19 @@ class AutonomousBuildOrchestrator:
         # the kickoff parent task, not on spawned children).
         self.model_routing_override: Dict[str, str] = {}
 
+        # SAL-4036 (2026-05-02) · file-collision-aware dispatch. Defaults
+        # to enabled; the kickoff payload's
+        # ``model_routing.disable_file_collision_check: true`` flag flips
+        # this off when the operator has manually verified that
+        # overlapping ``## Target`` paths cannot race (e.g. small AIO
+        # bring-ups where the wave is sequenced by hand). When enabled,
+        # ``_dispatch_ready_tickets`` serialises any ready ticket whose
+        # ``## Target`` ``paths`` ∪ ``new_paths`` intersects an in-flight
+        # ticket's set in the same repo (different ``owner``+``repo``
+        # never collides). See ``_ticket_file_set`` /
+        # ``_file_collision_for`` below.
+        self.disable_file_collision_check: bool = False
+
         # SAL-3799 (2026-05-01) · per-epic plan-doc URL overrides from the
         # kickoff payload's ``plan_doc_urls`` field. Read by
         # ``_resolve_plan_doc_url`` before the static ``_EPIC_TO_PLAN_FILE``
@@ -4070,6 +4083,21 @@ class AutonomousBuildOrchestrator:
         else:
             self.model_routing_override = {}
 
+        # SAL-4036 (2026-05-02): file-collision-aware dispatch override
+        # lives under ``model_routing.disable_file_collision_check``. Kept
+        # under the existing ``model_routing`` envelope so kickoff
+        # payloads don't grow another top-level key for what is
+        # effectively a routing-discipline knob. Truthy → revert to the
+        # pre-SAL-4036 concurrent dispatch (file overlap allowed); falsy
+        # / absent → enforce serialization. Non-dict ``model_routing``
+        # payload leaves the default (enabled) intact.
+        if isinstance(routing_override, dict):
+            self.disable_file_collision_check = bool(
+                routing_override.get("disable_file_collision_check", False)
+            )
+        else:
+            self.disable_file_collision_check = False
+
         # SAL-3799 (2026-05-01): per-epic plan-doc URL overrides. The
         # kickoff payload's ``plan_doc_urls`` field is an epic-keyed map
         # of fetchable raw.githubusercontent.com URLs read by
@@ -4349,6 +4377,36 @@ class AutonomousBuildOrchestrator:
                     break
                 if self._epic_in_flight(ticket.epic, in_flight) >= self.per_epic_cap:
                     continue
+                # SAL-4036 (2026-05-02) · file-collision-aware dispatch.
+                # The fourth scheduling layer (after wave gate, per-epic
+                # cap, Linear blockedBy/blocks) — refuse to dispatch a
+                # ticket whose ``## Target`` paths overlap a same-repo
+                # in-flight ticket's paths. Two builders editing the
+                # same file race on the merge and produce conflict
+                # storms (AIO W2-A + W3-E both rewriting
+                # ``docker-compose.yml`` was the canonical motivating
+                # case). The override
+                # ``model_routing.disable_file_collision_check: true``
+                # reverts to today's concurrent behaviour for kickoffs
+                # where the operator has manually verified no risk.
+                if not self.disable_file_collision_check:
+                    collision = self._file_collision_for(ticket, in_flight)
+                    if collision is not None:
+                        blocker, shared_files = collision
+                        logger.info(
+                            "[collision-serialize] %s waiting on %s "
+                            "(shared: %s)",
+                            ticket.identifier,
+                            blocker.identifier,
+                            ", ".join(shared_files),
+                        )
+                        self.state.record_event(
+                            "ticket_serialized_file_collision",
+                            identifier=ticket.identifier,
+                            blocked_by=blocker.identifier,
+                            shared_files=list(shared_files),
+                        )
+                        continue
                 # SS-08 gate (AB-06 stub for now).
                 if ticket.code.upper() == "SS-08":
                     allowed = await self._maybe_ss08_gate(ticket)
@@ -4854,6 +4912,84 @@ class AutonomousBuildOrchestrator:
 
     def _epic_in_flight(self, epic: str, in_flight: List[Ticket]) -> int:
         return sum(1 for t in in_flight if t.epic == epic)
+
+    # ── SAL-4036 · file-collision-aware dispatch ───────────────────────────
+    #
+    # A fourth scheduling layer alongside (1) wave gate, (2) per_epic_cap,
+    # (3) Linear blockedBy/blocks. Two same-wave tickets that touch the
+    # same file in the same repo (e.g. AI-W2-A and AI-W3-E both editing
+    # ``docker-compose.yml``) MUST not dispatch concurrently — their
+    # branches would race on the same path and produce merge conflicts +
+    # incoherent state. The check is keyed on the resolved ``TargetHint``
+    # for each ticket: ``paths`` ∪ ``new_paths`` is the set of files the
+    # builder is contracted to touch. Cross-repo (different ``owner`` or
+    # ``repo``) NEVER collides — different filesystems. Empty file_set
+    # (no Target block, or registry hint with neither ``paths`` nor
+    # ``new_paths``) is treated as "no collision evidence" and never
+    # blocks dispatch.
+
+    def _ticket_file_set(self, ticket: Ticket) -> Tuple[str, str, frozenset]:
+        """Return ``(owner, repo, file_set)`` for collision detection.
+
+        ``file_set`` = the union of ``hint.paths`` + ``hint.new_paths``
+        for the ticket's resolved ``TargetHint`` (body-parsed first, then
+        registry fallback). When the ticket has no resolvable hint or
+        the hint has neither ``paths`` nor ``new_paths`` populated,
+        returns ``("", "", frozenset())`` so the collision check
+        short-circuits to "no collision" — consistent with the
+        empty-target rule (see SAL-4036 spec, item 4).
+        """
+        try:
+            hint, _ = _resolve_target_hint(ticket)
+        except Exception:
+            # _resolve_target_hint already swallows resolver-level
+            # crashes; an exception here would be a defensive belt-and-
+            # suspenders — fall through to "no collision evidence".
+            logger.exception(
+                "[collision] hint resolution crashed for %s; "
+                "treating as no-collision",
+                getattr(ticket, "identifier", "?"),
+            )
+            return ("", "", frozenset())
+        if hint is None:
+            return ("", "", frozenset())
+        owner = (hint.owner or "").strip().lower()
+        repo = (hint.repo or "").strip().lower()
+        files = set(hint.paths or ()) | set(hint.new_paths or ())
+        return (owner, repo, frozenset(files))
+
+    def _file_collision_for(
+        self,
+        ticket: Ticket,
+        in_flight: List[Ticket],
+    ) -> Optional[Tuple[Ticket, Tuple[str, ...]]]:
+        """Return ``(blocking_ticket, sorted_shared_files)`` if any
+        in-flight ticket in the SAME repo touches at least one file the
+        candidate ticket also touches; else ``None``.
+
+        Different ``owner`` or ``repo`` never collides. Empty file_set
+        on either side → no collision (per SAL-4036 spec items 3-4).
+        Returns the FIRST collision found in ``in_flight`` order so the
+        log line is deterministic; with the dispatch loop iterating
+        ready tickets sequentially this is sufficient — once the
+        candidate is serialised, later in-flight overlaps are irrelevant.
+        """
+        cand_owner, cand_repo, cand_files = self._ticket_file_set(ticket)
+        if not cand_files:
+            return None
+        for other in in_flight:
+            if other.id == ticket.id:
+                continue
+            o_owner, o_repo, o_files = self._ticket_file_set(other)
+            if not o_files:
+                continue
+            # Cross-repo never collides (item 3).
+            if cand_owner != o_owner or cand_repo != o_repo:
+                continue
+            shared = cand_files & o_files
+            if shared:
+                return other, tuple(sorted(shared))
+        return None
 
     async def _dispatch_child(self, ticket: Ticket) -> None:
         """Create a `[persona:alfred-coo-a]` child mesh task for `ticket`,
