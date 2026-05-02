@@ -3704,6 +3704,39 @@ class AutonomousBuildOrchestrator:
                 "continuing (builders will fall back to persona Step 1 path)"
             )
 
+        # Reference content hydration: fetch raw.githubusercontent.com/salucallc/*
+        # URLs from each ticket body and inline as a ``## Resolved References``
+        # section in the in-memory ticket.body (NOT pushed back to Linear).
+        # The dispatched task body picks it up via ``_child_task_body`` reading
+        # ``ticket.body``.
+        #
+        # Why this matters: ticket bodies reference planning artifacts via
+        # raw URLs (e.g. tokens.css, design notes) that builders need to read
+        # before producing diffs. The persona prompt actively discourages
+        # http_get on plan-doc URLs (Step 1a, after a wave of false grounding-
+        # gap escalations from builders that fetched plan docs they shouldn't
+        # have). Pre-fetching the content here gives builders the data they
+        # need without relying on them to "follow this rule" (which qwen and
+        # gpt-oss have repeatedly failed to do).
+        try:
+            n = await self._hydrate_references_pre_dispatch()
+            if n:
+                logger.info(
+                    "[pre-dispatch refs] hydrated %d tickets with resolved "
+                    "reference content (project=%s)",
+                    n, self.linear_project_id,
+                )
+                self.state.record_event(
+                    "pre_dispatch_refs_hydrated",
+                    project_id=self.linear_project_id,
+                    count=n,
+                )
+        except Exception:
+            logger.exception(
+                "_hydrate_references_pre_dispatch crashed during startup; "
+                "continuing (builders may http_get reference URLs as fallback)"
+            )
+
         # 4. Main wave loop.
         for wave in self.wave_order:
             self.state.current_wave = wave
@@ -9283,6 +9316,164 @@ class AutonomousBuildOrchestrator:
     # budget on a single boot. The doctor's hydrate_apev_headings
     # playbook (5-min cadence, 5/tick) catches anything left over.
     _PRE_DISPATCH_HYDRATE_MAX: int = 200
+
+    # Reference-hydration caps. Each ticket can carry many URL references;
+    # we fetch up to ``_PRE_DISPATCH_REFS_PER_TICKET`` distinct URLs and
+    # truncate each fetched body at ``_PRE_DISPATCH_REFS_MAX_BYTES`` so a
+    # 65KB design doc + 4 more references can't blow the dispatched
+    # prompt budget. The truncation marker tells the builder where the
+    # full file is in case it needs more (and the persona prompt allows
+    # one fallback http_get).
+    _PRE_DISPATCH_REFS_PER_TICKET: int = 5
+    _PRE_DISPATCH_REFS_MAX_BYTES: int = 12_000
+
+    _REFERENCE_URL_RE = re.compile(
+        r"https://raw\.githubusercontent\.com/salucallc/[^\s\)\]\>'\"`]+",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _guess_code_lang(filename: str) -> str:
+        """Infer a code-fence language from a filename suffix. Empty string
+        when nothing fits — the markdown renderer handles that fine, the
+        fence still parses."""
+        lower = filename.lower()
+        if lower.endswith(".css"):
+            return "css"
+        if lower.endswith(".md") or lower.endswith(".markdown"):
+            return "markdown"
+        if lower.endswith(".html") or lower.endswith(".htm"):
+            return "html"
+        if lower.endswith(".json"):
+            return "json"
+        if lower.endswith(".py"):
+            return "python"
+        if lower.endswith((".ts", ".tsx")):
+            return "typescript"
+        if lower.endswith((".js", ".jsx", ".mjs")):
+            return "javascript"
+        if lower.endswith((".yml", ".yaml")):
+            return "yaml"
+        if lower.endswith(".toml"):
+            return "toml"
+        if lower.endswith(".sh"):
+            return "bash"
+        if lower.endswith(".sql"):
+            return "sql"
+        return ""
+
+    async def _fetch_one_reference(
+        self, client: httpx.AsyncClient, url: str,
+    ) -> tuple[str, Optional[str]]:
+        """Fetch one reference URL. Returns ``(content, None)`` on success,
+        ``("", error_str)`` on failure. Truncates content past
+        ``_PRE_DISPATCH_REFS_MAX_BYTES`` with a clear marker so the builder
+        knows it can fetch the full file as a fallback if needed."""
+        try:
+            resp = await client.get(url)
+        except Exception as e:  # noqa: BLE001 — best-effort, logged in caller
+            return "", f"{type(e).__name__}"
+        if resp.status_code != 200:
+            return "", f"HTTP {resp.status_code}"
+        content = resp.text
+        cap = self._PRE_DISPATCH_REFS_MAX_BYTES
+        if len(content) > cap:
+            content = (
+                content[:cap]
+                + f"\n\n... [truncated at {cap} bytes; "
+                f"full file at {url}]"
+            )
+        return content, None
+
+    async def _hydrate_references_pre_dispatch(self) -> int:
+        """Pre-fetch reference URLs and inline content into in-memory bodies.
+
+        For each non-terminal ticket in the graph, scan ``ticket.body`` for
+        ``raw.githubusercontent.com/salucallc/*`` URLs, fetch each (bounded
+        by ``_PRE_DISPATCH_REFS_PER_TICKET`` and per-fetch size), and append
+        a ``## Resolved References`` section with the inlined content. The
+        Linear ticket body is NOT mutated — only the in-memory ``ticket.body``
+        used by ``_child_task_body`` to render the dispatched prompt.
+
+        Idempotent: skips tickets whose body already contains the
+        ``## Resolved References`` heading. Best-effort: per-fetch errors
+        are inlined as a "fetch failed" line and the loop continues.
+
+        Returns the count of tickets that received at least one inlined
+        reference (success or failure note).
+        """
+        if not self.graph or not self.graph.nodes:
+            return 0
+
+        gh_token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+        if not gh_token:
+            logger.warning(
+                "[pre-dispatch refs] GITHUB_TOKEN missing; skipping "
+                "(builders may http_get reference URLs as fallback)"
+            )
+            return 0
+
+        hydrated = 0
+        try:
+            async with httpx.AsyncClient(
+                timeout=10.0,
+                headers={
+                    "User-Agent": "saluca-alfred/1.0 (orchestrator pre-dispatch refs)",
+                    "Authorization": f"Bearer {gh_token}",
+                },
+            ) as client:
+                for ticket in self.graph.nodes.values():
+                    if ticket.status in TERMINAL_STATES:
+                        continue
+                    body = ticket.body or ""
+                    if "## Resolved References" in body:
+                        continue
+                    urls = list(dict.fromkeys(
+                        self._REFERENCE_URL_RE.findall(body)
+                    ))
+                    if not urls:
+                        continue
+                    urls = urls[: self._PRE_DISPATCH_REFS_PER_TICKET]
+
+                    sections: list[str] = []
+                    for url in urls:
+                        content, err = await self._fetch_one_reference(
+                            client, url,
+                        )
+                        filename = url.rsplit("/", 1)[-1] or "(no-name)"
+                        if err:
+                            sections.append(
+                                f"### {filename}\n"
+                                f"URL: {url}\n"
+                                f"(fetch failed: {err}; you may http_get this URL "
+                                f"once as a fallback)\n"
+                            )
+                        else:
+                            lang = self._guess_code_lang(filename)
+                            sections.append(
+                                f"### {filename}\n"
+                                f"URL: {url}\n"
+                                f"\n"
+                                f"```{lang}\n{content}\n```\n"
+                            )
+
+                    if not sections:
+                        continue
+
+                    block = (
+                        "\n\n## Resolved References\n"
+                        "(Pre-fetched by the orchestrator. Read this section "
+                        "directly — do NOT call http_get on these URLs.)\n\n"
+                        + "\n".join(sections)
+                    )
+                    ticket.body = body.rstrip() + block
+                    hydrated += 1
+        except Exception:
+            logger.exception(
+                "[pre-dispatch refs] httpx client lifecycle failed; "
+                "returning partial count=%d", hydrated,
+            )
+        return hydrated
 
     async def _sweep_stale_in_progress(self, project_id: str) -> int:
         """Find Linear tickets in ``project_id`` stuck in "In Progress" with
