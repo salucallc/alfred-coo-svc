@@ -8423,12 +8423,30 @@ class AutonomousBuildOrchestrator:
         cp_failed = [t for t in failed if t.is_critical_path]
         green = [t for t in scored if t.status == TicketStatus.MERGED_GREEN]
         threshold = float(self.wave_green_ratio_threshold)
-        # SAL-3072: include excused in denominator (was len(scored)).
-        # Empty waves now report ratio=0.0 and fail the threshold instead
-        # of vacuously passing. All-excused waves likewise fail (correctly
-        # surfacing that the wave shipped nothing).
-        denominator = len(scored) + len(excused)
-        green_ratio = (len(green) / denominator) if denominator > 0 else 0.0
+        # SAL-3919 (2026-05-02): excused tickets are EXCLUDED from the
+        # green-ratio denominator. Substrate fix #83 (PR #353) added
+        # Cancelled / Canceled / Duplicate Linear states as a fourth
+        # excusal axis, but left SAL-3072's "excused-in-denominator" math
+        # in place. Result: a wave with green=1, excused=3, failed=0,
+        # total=4 reported ratio = 1/4 = 0.25 and halted at the 0.9
+        # threshold even though 1/(4-3) = 1.0 should pass — the kickoff
+        # for mesh task 49e7fa40 hit exactly that shape on Agent-Ingest.
+        #
+        # Excused tickets are work the orchestrator legitimately did NOT
+        # own this wave (PATH_CONFLICT, NO_HINT, HUMAN_ASSIGNED,
+        # Cancelled / Duplicate Linear states); they should not depress
+        # the green ratio for the work it DID own. When every ticket in
+        # the wave is excused (denominator == 0), the wave is a no-op
+        # and we pass through with ratio = 1.0 so the orchestrator
+        # advances to the next wave instead of halting.
+        #
+        # Note: this is a deliberate revert of SAL-3072's force-pass
+        # mitigation. The force-pass concern there (5 green + 9 excused
+        # → "ship rate 100%") is a metrics/observability issue, not a
+        # gate issue — the gate's job is to halt when failures exceed
+        # the threshold, and an excused ticket is not a failure.
+        denominator = len(scored)
+        green_ratio = (len(green) / denominator) if denominator > 0 else 1.0
 
         # AB-17-w: structured wave-end log line. Always emitted, regardless
         # of decision, so an operator tailing logs sees the full math
@@ -8469,32 +8487,30 @@ class AutonomousBuildOrchestrator:
         # got logged as success. Now it raises with ratio=0.0 < threshold.
 
         if green_ratio < threshold:
-            # Below threshold. Distinguish "real failures pulled the ratio
-            # down" from "nothing shipped (all excused, or empty post-
-            # repo-missing-filter)" for ops triage, but both raise.
+            # Below threshold. Post-SAL-3919, denominator=0 short-circuits
+            # to ratio=1.0 above (all-excused or empty-after-filter waves
+            # pass through silently), so reaching this branch implies
+            # denominator > 0 and at least one real failure or unmerged
+            # green ticket. The two messages below distinguish "real
+            # failures pulled the ratio down" from the residual edge
+            # case where there are no failures, no greens, but scored
+            # tickets remain (e.g. status PENDING / IN_PROGRESS that the
+            # gate observed as not-green-yet).
             if failed:
                 msg = (
                     f"wave {wave_n} failed: green_ratio={green_ratio:.2f} < "
                     f"{threshold:.2f} and {len(failed)} non-critical failure(s)"
                 )
-            elif denominator <= 0:
-                # All tickets were repo-missing-filtered. Pre-SAL-3072
-                # this would have been masked as a vacuous all-excused
-                # pass; now surfaced as a halt so ops sees the grounding
-                # gap.
-                msg = (
-                    f"wave {wave_n} failed: zero scoreable tickets "
-                    f"(all REPO_MISSING-filtered); orchestrator state "
-                    f"corrupt or grounding gap"
-                )
             else:
-                # Excused-dominant wave: no failures, no greens, just
-                # tickets the orchestrator never owned. Pre-SAL-3072 this
-                # was the force-pass scenario the mining sub flagged.
+                # Residual: scored tickets exist but none are MERGED_GREEN
+                # and none are FAILED/ABANDONED. Could happen if the gate
+                # observed mid-flight tickets. Pre-SAL-3919 this branch
+                # also caught the all-excused force-pass shape; that is
+                # now handled by the denominator=0 → ratio=1.0 fallback.
                 msg = (
                     f"wave {wave_n} failed: green_ratio={green_ratio:.2f} < "
                     f"{threshold:.2f} (green={len(green)} excused="
-                    f"{len(excused)} of {denominator}); nothing shipped"
+                    f"{len(excused)} of {denominator} scored); nothing shipped"
                 )
             logger.error(msg)
             self.state.record_event(

@@ -1,27 +1,40 @@
-"""SAL-3072 (2026-04-28) — wave-gate ratio with excused-in-denominator.
+"""SAL-3919 (2026-05-02) — wave-gate ratio with excused-OUT-of-denominator.
 
-Mining sub findings (2026-04-28): 97% of wave-gate passes (83/86 in 7d
-trailing window) were force-passes where the green-ratio denominator
-excluded excused tickets, so a wave with 5 green and 9 excused looked
-like ratio=1.00 (passed) when in reality only 5 of 14 actually shipped.
-One pass even fired with denominator=0 ("no work, gate passed") because
-the all-excused branch was a vacuous-truth pass.
+History:
+- SAL-3072 (2026-04-28) added excused tickets to the denominator to
+  prevent a "force-pass bug" where a wave with 5 green and 9 excused
+  reported ratio=1.00.
+- Substrate fix #83 (PR #353, 2026-05-02) added Canceled / Cancelled /
+  Duplicate Linear states as a fourth excusal axis. Combined with
+  SAL-3072's denominator math, an Agent-Ingest kickoff (mesh task
+  49e7fa40) hit green=1 / excused=3 / failed=0 / total=4 → ratio=0.25
+  → halt at the 0.9 threshold even though 1/(4-3) = 1.0 should pass.
+- SAL-3919 (this file) reverts the SAL-3072 denominator change.
+  Excused tickets are work the orchestrator legitimately did NOT own
+  this wave; they should not depress the green ratio for the work it
+  DID own. When EVERY ticket is excused (denominator==0), the wave is
+  a no-op and passes through with ratio=1.0.
 
-This file pins the new contract: ``denominator = green + failed +
-excused``. The default threshold (0.9 / SOFT_GREEN_THRESHOLD) is
-unchanged; the bug was the formula, not the bar.
+The "force-pass" concern from SAL-3072 (ship-rate metrics) is a
+metrics/observability question, not a gate question — the gate's job
+is to halt when failures exceed the threshold, and an excused ticket
+is not a failure.
 
-Test matrix mirrors the cases in the SAL-3072 spec, scaled to the
-codebase's actual default (0.9 — the prompt's example used 0.50 which
-is a separate tuning question):
+Post-SAL-3919 contract: ``denominator = green + failed`` (i.e.
+``len(scored)``); excused tickets are excluded. Default threshold
+(0.9 / SOFT_GREEN_THRESHOLD) unchanged.
+
+Test matrix:
 
     green | failed | excused | denom | ratio | result
     ------|--------|---------|-------|-------|-------
-    5     |   0    |    9    |  14   | 0.36  | fail (was force-pass)
+    5     |   0    |    9    |   5   | 1.00  | pass (was halt under SAL-3072)
     9     |   1    |    0    |  10   | 0.90  | pass (soft-green)
-    0     |   0    |    14   |  14   | 0.00  | fail (was force-pass)
-    0     |   0    |    0    |   0   | 0.00  | fail (empty wave; was vacuous)
+    0     |   0    |   14    |   0   | 1.00  | pass (was halt under SAL-3072)
+    0     |   0    |    0    |   0   | 1.00  | pass (empty wave handled by short-circuit)
     9     |   1    |    0    |  10   | 0.90  | pass (full match w/ failure)
+    1     |   2    |    1    |   3   | 0.33  | halt (real failures still gate)
+    1     |   0    |    3    |   1   | 1.00  | halt-was-bug repro (SAL-3919)
 """
 
 from __future__ import annotations
@@ -147,10 +160,18 @@ def _excuse_path_conflict(orch: AutonomousBuildOrchestrator, t: Ticket) -> None:
 # ── The five SAL-3072 cases ────────────────────────────────────────────────
 
 
-async def test_5_green_9_excused_fails_was_force_pass(monkeypatch):
-    """Case 1 (the bug): 5 green / 0 failed / 9 excused.
-    Pre-fix denominator=5 → ratio=1.00 → "passed" (force-pass).
-    Post-fix denominator=14 → ratio≈0.36 → fails 0.9 threshold.
+async def test_5_green_9_excused_passes_post_sal_3919(monkeypatch):
+    """Case 1 — SAL-3919 contract flip: 5 green / 0 failed / 9 excused.
+
+    SAL-3072 history: pinned this case to fail with denominator=14 →
+    ratio≈0.36 to mitigate a "force-pass" metrics concern (mining sub
+    found 97% of passes had excused tickets in the trailing 7d window).
+
+    SAL-3919 reverts that. Excused tickets are work the orchestrator
+    legitimately did NOT own this wave; the gate should not punish a
+    wave for excusals. Post-fix: denominator=5 (scored only), ratio=
+    1.0, soft-green pass / all-green pass. The ship-rate metric is a
+    separate observability concern.
     """
     orch = _mk_orch()
     orch.poll_sleep_sec = 0
@@ -164,15 +185,13 @@ async def test_5_green_9_excused_fails_was_force_pass(monkeypatch):
     _seed(orch, greens + excused)
     await _patch_nosleep(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="nothing shipped|green_ratio"):
-        await orch._wait_for_wave_gate(1)
-    halt = next(
-        e for e in orch.state.events
-        if e["kind"] == "wave_halt_below_soft_green"
+    # No raise; wave passes.
+    await orch._wait_for_wave_gate(1)
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "wave_halt_below_soft_green" not in kinds
+    assert "wave_all_green" in kinds, (
+        f"expected wave_all_green; got {kinds}"
     )
-    assert halt.get("excused_count") == 9
-    # 5 / (5 + 0 + 9) = 5/14 ≈ 0.357
-    assert halt.get("green_ratio") == pytest.approx(5 / 14, abs=1e-3)
 
 
 async def test_5_green_0_failed_0_excused_passes_lower_threshold(monkeypatch):
@@ -202,12 +221,13 @@ async def test_5_green_0_failed_0_excused_passes_lower_threshold(monkeypatch):
     assert "wave_halt_below_soft_green" not in kinds
 
 
-async def test_0_green_14_excused_fails_was_vacuous_pass(monkeypatch):
-    """Case 3: 0 green / 0 failed / 14 excused.
-    Pre-fix denominator=0 → vacuous "skipped_all_excused" pass.
-    Post-fix denominator=14, ratio=0.0 → fails. The mining-sub flagged
-    this as the wave-0 force-pass scenario (36 times in a row, same 9
-    tickets, never shipped, gate kept "passing").
+async def test_0_green_14_excused_passes_post_sal_3919(monkeypatch):
+    """Case 3 — SAL-3919: 0 green / 0 failed / 14 excused (all-excused).
+
+    SAL-3072 pinned denominator=14 → ratio=0.0 → halt. SAL-3919 treats
+    an all-excused wave as a no-op: denominator=0 short-circuits to
+    ratio=1.0 and the gate advances. APE/V acceptance case 2 from the
+    SAL-3919 spec.
     """
     orch = _mk_orch()
     orch.poll_sleep_sec = 0
@@ -218,17 +238,14 @@ async def test_0_green_14_excused_fails_was_vacuous_pass(monkeypatch):
     _seed(orch, excused)
     await _patch_nosleep(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="nothing shipped|green_ratio"):
-        await orch._wait_for_wave_gate(1)
-    halt = next(
-        e for e in orch.state.events
-        if e["kind"] == "wave_halt_below_soft_green"
-    )
-    assert halt.get("excused_count") == 14
-    assert halt.get("green_ratio") == pytest.approx(0.0)
-    # Crucially: the old vacuous-pass event is NOT emitted.
+    # No raise — gate advances silently.
+    await orch._wait_for_wave_gate(1)
     kinds = [e["kind"] for e in orch.state.events]
-    assert "wave_all_excused" not in kinds
+    assert "wave_halt_below_soft_green" not in kinds, (
+        f"all-excused wave must pass post-SAL-3919; got {kinds}"
+    )
+    # All-green branch fires (no failures, ratio>=threshold via fallback).
+    assert "wave_all_green" in kinds
 
 
 async def test_empty_wave_short_circuits(monkeypatch):
@@ -321,12 +338,11 @@ async def test_grounding_gap_escalated_still_excused_post_sal_3676(monkeypatch):
     of them must stay excused (axis 4 still matches ESCALATED) so the
     pre-fix grounding-gap behaviour is preserved.
 
-    With excused-in-denominator (SAL-3072) the wave still fails at
-    ratio=0.0, but the operator-facing message is "(green=0
-    excused=N); nothing shipped" — NOT "X non-critical failure(s)".
-    That's the discriminator: ESCALATED tickets show up in the
-    excused-dominant message bucket, not in the failed-pulled-the-
-    ratio-down bucket.
+    SAL-3072 history: pinned this all-escalated wave to halt at
+    ratio=0.0. SAL-3919 (this revision) treats all-excused waves as
+    no-ops (denominator=0 → ratio=1.0 fallback → pass). The discriminator
+    that this test exercises — ESCALATED is excused, not counted as
+    failed — is unchanged; only the gate decision flipped.
     """
     orch = _mk_orch()
     orch.poll_sleep_sec = 0
@@ -336,20 +352,16 @@ async def test_grounding_gap_escalated_still_excused_post_sal_3676(monkeypatch):
     _seed(orch, tickets)
     await _patch_nosleep(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="nothing shipped|green_ratio"):
-        await orch._wait_for_wave_gate(1)
-
-    halt = next(
-        e for e in orch.state.events
-        if e["kind"] == "wave_halt_below_soft_green"
-    )
-    # All 4 ESCALATED stay excused; failed bucket empty.
-    assert halt.get("excused_count") == 4
-    assert halt.get("failed") == [], (
-        f"ESCALATED must NOT count in failed column post-SAL-3676; "
-        f"got failed={halt.get('failed')}"
-    )
-    assert halt.get("green_ratio") == pytest.approx(0.0)
+    # No raise — all-excused wave passes through.
+    await orch._wait_for_wave_gate(1)
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "wave_halt_below_soft_green" not in kinds
+    # Predicate-level: ESCALATED still excused (the SAL-3676 invariant).
+    for t in tickets:
+        assert orch._is_wave_gate_excused(t) is True, (
+            f"ESCALATED ticket {t.identifier} must stay excused; "
+            f"SAL-3676 invariant"
+        )
 
 
 async def test_hard_timeout_abandoned_counts_as_failed_post_sal_3676(
@@ -426,9 +438,12 @@ async def test_mixed_escalated_and_abandoned_split_correctly(monkeypatch):
       - The three abandoned tickets → counted in the FAILED column.
       - The two greens → numerator.
 
-    denominator = 2 green + 3 failed + 2 excused = 7
-    ratio = 2 / 7 ≈ 0.286 → below 0.9 → halt with the failure-class
-    message ("3 non-critical failure(s)").
+    SAL-3919 contract: denominator = 2 green + 3 failed = 5 (excused
+    excluded), ratio = 2 / 5 = 0.4 → below 0.9 → halt with the
+    failure-class message ("3 non-critical failure(s)"). Pre-SAL-3919
+    the denominator was 7 and the ratio 2/7 ≈ 0.286; both halt, but
+    SAL-3919 surfaces the truer ship-rate among work the orchestrator
+    actually owned.
 
     Mirrors tonight's MSSP-Ext crash shape (green=2 abandoned=3 excused=
     1 + 1) so we'd catch a regression of this exact incident. Pre-fix
@@ -481,8 +496,8 @@ async def test_mixed_escalated_and_abandoned_split_correctly(monkeypatch):
         f"ESCALATED + human-assigned must total 2 excused; got "
         f"excused_count={halt.get('excused_count')}"
     )
-    # 2 / (2 + 3 + 2) = 2/7 ≈ 0.286
-    assert halt.get("green_ratio") == pytest.approx(2 / 7, abs=1e-3)
+    # SAL-3919: 2 / (2 + 3) = 2/5 = 0.4 (excused excluded from denom).
+    assert halt.get("green_ratio") == pytest.approx(2 / 5, abs=1e-3)
 
 
 # ── Substrate task #83 (2026-05-02) — Linear Canceled excusal axis ─────────
@@ -504,12 +519,12 @@ async def test_canceled_linear_state_excused_post_task_83(monkeypatch):
     """A ticket with Linear state == Canceled must be excused from the
     wave-gate denominator regardless of its internal TicketStatus.
 
-    Repro of tonight's Agent-Ingest chain crash: green=0 failed=1
-    excused=3 denom=4 ratio=0.00 because SAL-3610 (correctly Canceled
-    after the soul-svc canonical decision) showed up in the failed
-    column. Post-fix: the Canceled ticket joins the excused bucket so
-    the denominator is 3 (all-excused empty wave) and the operator
-    message is the excused-dominant shape, not a spurious failure.
+    SAL-3919 (2026-05-02): combined with the new "excused-out-of-
+    denominator" math, an all-Canceled/ESCALATED wave is denominator=0
+    → ratio=1.0 fallback → gate advances. Pre-SAL-3919 (substrate-#83
+    only) the denominator was 4 and the gate halted at ratio=0.0 even
+    though the Canceled ticket was correctly identified as excused.
+    SAL-3919 closes the loop so descoped tickets don't halt the gate.
     """
     orch = _mk_orch()
     orch.poll_sleep_sec = 0
@@ -527,27 +542,16 @@ async def test_canceled_linear_state_excused_post_task_83(monkeypatch):
     _seed(orch, [canceled] + others)
     await _patch_nosleep(monkeypatch)
 
-    # Sanity check: the predicate excuses the Canceled ticket directly.
+    # Predicate: the Canceled ticket is excused (substrate-#83 invariant).
     assert orch._is_wave_gate_excused(canceled) is True
 
-    with pytest.raises(RuntimeError, match="nothing shipped|green_ratio"):
-        await orch._wait_for_wave_gate(1)
-
-    halt = next(
-        e for e in orch.state.events
-        if e["kind"] == "wave_halt_below_soft_green"
+    # SAL-3919: all-excused wave passes through without halting.
+    await orch._wait_for_wave_gate(1)
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "wave_halt_below_soft_green" not in kinds, (
+        f"all-excused wave (1 Canceled + 3 ESCALATED) must pass post-"
+        f"SAL-3919; got {kinds}"
     )
-    # All 4 are excused (1 Canceled + 3 ESCALATED); failed bucket empty.
-    assert halt.get("excused_count") == 4
-    assert halt.get("failed") == [], (
-        f"Canceled Linear state must NOT count in failed column post-#83; "
-        f"got failed={halt.get('failed')}"
-    )
-    # 0 green / (0 + 0 + 4 excused) = 0/4 (denominator is shifted excused-
-    # only). The post-SAL-3072 formula treats this as ratio=0.0; the test
-    # only locks behaviour at the bucket level so SAL-3072's all-excused
-    # ratio semantics can evolve without churning this test.
-    assert halt.get("green_ratio") == pytest.approx(0.0)
 
 
 async def test_duplicate_linear_state_also_excused(monkeypatch):
@@ -572,3 +576,174 @@ async def test_lowercase_cancelled_spelling_excused(monkeypatch):
     t.status = TicketStatus.FAILED
     t.linear_state = "cancelled"  # lowercase, double-l British spelling
     assert orch._is_wave_gate_excused(t) is True
+
+
+# ── SAL-3919 (2026-05-02) — wave-gate excused-out-of-denominator APE/V ─────
+#
+# Reproduces the Agent-Ingest kickoff failure (mesh task 49e7fa40-0001-
+# 4e5e-9cfb-a9023f4defb2) and pins the four-case acceptance matrix from
+# the SAL-3919 spec. With the SAL-3072 denominator math, a wave with
+# green=1, excused=3, failed=0, total=4 reported ratio=1/4=0.25 and
+# halted at the 0.9 threshold even though 1/(4-3)=1.0 should pass.
+# Post-fix: excused tickets are excluded from the denominator; an all-
+# excused wave (denominator=0) short-circuits to ratio=1.0.
+
+
+async def test_sal_3919_case_1_one_green_three_excused_passes(monkeypatch):
+    """APE/V case 1: green=1, excused=3, failed=0, total=4.
+    denominator = total - excused = 1; ratio = 1/1 = 1.0; gate passes.
+    Direct repro of mesh task 49e7fa40 — Agent-Ingest wave 1 with
+    SAL-3612, SAL-3611, SAL-3609 all Cancelled/Duplicate.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+
+    green = _t("ug-ai-1", "SAL-AI-G1", "AI-W1A")
+    green.status = TicketStatus.MERGED_GREEN
+
+    canceled_ids = ["SAL-3612", "SAL-3611", "SAL-3609"]
+    canceled = []
+    for ident in canceled_ids:
+        t = _t(f"uc-{ident}", ident, f"AI-{ident}")
+        t.status = TicketStatus.FAILED
+        t.linear_state = "Cancelled"
+        canceled.append(t)
+
+    _seed(orch, [green] + canceled)
+    await _patch_nosleep(monkeypatch)
+
+    # No raise; gate advances.
+    await orch._wait_for_wave_gate(1)
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "wave_halt_below_soft_green" not in kinds, (
+        f"SAL-3919 case 1: gate must advance with 1 green + 3 excused; "
+        f"got {kinds}"
+    )
+    # Ratio computed against scored-only denominator: 1/1 = 1.0 → all-green.
+    assert "wave_all_green" in kinds, (
+        f"expected wave_all_green; got {kinds}"
+    )
+
+
+async def test_sal_3919_case_2_all_excused_passes_silently(monkeypatch):
+    """APE/V case 2: green=0, excused=4, failed=0, total=4.
+    denominator = 4-4 = 0; ratio falls back to 1.0; gate passes silently.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+
+    excused = []
+    for i in range(4):
+        t = _t(f"ux{i}", f"SAL-X{i}", f"AI-X{i}")
+        t.status = TicketStatus.FAILED
+        t.linear_state = "Cancelled"
+        excused.append(t)
+
+    _seed(orch, excused)
+    await _patch_nosleep(monkeypatch)
+
+    # No raise — denominator=0 fallback.
+    await orch._wait_for_wave_gate(1)
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "wave_halt_below_soft_green" not in kinds, (
+        f"SAL-3919 case 2: all-excused wave must pass silently; got {kinds}"
+    )
+
+
+async def test_sal_3919_case_3_real_failures_still_halt(monkeypatch):
+    """APE/V case 3 (regression): green=1, excused=1, failed=2, total=4.
+    denominator = 4-1 = 3; ratio = 1/3 ≈ 0.333; gate halts at 0.9.
+    Confirms that real failures still gate the wave even with excused
+    tickets removed from the denominator.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+
+    green = _t("ug-r3", "SAL-R3-G", "AI-R3-G")
+    green.status = TicketStatus.MERGED_GREEN
+
+    canceled = _t("uc-r3", "SAL-R3-C", "AI-R3-C")
+    canceled.status = TicketStatus.FAILED
+    canceled.linear_state = "Cancelled"
+
+    failed = [_t(f"uf-r3-{i}", f"SAL-R3-F{i}", f"AI-R3-F{i}") for i in range(2)]
+    for t in failed:
+        t.status = TicketStatus.FAILED  # non-excused failure
+
+    _seed(orch, [green, canceled] + failed)
+    await _patch_nosleep(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="non-critical failure|green_ratio"):
+        await orch._wait_for_wave_gate(1)
+
+    halt = next(
+        e for e in orch.state.events
+        if e["kind"] == "wave_halt_below_soft_green"
+    )
+    # excused = 1 (Cancelled), failed = 2 (the two SAL-R3-F*), green = 1.
+    assert halt.get("excused_count") == 1
+    assert sorted(halt.get("failed") or []) == ["SAL-R3-F0", "SAL-R3-F1"]
+    # SAL-3919 ratio: 1/(1+2) = 1/3.
+    assert halt.get("green_ratio") == pytest.approx(1 / 3, abs=1e-3)
+
+
+async def test_sal_3919_case_4_fully_green_still_passes(monkeypatch):
+    """APE/V case 4 (regression): green=4, excused=0, failed=0, total=4.
+    denominator = 4-0 = 4; ratio = 4/4 = 1.0; gate passes.
+    Confirms fully-green waves still pass identically post-fix.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+
+    greens = [_t(f"ug-r4-{i}", f"SAL-R4-G{i}", f"AI-R4-G{i}") for i in range(4)]
+    for t in greens:
+        t.status = TicketStatus.MERGED_GREEN
+
+    _seed(orch, greens)
+    await _patch_nosleep(monkeypatch)
+
+    # No raise; all-green pass.
+    await orch._wait_for_wave_gate(1)
+    kinds = [e["kind"] for e in orch.state.events]
+    assert "wave_all_green" in kinds, f"expected wave_all_green; got {kinds}"
+    assert "wave_halt_below_soft_green" not in kinds
+
+
+async def test_sal_3919_halt_event_payload_consistent(monkeypatch):
+    """The `green_ratio` field on the wave_halt_below_soft_green event
+    must match the gate decision. With excused excluded from the
+    denominator, the logged ratio mirrors the math the gate used.
+    Regression check that the event payload didn't drift from the
+    decision math (per SAL-3919 spec: "Apply the same logic in any
+    `wave_halt_below_soft_green` event payload so the logged
+    `green_ratio` matches the gate decision.").
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+
+    green = _t("ug-cons", "SAL-CONS-G", "AI-CONS-G")
+    green.status = TicketStatus.MERGED_GREEN
+
+    canceled = _t("uc-cons", "SAL-CONS-C", "AI-CONS-C")
+    canceled.status = TicketStatus.FAILED
+    canceled.linear_state = "Duplicate"
+
+    failed_t = [_t(f"uf-cons-{i}", f"SAL-CONS-F{i}", f"AI-CONS-F{i}") for i in range(3)]
+    for t in failed_t:
+        t.status = TicketStatus.FAILED
+
+    _seed(orch, [green, canceled] + failed_t)
+    await _patch_nosleep(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        await orch._wait_for_wave_gate(1)
+
+    halt = next(
+        e for e in orch.state.events
+        if e["kind"] == "wave_halt_below_soft_green"
+    )
+    # SAL-3919: denominator = 1 green + 3 failed = 4; ratio = 1/4 = 0.25.
+    # Excused=1 (Duplicate) is excluded from the denominator.
+    assert halt.get("excused_count") == 1
+    assert halt.get("green_ratio") == pytest.approx(1 / 4, abs=1e-3)
+    assert halt.get("threshold") == pytest.approx(0.9)
