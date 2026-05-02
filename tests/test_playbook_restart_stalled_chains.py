@@ -32,6 +32,7 @@ from alfred_coo.autonomous_build.playbooks import (
 )
 from alfred_coo.autonomous_build.playbooks.restart_stalled_chains import (
     DEFAULT_ATTEMPT_BUDGET,
+    DEFAULT_ATTEMPT_COOLDOWN_SEC,
     DEFAULT_ATTEMPT_WINDOW_SEC,
     DEFAULT_HEARTBEAT_FRESHNESS_SEC,
     _chain_alive_for_project,
@@ -510,6 +511,109 @@ def test_playbook_result_render_digest_separates_escalations_from_errors():
     body = "\n".join(lines[1:])
     assert "needs human:" in body
     assert "MSSP-Fed" in body
+
+
+# ── Substrate task #87 (2026-05-02): per-project cooldown ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_cooldown_active_skips_when_recent_attempt(
+    monkeypatch, tmp_path
+):
+    """A recent attempt within ``attempt_cooldown_sec`` (default 600s)
+    blocks a fresh restart even when budget is available. Substrate task
+    #87: doctor's 5-minute surveillance tick must NOT burn the full
+    budget in 15 minutes when a chain is genuinely dead — leaves
+    operator no time to intervene before escalation."""
+    pid = "proj-1"
+    history_path = str(tmp_path / "history.json")
+    now = time.time()
+    # One attempt 3 minutes ago — well inside the 10-minute cooldown.
+    seed = {pid: [now - 180]}
+    import json as _j
+    from pathlib import Path as _P
+    _P(history_path).write_text(_j.dumps(seed), encoding="utf-8")
+
+    pb = RestartStalledChainsPlaybook(
+        projects={"Cockpit-UX": pid},
+        history_path=history_path,
+        # default attempt_cooldown_sec=600
+    )
+    _patch_httpx(monkeypatch, _payload_with_backlog(7))
+    mesh = _MeshWithCreate()
+    res = await pb.execute(linear_api_key="k", dry_run=False, mesh=mesh)
+
+    # Cooldown should suppress the restart.
+    assert res.actions_taken == 0, "cooldown must block fresh kickoff"
+    assert mesh.created == [], "no kickoff queued during cooldown"
+    assert res.actions_skipped == 1
+    # Notable should explain the cooldown so operator knows why no restart.
+    assert any("cooldown active" in n for n in res.notable), (
+        f"expected cooldown notable, got {res.notable!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_cooldown_expired_allows_restart(
+    monkeypatch, tmp_path
+):
+    """Once cooldown expires (last attempt > attempt_cooldown_sec ago),
+    a fresh restart proceeds normally. Verifies cooldown is a sliding
+    window, not a permanent block."""
+    pid = "proj-1"
+    history_path = str(tmp_path / "history.json")
+    now = time.time()
+    # One attempt 15 minutes ago — past the 10-minute cooldown.
+    seed = {pid: [now - 900]}
+    import json as _j
+    from pathlib import Path as _P
+    _P(history_path).write_text(_j.dumps(seed), encoding="utf-8")
+
+    pb = RestartStalledChainsPlaybook(
+        projects={"Cockpit-UX": pid},
+        history_path=history_path,
+    )
+    _patch_httpx(monkeypatch, _payload_with_backlog(7))
+    mesh = _MeshWithCreate()
+    res = await pb.execute(linear_api_key="k", dry_run=False, mesh=mesh)
+
+    assert res.actions_taken == 1, "cooldown expired → restart should fire"
+    assert len(mesh.created) == 1
+    # History must record TWO attempts now: the seeded one + the new one.
+    history = _load_history(history_path)
+    assert len(history[pid]) == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_cooldown_zero_disables_check(monkeypatch, tmp_path):
+    """``attempt_cooldown_sec=0`` disables the cooldown — a freshly-
+    attempted project can be restarted immediately if budget allows.
+    Used in tests + emergency operator overrides."""
+    pid = "proj-1"
+    history_path = str(tmp_path / "history.json")
+    now = time.time()
+    seed = {pid: [now - 30]}  # 30s ago — would normally block
+    import json as _j
+    from pathlib import Path as _P
+    _P(history_path).write_text(_j.dumps(seed), encoding="utf-8")
+
+    pb = RestartStalledChainsPlaybook(
+        projects={"Cockpit-UX": pid},
+        history_path=history_path,
+        attempt_cooldown_sec=0,
+    )
+    _patch_httpx(monkeypatch, _payload_with_backlog(7))
+    mesh = _MeshWithCreate()
+    res = await pb.execute(linear_api_key="k", dry_run=False, mesh=mesh)
+
+    assert res.actions_taken == 1, "cooldown=0 should not block restart"
+
+
+def test_default_attempt_cooldown_is_ten_minutes():
+    """Cooldown default lands at 10 minutes (600s). Doctor surveillance
+    tick is 5 minutes; cooldown ≥2× tick interval ensures budget can't
+    drain in fewer than 30 minutes when a chain is genuinely dead."""
+    assert DEFAULT_ATTEMPT_COOLDOWN_SEC == 600
 
 
 # ── Default registry ──────────────────────────────────────────────────────
