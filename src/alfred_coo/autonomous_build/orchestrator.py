@@ -5231,10 +5231,38 @@ class AutonomousBuildOrchestrator:
         # grep the plan-doc markdown for its exact section anchor (F08, OPS-01,
         # C-26, ...). Empty-code tickets must escalate — the child has no
         # grounding and would otherwise fabricate scope.
+        #
+        # SAL-4036 follow-up (2026-05-02): when the ticket body is
+        # ``self-contained`` — has BOTH a ``## Target`` block (paths +
+        # owner + repo) AND a ``## APE/V Acceptance`` block (machine-
+        # checkable acceptance criteria) — the child has a complete
+        # spec embedded in its task body and does NOT need an external
+        # plan-doc. This unblocks projects whose code prefix isn't in
+        # ``_EPIC_TO_PLAN_FILE`` (e.g. ``MC-AIO-W1-A``) where every
+        # ticket carries its own grounding. The escalate-Step-0 path
+        # remains for tickets that have neither code nor self-contained
+        # body — those genuinely have nothing for the builder to ground
+        # against.
+        body = (ticket.body or "")
+        # Cheap substring check; both markers must be present for the
+        # ticket to count as self-contained. Casing/exact match because
+        # the canonical structured-tickets template uses these exact
+        # strings.
+        body_self_contained = (
+            "## Target" in body
+            and "## APE/V Acceptance" in body
+        )
         if ticket.code:
             plan_doc_code_line = (
                 f"Plan-doc code: {ticket.code} "
                 f"(search for this string in the plan-doc markdown)\n"
+            )
+        elif body_self_contained:
+            plan_doc_code_line = (
+                "Plan-doc code: (none) — ticket body is self-contained "
+                "(see ## Target and ## APE/V Acceptance sections below); "
+                "ground your work in the embedded spec rather than an "
+                "external plan-doc.\n"
             )
         else:
             plan_doc_code_line = (

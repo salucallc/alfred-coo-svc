@@ -934,6 +934,110 @@ def test_child_task_body_unparseable_code_emits_escalate_line():
     ) in body, f"missing escalate fallback line in body:\n{body}"
 
 
+def test_child_task_body_self_contained_skips_escalate():
+    """SAL-4036 follow-up: when ticket.code is empty BUT the body has
+    both a `## Target` block and a `## APE/V Acceptance` block, the
+    orchestrator should NOT instruct the child to escalate. The
+    builder gets a softer "ground in embedded spec" prompt and the
+    body's Target + APE/V become the source of truth.
+
+    Live failure that motivated this: 2026-05-02 23:15Z, AIO MC v1.1.0-rc1
+    wave-1 with 4 tickets each carrying [MC-AIO-W*-*] codes that don't
+    appear in _EPIC_TO_PLAN_FILE — orchestrator emitted "Plan-doc code:
+    (unparseable — escalate Step 0)" and every builder bailed with no PR,
+    despite the ticket bodies containing complete Target + APE/V specs.
+    """
+    orch = _mk_orchestrator()
+    self_contained_body = (
+        "## Target\n"
+        "owner: salucallc\n"
+        "repo: alfred-coo-svc\n"
+        "new_paths:\n- deploy/foo.py\n"
+        "paths:\n- deploy/docker-compose.yml\n"
+        "base_branch: main\n"
+        "branch_hint: feature/sal-aio-foo\n"
+        "notes: stuff\n"
+        "\n"
+        "## APE/V Acceptance (machine-checkable)\n"
+        "**Acceptance:**\n"
+        "1. New service does X.\n"
+        "**Proof of execution:**\n"
+        "* curl smoke pasted into PR.\n"
+        "**Verification:**\n"
+        "* CI runs config + smoke.\n"
+    )
+    ticket = _t("u-aio", "SAL-3971", "", 1, "ops", body=self_contained_body)
+    rendered = orch._child_task_body(ticket)
+    assert (
+        "Plan-doc code: (none) — ticket body is self-contained"
+    ) in rendered, (
+        f"self-contained ticket should NOT trigger escalate path; "
+        f"rendered body:\n{rendered}"
+    )
+    # Negative: must NOT include the escalate fallback line.
+    assert "escalate per Step 0" not in rendered, (
+        "self-contained tickets must not get the escalate-Step-0 hint"
+    )
+
+
+def test_child_task_body_target_only_still_escalates():
+    """Conservative: a body with `## Target` but NO `## APE/V Acceptance`
+    is not enough to be considered self-contained; the builder still
+    needs the canonical acceptance criteria, so we keep the escalate
+    fallback. Both markers must be present.
+    """
+    orch = _mk_orchestrator()
+    target_only_body = (
+        "## Target\n"
+        "owner: salucallc\nrepo: alfred-coo-svc\n"
+        "paths:\n- foo.py\n"
+    )
+    ticket = _t("u-half", "SAL-HALF", "", 1, "ops", body=target_only_body)
+    rendered = orch._child_task_body(ticket)
+    assert (
+        "Plan-doc code: (unparseable — escalate per Step 0 of your "
+        "persona protocol)"
+    ) in rendered, (
+        "Target-only body still requires escalate fallback; rendered:\n"
+        f"{rendered}"
+    )
+
+
+def test_child_task_body_apev_only_still_escalates():
+    """Conservative: APE/V without Target also fails the
+    self-contained gate (no owner/repo/paths means the builder doesn't
+    know where to commit). Escalate fallback applies.
+    """
+    orch = _mk_orchestrator()
+    apev_only_body = (
+        "## APE/V Acceptance\n"
+        "**Acceptance:**\n1. X\n"
+    )
+    ticket = _t("u-half2", "SAL-HALF2", "", 1, "ops", body=apev_only_body)
+    rendered = orch._child_task_body(ticket)
+    assert (
+        "Plan-doc code: (unparseable — escalate per Step 0 of your "
+        "persona protocol)"
+    ) in rendered
+
+
+def test_child_task_body_self_contained_with_code_uses_code_path():
+    """When ticket.code IS parseable AND the body is also self-contained,
+    the existing code path wins (preserve backward compatibility — the
+    orchestrator's plan-doc grep flow stays intact for legacy projects).
+    """
+    orch = _mk_orchestrator()
+    body = (
+        "## Target\nowner: salucallc\nrepo: alfred-coo-svc\npaths:\n- foo\n"
+        "## APE/V Acceptance\n**Acceptance:**\n1. X\n"
+    )
+    ticket = _t("u-both", "SAL-BOTH", "AB-99", 1, "ops", body=body)
+    rendered = orch._child_task_body(ticket)
+    assert "Plan-doc code: AB-99" in rendered
+    assert "self-contained" not in rendered
+    assert "escalate per Step 0" not in rendered
+
+
 # ── 2026-04-27 builder propose_pr APE/V citation reliability fix ────────────
 #
 # 75% of hawkman REQUEST_CHANGES in the 2026-04-26 v7af window were
