@@ -12,6 +12,7 @@ import pytest
 from alfred_coo.autonomous_build.graph import (
     TicketStatus,
     _parse_code,
+    _parse_wave,
     build_ticket_graph,
 )
 
@@ -440,3 +441,42 @@ def test_target_hints_cover_co_ai_wave_1_codes() -> None:
         "on every Cockpit-UX or Agent-Ingest wave-1 dispatch and the "
         "wave-gate crashes with green=0."
     )
+
+
+# ── Substrate task #88: _parse_wave accepts both wave-N and wave:N ──────────
+#
+# Regression: 2026-05-02 ~05:00Z, MC Metrics Library kickoff `49c36d2a`
+# completed in 10s because sub-C used colon-separated `wave:N` labels when
+# creating the Linear tickets. _parse_wave used `re.fullmatch(r"wave-(\d+)")`
+# which only accepted hyphen → all 5 tickets parsed as wave=-1, dropped by
+# graph filter. Postel's law fix: accept both separators.
+
+
+@pytest.mark.parametrize(
+    "label, expected_wave",
+    [
+        ("wave-0", 0),
+        ("wave-1", 1),
+        ("wave-12", 12),
+        ("wave:0", 0),
+        ("wave:1", 1),
+        ("wave:12", 12),
+        ("WAVE-3", 3),
+        ("Wave:5", 5),
+        ("  wave-2  ", 2),
+        ("not-a-wave", -1),
+        ("wave1", -1),
+        ("wave--1", -1),
+        ("", -1),
+    ],
+)
+def test_parse_wave_accepts_hyphen_or_colon(label, expected_wave):
+    """Both `wave-N` (canonical) and `wave:N` (legacy/sub-emitted) parse correctly."""
+    assert _parse_wave([label]) == expected_wave
+
+
+def test_parse_wave_first_wave_label_wins():
+    """Mixed-format labels: first matching label wins (canonical or legacy)."""
+    assert _parse_wave(["track:agent-ingest", "wave:2", "size-S"]) == 2
+    assert _parse_wave(["track:agent-ingest", "wave-2", "size-S"]) == 2
+    assert _parse_wave(["wave:2", "wave-3"]) == 2  # first one wins

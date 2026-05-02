@@ -285,9 +285,12 @@ class TicketGraph:
 
 
 def _parse_wave(labels: Sequence[str]) -> int:
-    """Extract `wave-N` label. Returns -1 if no wave label is present."""
+    """Extract wave-N label. Accepts both `wave-N` (canonical) and `wave:N` (legacy/alternate) separators.
+
+    Returns -1 if no wave label is present.
+    """
     for lbl in labels:
-        m = re.fullmatch(r"wave-(\d+)", (lbl or "").strip().lower())
+        m = re.fullmatch(r"wave[-:](\d+)", (lbl or "").strip().lower())
         if m:
             try:
                 return int(m.group(1))
