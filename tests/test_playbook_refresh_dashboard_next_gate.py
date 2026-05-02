@@ -35,16 +35,21 @@ from alfred_coo.autonomous_build.playbooks.refresh_dashboard_next_gate import (
 # ── Pure helpers ────────────────────────────────────────────────────────────
 
 
+_TEST_PLAYBOOK_KINDS = ("hydrate_apev_headings", "refresh_dashboard_next_gate")
+
+
 def test_render_paragraph_byte_stable_for_same_inputs():
     """Same head + tick count + timestamp → identical output. Required so
     re-runs on unchanged state don't churn the file body unnecessarily."""
     a = _render_paragraph(
         head="abc1234", recent_doctor_ticks=12,
         now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=_TEST_PLAYBOOK_KINDS,
     )
     b = _render_paragraph(
         head="abc1234", recent_doctor_ticks=12,
         now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=_TEST_PLAYBOOK_KINDS,
     )
     assert a == b
 
@@ -53,6 +58,7 @@ def test_render_paragraph_includes_signals():
     out = _render_paragraph(
         head="abc1234", recent_doctor_ticks=7,
         now_iso="2026-05-01T20:00:00Z", interval_min=10,
+        playbook_kinds=_TEST_PLAYBOOK_KINDS,
     )
     assert "abc1234" in out
     assert "7 doctor ticks" in out
@@ -66,6 +72,7 @@ def test_render_paragraph_singular_tick_grammar():
     out = _render_paragraph(
         head="x", recent_doctor_ticks=1,
         now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=_TEST_PLAYBOOK_KINDS,
     )
     assert "1 doctor tick in the last hour" in out
     assert "1 doctor ticks" not in out
@@ -76,8 +83,65 @@ def test_render_paragraph_handles_unknown_head():
     out = _render_paragraph(
         head="", recent_doctor_ticks=0,
         now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=_TEST_PLAYBOOK_KINDS,
     )
     assert "daemon HEAD unknown" in out
+
+
+def test_render_paragraph_lists_all_registered_playbooks():
+    """The paragraph reflects the live ``DEFAULT_PLAYBOOKS`` list — adding
+    a new playbook (e.g. ``restart_stalled_chains``) automatically shows
+    up on the dashboard the next refresh tick. No hardcoded list."""
+    out = _render_paragraph(
+        head="x", recent_doctor_ticks=10,
+        now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=(
+            "hydrate_apev_headings",
+            "refresh_dashboard_next_gate",
+            "restart_stalled_chains",
+        ),
+    )
+    assert "hydrate_apev_headings" in out
+    assert "refresh_dashboard_next_gate" in out
+    assert "restart_stalled_chains" in out
+
+
+def test_render_paragraph_lists_pre_dispatch_gates():
+    """The paragraph names every pre-dispatch gate that fires at startup
+    (currently APE/V hydration + reference content hydration) so the
+    operator dashboard reflects the full structural-fix surface area."""
+    out = _render_paragraph(
+        head="x", recent_doctor_ticks=10,
+        now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=_TEST_PLAYBOOK_KINDS,
+    )
+    assert "APE/V hydration" in out
+    assert "reference content hydration" in out
+
+
+def test_render_paragraph_mentions_escalations_vs_errors_split():
+    """Phase 3a metric stream tracks errors and escalations as distinct
+    fields — the dashboard paragraph should reflect that so the operator
+    knows the metric semantics they're seeing in Grafana are correct."""
+    out = _render_paragraph(
+        head="x", recent_doctor_ticks=10,
+        now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=_TEST_PLAYBOOK_KINDS,
+    )
+    assert "errors" in out.lower()
+    assert "escalation" in out.lower()
+
+
+def test_render_paragraph_handles_empty_playbook_list():
+    """Defensive: an empty ``playbook_kinds`` tuple renders cleanly (no
+    crash) and reads as ``no playbooks registered`` so an unconfigured
+    daemon still produces a parseable paragraph."""
+    out = _render_paragraph(
+        head="x", recent_doctor_ticks=0,
+        now_iso="2026-05-01T20:00:00Z", interval_min=5,
+        playbook_kinds=(),
+    )
+    assert "no playbooks registered" in out
 
 
 # ── Section replacement ─────────────────────────────────────────────────────

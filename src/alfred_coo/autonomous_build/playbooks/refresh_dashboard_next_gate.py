@@ -110,33 +110,66 @@ async def _count_recent_doctor_ticks(
     return n
 
 
+# Pre-dispatch structural gates that fire once at orchestrator startup
+# (in ``_run_inner`` before the wave loop). Listed here so the Next Gate
+# paragraph self-describes as new gates land. When a new gate ships,
+# append it here — the dashboard render picks it up automatically on the
+# next 5-min tick.
+PRE_DISPATCH_GATES: tuple[str, ...] = (
+    "APE/V hydration",
+    "reference content hydration",
+)
+
+
 def _render_paragraph(
     *,
     head: str,
     recent_doctor_ticks: int,
     now_iso: str,
     interval_min: int,
+    playbook_kinds: tuple[str, ...],
+    pre_dispatch_gates: tuple[str, ...] = PRE_DISPATCH_GATES,
 ) -> str:
     """Compose the Next Gate paragraph from the live signals.
 
     Format is byte-stable for the same inputs so a chain of identical
     ticks doesn't churn the file's body bytes. The closing reminder line
     documents the auto-refresh contract so a future operator opening the
-    doc directly knows not to hand-edit it."""
+    doc directly knows not to hand-edit it.
+
+    ``playbook_kinds`` is the live list pulled from ``DEFAULT_PLAYBOOKS``
+    at render time so adding a playbook automatically updates the
+    paragraph the next tick. ``pre_dispatch_gates`` covers the orchestrator
+    pre-dispatch gates that fire once at startup (currently APE/V and
+    reference content); update ``PRE_DISPATCH_GATES`` when a new one ships.
+    """
     head_clause = f"daemon HEAD `{head}`" if head else "daemon HEAD unknown"
     activity_clause = (
         f"{recent_doctor_ticks} doctor tick"
         + ("s" if recent_doctor_ticks != 1 else "")
         + " in the last hour"
     )
+    if playbook_kinds:
+        playbook_list = ", ".join(playbook_kinds)
+        playbook_clause = f"playbooks ({playbook_list})"
+    else:
+        playbook_clause = "no playbooks registered"
+    if pre_dispatch_gates:
+        gate_list = " + ".join(pre_dispatch_gates)
+        gate_clause = f"pre-dispatch {gate_list} gates"
+    else:
+        gate_clause = "no pre-dispatch gates"
     return (
         f"**Substrate self-healing live (refreshed {now_iso}).** "
         f"{head_clause}; {activity_clause}; "
-        f"alfred-doctor white-blood-cell + Phase 2 playbooks (hydrate_apev_headings, "
-        f"refresh_dashboard_next_gate) + pre-dispatch APE/V hydration gate all active. "
-        f"Phase A (rc.6 ship + 48h soak) and Phase B (MC backlog drain) closed during "
-        f"the MC v1 GA marathon (2026-04-27). Live progress: see the per-phase bars "
-        f"below — they're computed from Linear at request time. "
+        f"alfred-doctor white-blood-cell + {playbook_clause} + "
+        f"{gate_clause} all active. Doctor metric stream tracks errors "
+        f"(real failures) and escalations (designed human-needed signals) "
+        f"as distinct fields per playbook. "
+        f"Phase A (rc.6 ship + 48h soak) and Phase B (MC backlog drain) "
+        f"closed during the MC v1 GA marathon (2026-04-27). Live progress: "
+        f"see the per-phase bars below — they're computed from Linear at "
+        f"request time. "
         f"_Auto-refreshed by the alfred-doctor `refresh_dashboard_next_gate` "
         f"playbook every {interval_min} min; do not hand-edit this paragraph._"
     )
@@ -210,11 +243,18 @@ class RefreshDashboardNextGatePlaybook(Playbook):
             )
 
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Pull the live playbook kind list from the registry at render
+        # time so the paragraph self-describes when new playbooks land.
+        # Lazy import — module-level would cycle through __init__.py back
+        # to this file.
+        from . import DEFAULT_PLAYBOOKS  # noqa: WPS433
+        playbook_kinds = tuple(pb.kind for pb in DEFAULT_PLAYBOOKS)
         new_paragraph = _render_paragraph(
             head=head,
             recent_doctor_ticks=recent_ticks,
             now_iso=now_iso,
             interval_min=self.interval_min,
+            playbook_kinds=playbook_kinds,
         )
 
         new_src = _replace_next_gate_section(src, new_paragraph)
