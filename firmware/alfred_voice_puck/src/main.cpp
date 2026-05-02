@@ -1,18 +1,24 @@
-// Alfred voice puck firmware (skeleton).
+// Alfred voice puck firmware.
 //
-// Ticket: SAL-3999 (P1.1, ESP-IDF / arduino-esp32 project skeleton).
+// Tickets:
+//   SAL-3999 (P1.1): project skeleton, USB-CDC, I2C smoke test, heartbeat.
+//   SAL-4000 (P1.2): I2S slave RX from XVF3800 + channel-0 RMS log.
+//
 // Hardware: Seeed XIAO ESP32-S3 mounted on Seeed ReSpeaker XVF3800 carrier.
 // Toolchain: PlatformIO + arduino-esp32 framework (see platformio.ini).
 //
-// What this skeleton proves:
+// What this firmware proves:
 //   1. The XIAO boots and talks over its native USB-CDC serial.
 //   2. PSRAM is enabled and visible (non-zero ESP.getFreePsram()).
 //   3. The custom huge_app partition table (3 MB app slot) is honored.
 //   4. The XVF3800 control servicer at I2C 0x2C still ACKs from firmware
 //      (matches the bench result captured in p0_i2c.log).
+//   5. The XVF3800 (i2s_master test5 firmware) is driving I2S into the
+//      XIAO, the XIAO is consuming it as I2S slave RX, and channel-0 RMS
+//      tracks acoustic energy in the room (rises with speech, drops back
+//      to noise floor in silence).
 //
 // Future Phase 1 tickets plug in here:
-//   * SAL-4000 (I2S RX from XVF3800)         -> add an audio_io component
 //   * SAL-4001 (Opus encode + ring buffer)   -> add a codec component
 //   * SAL-4003 (WebSocket client to gateway) -> add a transport component
 
@@ -21,6 +27,10 @@
 #include <esp_chip_info.h>
 #include <esp_mac.h>
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include "audio_io.h"
 
 namespace {
 
@@ -35,6 +45,11 @@ constexpr uint8_t kAddrXvf3800Ctl  = 0x2C;
 
 // Heartbeat cadence; matches the SAL-3999 acceptance criterion.
 constexpr uint32_t kHeartbeatIntervalMs = 5000;
+
+// Audio task cadence: log RMS every 500 ms, read 20 ms blocks (matches the
+// Phase 1 Opus framing target so SAL-4001 can hook straight in).
+constexpr uint32_t kAudioRmsLogIntervalMs = 500;
+constexpr size_t   kAudioBlockFrames = (alfred::audio::kSampleRateHz / 1000) * 20;
 
 uint32_t g_last_heartbeat_ms = 0;
 uint32_t g_heartbeat_seq = 0;
@@ -108,11 +123,54 @@ void runI2cSmokeTest() {
 
 void printHeartbeat() {
   ++g_heartbeat_seq;
-  Serial.printf("[heartbeat seq=%lu uptime=%lus heap=%lu psram=%lu]\r\n",
+  alfred::audio::AudioStats s = alfred::audio::audio_io_get_stats();
+  Serial.printf("[heartbeat seq=%lu uptime=%lus heap=%lu psram=%lu "
+                "audio_frames=%llu underruns=%lu errors=%lu]\r\n",
                 (unsigned long)g_heartbeat_seq,
                 (unsigned long)(millis() / 1000UL),
                 (unsigned long)ESP.getFreeHeap(),
-                (unsigned long)ESP.getFreePsram());
+                (unsigned long)ESP.getFreePsram(),
+                (unsigned long long)s.frames_in,
+                (unsigned long)s.underruns,
+                (unsigned long)s.read_errors);
+}
+
+// FreeRTOS task: continually drain the I2S DMA into a stack-allocated block,
+// have audio_io compute RMS / peak on channel 0, and log a one-line summary
+// every kAudioRmsLogIntervalMs. Pinned to core 1 so it never competes with
+// the Arduino main loop on core 0 and so future networking traffic on core 0
+// (Wi-Fi + WebSocket) cannot starve audio capture.
+void audioTask(void* /*arg*/) {
+  // 20 ms stereo at 48 kHz = 960 frames * 2 ch * 4 bytes = 7680 bytes.
+  // Stays well under the 16 KB task stack we provision below.
+  static int32_t block[kAudioBlockFrames * alfred::audio::kChannelCount];
+
+  uint32_t last_log_ms = millis();
+  uint32_t blocks_since_log = 0;
+  for (;;) {
+    const size_t got = alfred::audio::audio_io_read_block(
+        block, kAudioBlockFrames, /*timeout_ms=*/100);
+    if (got == 0) {
+      // Brief sleep on a starvation path so we don't spin a core.
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+    ++blocks_since_log;
+
+    const uint32_t now = millis();
+    if (now - last_log_ms >= kAudioRmsLogIntervalMs) {
+      alfred::audio::AudioStats s = alfred::audio::audio_io_get_stats();
+      Serial.printf("[audio rms_ch0=%.1f dBFS peak_ch0=%.1f dBFS "
+                    "blocks=%lu/%lums frames=%llu under=%lu]\r\n",
+                    s.rms_ch0_dbfs, s.peak_ch0_dbfs,
+                    (unsigned long)blocks_since_log,
+                    (unsigned long)(now - last_log_ms),
+                    (unsigned long long)s.frames_in,
+                    (unsigned long)s.underruns);
+      last_log_ms = now;
+      blocks_since_log = 0;
+    }
+  }
 }
 
 }  // namespace
@@ -133,6 +191,26 @@ void setup() {
 
   printBanner();
   runI2cSmokeTest();
+
+  // Bring up I2S RX. If this fails, we still want the heartbeat loop running
+  // so the bench can see the firmware is alive and trigger a re-flash; just
+  // skip spawning the audio task in that case.
+  const bool audio_ok = alfred::audio::audio_io_init();
+  if (audio_ok) {
+    Serial.println(F("[audio] audio_io_init OK; spawning capture task on core 1."));
+    BaseType_t rc = xTaskCreatePinnedToCore(
+        audioTask, "audio_rx",
+        /*stack=*/16 * 1024,
+        /*arg=*/nullptr,
+        /*priority=*/5,           // Above idle, below Wi-Fi (which is 23).
+        /*handle=*/nullptr,
+        /*core=*/1);
+    if (rc != pdPASS) {
+      Serial.println(F("[audio] FAIL: xTaskCreatePinnedToCore returned !pdPASS."));
+    }
+  } else {
+    Serial.println(F("[audio] FAIL: audio_io_init returned false; capture task not spawned."));
+  }
 
   g_last_heartbeat_ms = millis();
   Serial.printf("[boot] entering loop, heartbeat every %lu ms\r\n",

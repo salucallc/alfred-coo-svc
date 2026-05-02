@@ -10,9 +10,11 @@ gateway, and protocol can evolve in lockstep on a single PR.
 
 ## Status
 
-* Ticket SAL-3999 (P1.1, project skeleton): this commit.
-* I2S RX, Opus encode, WebSocket client, TLS, and Wi-Fi provisioning land in
-  later Phase 1 tickets (SAL-4000..SAL-4002+).
+* Ticket SAL-3999 (P1.1, project skeleton): boot banner, I2C smoke, heartbeat.
+* Ticket SAL-4000 (P1.2, I2S slave RX): live capture from XVF3800,
+  channel-0 RMS log on UART, dedicated FreeRTOS task on core 1.
+* Opus encode (SAL-4001), WebSocket client (SAL-4003), TLS, and Wi-Fi
+  provisioning land in later Phase 1 tickets.
 
 ## Hardware
 
@@ -51,9 +53,10 @@ Wi-Fi, mbedTLS) keeps working when we flip.
 firmware/alfred_voice_puck/
   platformio.ini          # build config; default env = arduino, alt env = idf
   partitions/huge_app.csv # custom partition table, 3 MB app slot
-  src/main.cpp            # boot banner, I2C smoke test, heartbeat
+  src/main.cpp            # boot banner, I2C smoke, heartbeat, audio task spawn
   include/                # public headers (empty for now)
-  lib/                    # vendored libraries (empty for now; libopus lands at SAL-4001)
+  lib/audio_io/           # I2S slave RX + RMS metering (SAL-4000)
+  lib/                    # vendored libraries (libopus lands at SAL-4001)
   test/                   # PlatformIO unit tests (empty for now)
 ```
 
@@ -127,14 +130,83 @@ python -m platformio device monitor -e arduino --port COM5 `
 * The 5 second heartbeat confirms the loop is scheduled and the USB-CDC
   buffer is draining.
 
+## I2S audio capture (SAL-4000)
+
+The XVF3800 carrier ships with the
+`respeaker_xvf3800_i2s_master_dfu_firmware_v1.0.7_48k_test5.bin` firmware
+flashed via DFU (see top-level handoff). In that firmware the **XMOS DSP is
+the I2S master** and emits a 48 kHz / 32-bit / stereo (2-channel) post-AEC
+stream. Channel 0 (left) is the AEC-clean ASR signal; channel 1 (right) is
+the secondary mix. The XIAO ESP32-S3 sits on the bus as **I2S slave RX**.
+
+### Pin map
+
+| Signal | XIAO GPIO | Notes |
+|--------|-----------|-------|
+| BCLK   | GPIO8     | clock from XMOS |
+| LRCLK / WS | GPIO7 | frame sync from XMOS |
+| DIN    | GPIO43    | mic data into XIAO |
+| DOUT   | GPIO44    | RESERVED for SAL-4014 (I2S TX to codec) |
+| MCLK   | not connected | XMOS does not need an MCLK from the XIAO |
+
+Source of truth for this map is the
+[Seeed wiki](https://wiki.seeedstudio.com/respeaker_xvf3800_xiao_i2s/) and
+the
+[`formatBCE/Respeaker-XVF3800-ESPHome-integration`](https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration)
+satellite YAML, both of which agree on the pinout for this exact carrier
+SKU. Earlier internal notes that listed `WS=9, DIN=7` were wrong; do not
+revert to those.
+
+### I2S config
+
+* port: `I2S_NUM_0`
+* mode: `I2S_MODE_SLAVE | I2S_MODE_RX`
+* sample rate: 48 000 Hz
+* bits per sample: 32 (slot width)
+* channel format: `I2S_CHANNEL_FMT_RIGHT_LEFT` (standard stereo)
+* communication format: `I2S_COMM_FORMAT_STAND_I2S` (Philips)
+* DMA: 6 buffers x 1024 frames = 128 ms total runway, ~21 ms per buffer
+
+The audio capture task is pinned to **core 1** at priority 5, leaving
+core 0 free for the Arduino main loop and (later) the Wi-Fi + WebSocket
+client. The task reads 20 ms blocks (960 frames) so SAL-4001's Opus encoder
+can hook straight into the same block size.
+
+### Reading the RMS log
+
+While the firmware is monitoring, expect lines of the form:
+
+```
+[audio rms_ch0=-72.4 dBFS peak_ch0=-58.1 dBFS blocks=25/500ms frames=24576 under=0]
+[heartbeat seq=3 uptime=15s heap=294060 psram=8388416 audio_frames=120384 underruns=0 errors=0]
+```
+
+* `rms_ch0` — RMS of channel 0 over the 500 ms window in dBFS.
+* `peak_ch0` — peak absolute sample over the same window in dBFS.
+* `blocks=N/Tms` — N audio blocks consumed in T ms (expect roughly 25 blocks
+  for 500 ms at 20 ms per block).
+* `under` — i2s_read timeouts since boot (should stay at 0).
+
+Reference values measured on the bench:
+
+| Acoustic state | rms_ch0 | peak_ch0 |
+|----------------|---------|----------|
+| Quiet room (no one talking) | -70 to -80 dBFS | -55 to -65 dBFS |
+| Normal speaking voice at ~30 cm | -45 to -30 dBFS | -25 to -10 dBFS |
+| Hand clap near the array | n/a (transient) | 0 to -3 dBFS peak |
+
+A >12 dB delta between the silent and speaking RMS values proves the audio
+path is alive and channel-0 selection is correct.
+
 ## Future hooks
 
-When SAL-4000 (I2S RX) lands, replace the `runI2cSmokeTest` body with a
-proper codec init that also configures the TLV320 for 4-channel I2S slave
-mode at 16 kHz. The smoke probe stays as a pre-flight assertion.
-
 When SAL-4001 (Opus encode) lands, vendor libopus under `lib/opus/` and add
-`lib_deps = file://lib/opus` to the `[env:arduino]` block.
+`lib_deps = file://lib/opus` to the `[env:arduino]` block. Tap into
+`audio_io_read_block()` directly; the 20 ms block size already matches
+Opus framing.
 
-When SAL-4002 (WebSocket transport) lands, add `lib_deps = WebSockets` and
+When SAL-4003 (WebSocket transport) lands, add `lib_deps = WebSockets` and
 keep TLS roots in `data/` so they ship in the SPIFFS partition.
+
+When SAL-4014 (I2S TX to codec) lands, extend `audio_io` with a TX path
+on GPIO44 sharing the same BCK/WS pins (full duplex on I2S0).

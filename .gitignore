@@ -11,6 +11,10 @@ eggs/
 .eggs/
 lib/
 lib64/
+# PlatformIO firmware components live under firmware/**/lib/<component>/
+# and must be tracked despite the Python-distutils `lib/` rule above.
+!firmware/**/lib/
+!firmware/**/lib/**
 parts/
 sdist/
 var/
