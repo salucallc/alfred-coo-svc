@@ -317,6 +317,7 @@ def build_snapshot_from_doctor(
             "acted": int(getattr(pr, "actions_taken", 0)),
             "skipped": int(getattr(pr, "actions_skipped", 0)),
             "errors": len(getattr(pr, "errors", []) or []),
+            "escalations": len(getattr(pr, "escalations", []) or []),
             "dry_run": bool(getattr(pr, "dry_run", False)),
         }
     return MetricSnapshot(

@@ -307,22 +307,30 @@ def test_format_baseline_summary_renders_percentiles_when_populated():
 
 def test_build_snapshot_from_doctor_summarises_playbook_results():
     class _PR:
-        def __init__(self, kind, found, acted, skipped, errors, dry_run):
+        def __init__(
+            self, kind, found, acted, skipped, errors, dry_run,
+            escalations=None,
+        ):
             self.kind = kind
             self.candidates_found = found
             self.actions_taken = acted
             self.actions_skipped = skipped
             self.errors = errors
+            self.escalations = escalations or []
             self.dry_run = dry_run
 
     pr1 = _PR("hydrate_apev_headings", 3, 2, 1, [], False)
     pr2 = _PR("refresh_dashboard_next_gate", 1, 1, 0, [], False)
+    pr3 = _PR(
+        "restart_stalled_chains", 0, 0, 1, [], False,
+        escalations=["MSSP-Fed: budget exhausted"],
+    )
     snap = build_snapshot_from_doctor(
         started_at=100.0,
         finished_at=102.5,
         counters={"silent_with_tools": 1},
         grounding_gaps=["SAL-1", "SAL-2"],
-        playbook_results=[pr1, pr2],
+        playbook_results=[pr1, pr2, pr3],
         daemon_head="abc1234567890",
     )
     assert snap.scan_duration_s == 2.5
@@ -330,6 +338,11 @@ def test_build_snapshot_from_doctor_summarises_playbook_results():
     assert snap.grounding_gaps_count == 2
     assert snap.playbook_summary["hydrate_apev_headings"]["acted"] == 2
     assert snap.playbook_summary["refresh_dashboard_next_gate"]["acted"] == 1
+    # Escalations surface distinctly from errors so Phase 3b deviation
+    # detection can rule on the designed signal vs real failures.
+    assert snap.playbook_summary["restart_stalled_chains"]["escalations"] == 1
+    assert snap.playbook_summary["restart_stalled_chains"]["errors"] == 0
+    assert snap.playbook_summary["hydrate_apev_headings"]["escalations"] == 0
     # daemon_head clamped to 12 chars.
     assert len(snap.daemon_head) <= 12
 
