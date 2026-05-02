@@ -26,7 +26,7 @@ every iteration, so the full tool chain is observable end-to-end.
 import json
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, Union
 
 import httpx
 from tenacity import (
@@ -348,8 +348,308 @@ def _peek_builder_fallback_chain(task: dict) -> list | None:
     return None
 
 
-def select_model(task: dict, persona) -> str:
-    """Pick the model for `task` + `persona`.
+# ──────────────────────────────────────────────────────────────────────────
+# SAL-3939 (2026-05-02): size-aware dispatch.
+#
+# Pre-3939 every builder dispatch picked the same model — typically
+# `kimi-k2-thinking:cloud` — and the same iteration_cap (12) regardless of
+# ticket size. A size-S ticket (5-line compose edit, env var add) burned the
+# same 10-15 min wall-clock as a size-XL ticket (cross-cutting refactor).
+#
+# This block adds:
+#   1. Size → primary/fallback model mapping for the builder role.
+#   2. Size → iteration_cap mapping (S=4, M=8, L=12, XL=16). Lower than the
+#      legacy `iteration_cap_for_size` table on purpose — the legacy table
+#      stays unchanged because main.py's `_builder_iteration_cap` path is
+#      still used by the existing dispatch loop and changing it would break
+#      every consumer at once. The new `SizeAwareDispatch` is a cleaner per-
+#      role/per-size lookup the orchestrator can hand out at kickoff time.
+#   3. Per-kickoff overrides: `model_routing.<role>` wins over the size-aware
+#      model pick; `model_routing.iteration_cap_by_size` wins over the cap
+#      table.
+#
+# Sources are stamped on the result so dispatch logs can tell `size-default`
+# from `kickoff_override` from `registry-default` at a glance.
+
+# Builder size → (primary, fallback). Other roles are not size-gated today;
+# they fall through to the registry / persona default.
+_SIZE_AWARE_BUILDER_MODELS: dict[str, tuple[str, str]] = {
+    "S": ("gpt-oss:120b-cloud", "qwen3-coder:30b-a3b-q4_K_M"),
+    "M": ("qwen3-coder:480b-cloud", "gpt-oss:120b-cloud"),
+    "L": ("kimi-k2-thinking:cloud", "qwen3-coder:480b-cloud"),
+    "XL": ("kimi-k2-thinking:cloud", "qwen3-coder:480b-cloud"),
+}
+
+# Size → iteration_cap. Trivial tickets get a tight 4-turn budget so a
+# misbehaving builder can't burn 10+ minutes on a 5-line edit; XL gets
+# headroom for cross-cutting refactors.
+_SIZE_AWARE_ITERATION_CAPS: dict[str, int] = {
+    "S": 4,
+    "M": 8,
+    "L": 12,
+    "XL": 16,
+}
+
+# Defaults when the size label is unknown / missing. Match today's
+# pre-3939 behaviour so an un-labelled kickoff doesn't suddenly change
+# semantics on rollout.
+_SIZE_AWARE_DEFAULT_MODEL = "kimi-k2-thinking:cloud"
+_SIZE_AWARE_DEFAULT_CAP = 12
+
+
+@dataclass
+class SizeAwareDispatch:
+    """Result of a size-aware dispatch lookup.
+
+    `model` and `iteration_cap` are the values to hand to
+    `Dispatcher.call_with_tools` (or the orchestrator's spawn helper).
+    `source` is a string tag for observability — one of:
+      * ``kickoff_override`` — `model_routing.<role>` from the kickoff
+        payload pinned the model.
+      * ``size-default`` — picked from `_SIZE_AWARE_BUILDER_MODELS` based
+        on the ticket's size label.
+      * ``registry-default`` — fell through to today's pre-3939 default
+        (the size label was unknown / no override applied).
+
+    `cap_source` is the analogous tag for `iteration_cap`:
+      * ``kickoff_override`` — `model_routing.iteration_cap_by_size[<size>]`
+      * ``size-default`` — picked from `_SIZE_AWARE_ITERATION_CAPS`.
+      * ``registry-default`` — pre-3939 default cap (12).
+
+    `fallback_model` is the size-aware fallback. None when no size-aware
+    fallback applies (e.g. the kickoff override won, or the size label
+    was unknown).
+    """
+
+    model: str
+    iteration_cap: int
+    source: str
+    cap_source: str
+    fallback_model: Optional[str] = None
+
+
+def _normalise_size(size: Optional[str]) -> Optional[str]:
+    """Return the canonical size key (`S`/`M`/`L`/`XL`) or None.
+
+    Accepts any of: ``"S"``, ``"size-s"``, ``"Size: M"``, ``"size-XL"``,
+    case-insensitive. Returns None for ``None``, ``""``, or anything that
+    doesn't match the four canonical bucket names. ``XS`` collapses to
+    ``S`` so the orchestrator's ad-hoc XS labels reuse the size-S budget
+    rather than fall through to defaults.
+    """
+    if not size or not isinstance(size, str):
+        return None
+    s = size.strip().upper()
+    # Strip a leading "SIZE-" or "SIZE:" prefix.
+    if s.startswith("SIZE-"):
+        s = s[5:]
+    elif s.startswith("SIZE:"):
+        s = s[5:].strip()
+    if s == "XS":
+        return "S"
+    if s in _SIZE_AWARE_BUILDER_MODELS:
+        return s
+    return None
+
+
+def _peek_iteration_cap_override(
+    task_or_payload: dict, size: str
+) -> Optional[int]:
+    """Return ``model_routing.iteration_cap_by_size[<size>]`` if set.
+
+    Looks for the override in two places:
+      1. Direct dict path: ``task_or_payload["model_routing"]
+         ["iteration_cap_by_size"][<size>]``.
+      2. Kickoff-payload path via ``_peek_kickoff_payload`` (full-body
+         JSON envelope OR embedded ``<!-- model_routing: ... -->``
+         propagation block).
+
+    Size keys in the override map are case-insensitive — both ``"S"`` and
+    ``"s"`` resolve. Best-effort — never raises.
+    """
+    if not isinstance(task_or_payload, dict):
+        return None
+
+    def _lookup(routing: Any) -> Optional[int]:
+        if not isinstance(routing, dict):
+            return None
+        cap_map = routing.get("iteration_cap_by_size")
+        if not isinstance(cap_map, dict):
+            return None
+        # Try exact, upper, lower — operators write `S`/`s`/`size-s` freely.
+        for key in (size, size.upper(), size.lower()):
+            v = cap_map.get(key)
+            if isinstance(v, int) and v > 0:
+                return v
+        return None
+
+    # Direct dict path on the input itself.
+    direct = _lookup(task_or_payload.get("model_routing"))
+    if direct is not None:
+        return direct
+
+    # Kickoff-payload path (parent envelope or child propagation block).
+    payload = _peek_kickoff_payload(task_or_payload)
+    if isinstance(payload, dict):
+        nested = _lookup(payload.get("model_routing"))
+        if nested is not None:
+            return nested
+    return None
+
+
+def _select_size_aware(
+    role: str,
+    *,
+    size: Optional[str] = None,
+    payload: Optional[dict] = None,
+) -> SizeAwareDispatch:
+    """Size-aware dispatch lookup for the new ``select_model(role, size=...,
+    payload=...)`` entry point.
+
+    Precedence (model):
+      1. ``payload["model_routing"][<role>]`` — per-kickoff hard pin.
+      2. Size-aware default for ``role == "builder"`` from
+         ``_SIZE_AWARE_BUILDER_MODELS`` when `size` resolves.
+      3. Pre-3939 default (`kimi-k2-thinking:cloud`).
+
+    Precedence (iteration_cap):
+      1. ``payload["model_routing"]["iteration_cap_by_size"][<size>]``.
+      2. ``_SIZE_AWARE_ITERATION_CAPS[<size>]`` when `size` resolves.
+      3. Pre-3939 default (12).
+
+    Roles other than ``"builder"`` skip the size-aware model table (they
+    have their own routing knobs at the orchestrator layer); they DO still
+    honour the model_routing override and the cap mapping so a kickoff
+    can tighten QA caps too.
+    """
+    payload_dict: dict = payload if isinstance(payload, dict) else {}
+    canonical_size = _normalise_size(size)
+
+    # ── Model selection ────────────────────────────────────────────────
+    model: str
+    source: str
+    fallback: Optional[str] = None
+
+    # (1) Per-kickoff hard pin wins.
+    routing = payload_dict.get("model_routing") if isinstance(payload_dict, dict) else None
+    override: Optional[str] = None
+    if isinstance(routing, dict):
+        v = routing.get(role)
+        if isinstance(v, str) and v:
+            override = v
+    if override is None:
+        # Also peek the kickoff-payload path (description JSON + HTML
+        # comment block). Keeps the new API consistent with the legacy
+        # `select_model(task, persona)` precedence.
+        kickoff = _peek_kickoff_payload(payload_dict) if payload_dict else None
+        if isinstance(kickoff, dict):
+            r2 = kickoff.get("model_routing")
+            if isinstance(r2, dict):
+                v = r2.get(role)
+                if isinstance(v, str) and v:
+                    override = v
+
+    if override is not None:
+        model = override
+        source = "kickoff_override"
+    elif role == "builder" and canonical_size is not None:
+        primary, fb = _SIZE_AWARE_BUILDER_MODELS[canonical_size]
+        model = primary
+        fallback = fb
+        source = "size-default"
+    else:
+        model = _SIZE_AWARE_DEFAULT_MODEL
+        source = "registry-default"
+
+    # ── Iteration-cap selection ────────────────────────────────────────
+    iteration_cap: int
+    cap_source: str
+
+    cap_override = (
+        _peek_iteration_cap_override(payload_dict, canonical_size)
+        if canonical_size is not None
+        else None
+    )
+    if cap_override is not None:
+        iteration_cap = min(cap_override, MAX_TOOL_ITERATIONS)
+        cap_source = "kickoff_override"
+    elif canonical_size is not None:
+        iteration_cap = min(
+            _SIZE_AWARE_ITERATION_CAPS[canonical_size], MAX_TOOL_ITERATIONS
+        )
+        cap_source = "size-default"
+    else:
+        iteration_cap = _SIZE_AWARE_DEFAULT_CAP
+        cap_source = "registry-default"
+
+    return SizeAwareDispatch(
+        model=model,
+        iteration_cap=iteration_cap,
+        source=source,
+        cap_source=cap_source,
+        fallback_model=fallback,
+    )
+
+
+def log_size_aware_dispatch(
+    ticket: str,
+    size: Optional[str],
+    pick: SizeAwareDispatch,
+) -> None:
+    """Emit the canonical size-aware-dispatch log line.
+
+    Format (one line, no embedded newlines so log greps stay simple):
+
+        dispatching <ticket> (size=<size>, model=<model>, source=<src>,
+        iteration_cap=<n>, cap_source=<src>)
+
+    Callers MUST emit this once per dispatch so ops can correlate
+    size→model→cap decisions in the logs. The orchestrator dispatch path
+    in main.py uses this directly; tests assert on the substring shape.
+    """
+    canonical = _normalise_size(size)
+    size_repr = f"size-{canonical.lower()}" if canonical else (size or "unknown")
+    logger.info(
+        "dispatching %s (size=%s, model=%s, source=%s, "
+        "iteration_cap=%d, cap_source=%s)",
+        ticket or "-",
+        size_repr,
+        pick.model,
+        pick.source,
+        pick.iteration_cap,
+        pick.cap_source,
+    )
+
+
+def select_model(
+    *args, **kwargs
+) -> Union[str, SizeAwareDispatch]:
+    """Polymorphic model picker.
+
+    Two call shapes are supported:
+
+    1. Legacy: ``select_model(task: dict, persona) -> str``
+       Returns the model name string. Used by the main poll loop in
+       `alfred_coo.main` and the autonomous-build orchestrator. See
+       module-level "Sub #62" block for the full precedence ordering.
+
+    2. SAL-3939: ``select_model(role: str, *, size: str | None,
+       payload: dict | None) -> SizeAwareDispatch``
+       Size-aware lookup that returns model + iteration_cap + provenance
+       in one shot. Used by the size-aware dispatch path; see
+       `_select_size_aware` for full precedence.
+
+    Dispatch on the type of the first positional argument:
+      * ``str`` → SAL-3939 path.
+      * ``dict`` (or anything else) → legacy path.
+    """
+    if args and isinstance(args[0], str):
+        return _select_size_aware(args[0], **kwargs)
+    return _select_model_legacy(*args, **kwargs)
+
+
+def _select_model_legacy(task: dict, persona) -> str:
+    """Pick the model for `task` + `persona` — legacy two-arg API.
 
     See module-level "Sub #62" block for the full precedence ordering. The
     legacy tag-based shortcuts are preserved verbatim so existing test
