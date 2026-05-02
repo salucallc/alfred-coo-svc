@@ -17,6 +17,7 @@ import importlib
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 import uvicorn
@@ -24,6 +25,7 @@ import uvicorn
 from . import config, log, dispatch, health
 from . import cockpit_router
 from .mesh import MeshClient, parse_persona_tag
+from .orphan_recovery import recover_orphaned_tasks
 from .soul import SoulClient
 from .persona import Persona, get_persona
 from .dispatch import (
@@ -677,6 +679,20 @@ async def main() -> None:
         logger.info("initial heartbeat ok")
     except Exception as e:
         logger.warning("initial heartbeat failed (continuing): %s", e)
+
+    # Substrate task #80: recover orphan-claimed tasks from prior daemon run.
+    # A systemd restart leaves any in-flight task claimed by ``alfred-coo``
+    # session_id but with no living process to advance it. Pre-fix, those
+    # orphans froze the chain until manual mesh API cleanup. Best-effort —
+    # never blocks startup if the recovery RPC fails.
+    try:
+        await recover_orphaned_tasks(
+            mesh, session_id=settings.soul_session_id,
+        )
+    except Exception:
+        logger.exception(
+            "[orphan-recovery] uncaught error during boot-time recovery; continuing"
+        )
 
     while True:
         try:
