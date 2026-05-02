@@ -1,0 +1,149 @@
+name: Deploy to Oracle (systemd canonical)
+
+# Substrate task #86 (2026-05-02): the existing `Deploy to Oracle` workflow
+# is a SIDECAR docker deploy on host port 8091 — it was never meant to
+# update the production daemon, which runs as the systemd
+# `alfred-coo.service` host process at /opt/alfred-coo. Without this
+# workflow, every "merged to main" claim was misleading until an operator
+# manually SSH'd to the Oracle host and ran:
+#
+#   sudo git fetch origin main
+#   sudo git reset --hard origin/main
+#   sudo chown -R alfredcoo:alfredcoo /opt/alfred-coo
+#   sudo -u alfredcoo /opt/alfred-coo/venv/bin/pip install -e .
+#   sudo systemctl restart alfred-coo
+#
+# This workflow automates that ritual. Triggered by workflow_run on the
+# publish workflow's success (mirroring the docker sidecar deploy
+# pattern) so a merge → image build → daemon restart pipeline runs end
+# to end without operator intervention.
+#
+# REQUIRED SECRETS (one-time setup before this workflow can fire):
+#
+#   ORACLE_SSH_DEPLOY_KEY  — private SSH key for the deploy user on Oracle.
+#                            Suggested provisioning:
+#                              1. On Oracle host: `ssh-keygen -t ed25519
+#                                 -f ~/.ssh/alfred-coo-deploy -N ""`
+#                              2. Append the public key to
+#                                 ~ubuntu/.ssh/authorized_keys
+#                              3. `gh secret set ORACLE_SSH_DEPLOY_KEY
+#                                 < ~/.ssh/alfred-coo-deploy --repo
+#                                 salucallc/alfred-coo-svc`
+#
+#   ORACLE_SSH_HOST        — IP / hostname of the Oracle daemon host
+#                            (currently 100.105.27.63). Optional: defaults
+#                            to the Tailscale IP if unset.
+#
+#   ORACLE_SSH_USER        — login user (default: ubuntu).
+#
+# The workflow fails fast with a clear message if any required secret is
+# missing, so operators can see the gap in the Actions log instead of
+# the workflow silently no-op'ing.
+
+on:
+  workflow_run:
+    workflows: ["Publish daemon image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA to deploy (defaults to current HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-systemd:
+    name: SSH to Oracle + git pull + systemctl restart alfred-coo
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - name: Resolve target SHA
+        id: sha
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          elif [ -n "${{ inputs.sha }}" ]; then
+            FULL_SHA="${{ inputs.sha }}"
+          else
+            FULL_SHA="${{ github.sha }}"
+          fi
+          SHORT_SHA="${FULL_SHA:0:7}"
+          echo "full=${FULL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved SHA: full=${FULL_SHA} short=${SHORT_SHA}"
+
+      - name: Verify required secrets are present
+        # Fail fast with an actionable message if the operator hasn't yet
+        # provisioned the SSH deploy key. Without this guard, the
+        # appleboy/ssh-action step would error out with an opaque ssh
+        # client failure that takes longer to diagnose.
+        env:
+          KEY: ${{ secrets.ORACLE_SSH_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::ORACLE_SSH_DEPLOY_KEY secret is not set."
+            echo "::error::This workflow requires an SSH deploy key for the Oracle daemon host."
+            echo "::error::See workflow file header for one-time provisioning steps."
+            exit 1
+          fi
+          echo "ORACLE_SSH_DEPLOY_KEY is configured (length=${#KEY})"
+
+      - name: Deploy via systemd ritual
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.ORACLE_SSH_HOST || '100.105.27.63' }}
+          username: ${{ secrets.ORACLE_SSH_USER || 'ubuntu' }}
+          key: ${{ secrets.ORACLE_SSH_DEPLOY_KEY }}
+          port: 22
+          # 5-minute timeout — pip install -e . is the slow step (~60-90s
+          # in steady state, longer on dependency churn).
+          command_timeout: 5m
+          # Inline the canonical deploy ritual. Keep this in sync with
+          # the manual procedure documented in
+          # `reference_alfred_coo_deploy_mechanism.md`.
+          script: |
+            set -euo pipefail
+
+            cd /opt/alfred-coo
+
+            # /opt/alfred-coo is owned by alfredcoo (uid 999); SSH user is
+            # `ubuntu` (sudoer). Use sudo for fetch + reset + chown +
+            # install + restart so file perms stay correct after deploy.
+            sudo git config --global --add safe.directory /opt/alfred-coo
+
+            # 1. Pull latest main.
+            sudo git fetch origin main
+            sudo git reset --hard origin/main
+            CURRENT_SHA="$(sudo git rev-parse --short HEAD)"
+            EXPECTED_SHA="${{ steps.sha.outputs.short }}"
+            echo "Deployed SHA: $CURRENT_SHA (expected: $EXPECTED_SHA)"
+
+            # 2. Restore alfredcoo ownership (sudo git operations may have
+            # left some files root-owned).
+            sudo chown -R alfredcoo:alfredcoo /opt/alfred-coo
+
+            # 3. Re-install the package so any code changes take effect.
+            # `-e .` is editable install; sub-second when no metadata changed.
+            sudo -u alfredcoo /opt/alfred-coo/venv/bin/pip install -e . --quiet
+
+            # 4. Restart systemd unit.
+            sudo systemctl restart alfred-coo
+
+            # 5. Verify the daemon came up clean. systemd marks the unit
+            # active immediately on Type=exec; wait briefly then probe.
+            sleep 5
+            STATE="$(sudo systemctl is-active alfred-coo)"
+            if [ "$STATE" != "active" ]; then
+              echo "::error::alfred-coo failed to come up: state=$STATE"
+              sudo systemctl status alfred-coo --no-pager | head -30
+              exit 1
+            fi
+
+            echo "::notice::alfred-coo deployed @ $CURRENT_SHA, state=active"
