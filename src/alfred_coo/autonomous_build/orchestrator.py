@@ -4955,7 +4955,26 @@ class AutonomousBuildOrchestrator:
             return ("", "", frozenset())
         owner = (hint.owner or "").strip().lower()
         repo = (hint.repo or "").strip().lower()
-        files = set(hint.paths or ()) | set(hint.new_paths or ())
+        # SAL-4036 follow-up (2026-05-02): drop sentinel placeholders before
+        # collision-set construction. Registry entries that lack populated
+        # paths fall back to literal strings like "TBD" or empty values;
+        # those carry no real file-overlap signal but the equality check
+        # would treat two different tickets each placeholdered with "TBD"
+        # as colliding on a real shared file. Filter out sentinels and
+        # empty/whitespace-only entries so only real paths participate in
+        # the overlap test.
+        _SENTINELS = {"tbd", "n/a", "na", "todo", "?", "-"}
+
+        def _real_paths(items):
+            for p in items or ():
+                if p is None:
+                    continue
+                s = str(p).strip()
+                if not s or s.lower() in _SENTINELS:
+                    continue
+                yield s
+
+        files = set(_real_paths(hint.paths)) | set(_real_paths(hint.new_paths))
         return (owner, repo, frozenset(files))
 
     def _file_collision_for(
