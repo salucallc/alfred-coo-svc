@@ -64,6 +64,14 @@ DEFAULT_ACTIVE_PROJECTS: dict[str, str] = {
 DEFAULT_ATTEMPT_BUDGET = 3
 DEFAULT_ATTEMPT_WINDOW_SEC = 3600       # 1h sliding window
 DEFAULT_HEARTBEAT_FRESHNESS_SEC = 1800  # chain considered alive if heartbeat <30 min
+# Substrate task #87 (2026-05-02): minimum gap between successive restart
+# attempts for the same project. Without this, the doctor's 5-minute
+# surveillance tick can fire 3 budget-permitted restarts in 15 minutes when
+# the chain is genuinely dead — burning the entire 1h budget while the
+# operator hasn't had time to look. 10-minute cooldown spaces attempts so
+# Cristian sees the first stalled-chain Slack message before the playbook
+# decides the chain is irrecoverable.
+DEFAULT_ATTEMPT_COOLDOWN_SEC = 600
 DEFAULT_HISTORY_PATH = "/var/lib/alfred-coo/restart_history.json"
 
 
@@ -274,6 +282,7 @@ class RestartStalledChainsPlaybook(Playbook):
         history_path: str | None = None,
         attempt_budget: int = DEFAULT_ATTEMPT_BUDGET,
         attempt_window_sec: int = DEFAULT_ATTEMPT_WINDOW_SEC,
+        attempt_cooldown_sec: int = DEFAULT_ATTEMPT_COOLDOWN_SEC,
         heartbeat_freshness_sec: int = DEFAULT_HEARTBEAT_FRESHNESS_SEC,
         from_session_id: str = "alfred-coo",
     ):
@@ -283,6 +292,7 @@ class RestartStalledChainsPlaybook(Playbook):
         self.history_path = history_path or DEFAULT_HISTORY_PATH
         self.attempt_budget = attempt_budget
         self.attempt_window_sec = attempt_window_sec
+        self.attempt_cooldown_sec = attempt_cooldown_sec
         self.heartbeat_freshness_sec = heartbeat_freshness_sec
         self.from_session_id = from_session_id
 
@@ -395,6 +405,29 @@ class RestartStalledChainsPlaybook(Playbook):
                 f"({len(recent)} attempts in last {window_min}min)"
             )
             return
+
+        # 3b. Per-project cooldown check (substrate task #87, 2026-05-02).
+        # Even with budget remaining, refuse to fire a fresh kickoff if the
+        # last attempt for THIS project was less than ``attempt_cooldown_sec``
+        # ago. Doctor surveillance ticks at 5-minute intervals; without a
+        # cooldown the playbook can burn the full 3-attempt budget in 15
+        # minutes when a chain is genuinely dead, leaving no headroom for
+        # operator intervention. 10-minute cooldown spaces attempts so the
+        # first failed-restart Slack notification reaches Cristian before
+        # the playbook escalates to "irrecoverable".
+        if recent and self.attempt_cooldown_sec > 0:
+            last_attempt = max(recent)
+            since_last = now - last_attempt
+            if since_last < self.attempt_cooldown_sec:
+                cooldown_min = self.attempt_cooldown_sec // 60
+                wait_sec = int(self.attempt_cooldown_sec - since_last)
+                result.actions_skipped += 1
+                result.notable.append(
+                    f"{name}: cooldown active "
+                    f"({int(since_last)}s since last attempt; "
+                    f"min {cooldown_min}min, wait {wait_sec}s)"
+                )
+                return
 
         # 4. Queue fresh kickoff.
         result.candidates_found += 1
