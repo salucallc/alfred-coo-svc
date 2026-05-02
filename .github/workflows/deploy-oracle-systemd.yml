@@ -128,32 +128,25 @@ jobs:
 
       - name: Wait for no active autonomous-build-a orchestrator (SAL-3924)
         id: gate
-        # Pre-deploy gate. Polls Oracle's mesh API for active parent
-        # kickoffs whose title starts with `[persona:autonomous-build-a]`
-        # and whose status is `claimed` or `in_progress`. If any are
-        # active, sleeps 60s and retries up to 60 times (1-hour budget),
-        # then force-proceeds with a Slack warning. Fails open: if the
-        # gate itself errors (network, missing token, malformed
-        # response), it logs and proceeds rather than blocking the
-        # deploy indefinitely.
+        # Pre-deploy gate (SAL-3924, hardened by SAL-4058). Polls the
+        # daemon's cockpit endpoint for in-process orchestrators. If any
+        # are active, sleeps 60s and retries up to 60 times (1-hour
+        # budget), then force-proceeds with a Slack warning. Fails
+        # CLOSED: if the gate itself errors (SSH unreachable, cockpit
+        # 5xx, malformed response), it defers and retries — preferring
+        # to slow a deploy than to kill an in-flight orchestrator
+        # silently. SOUL_API_KEY is no longer required since the
+        # cockpit endpoint is unauth'd on the Oracle host's localhost.
         env:
           ORACLE_SSH_HOST: ${{ secrets.ORACLE_SSH_HOST || '100.105.27.63' }}
           ORACLE_SSH_USER: ${{ secrets.ORACLE_SSH_USER || 'ubuntu' }}
           ORACLE_SSH_DEPLOY_KEY: ${{ secrets.ORACLE_SSH_DEPLOY_KEY }}
-          SOUL_API_KEY: ${{ secrets.SOUL_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: "C0ASAKFTR1C" # #batcave
           MAX_RETRIES: "60"
           SLEEP_SECONDS: "60"
         run: |
           set -uo pipefail
-
-          if [ -z "${SOUL_API_KEY:-}" ]; then
-            echo "::warning::SOUL_API_KEY not set — skipping autonomous-build orchestrator gate (fail-open)."
-            echo "force_deployed=false" >> "$GITHUB_OUTPUT"
-            echo "active_task=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           # Stage SSH key for one-shot ssh execution. We re-use the same
           # ORACLE_SSH_DEPLOY_KEY that the deploy step uses so the gate
@@ -162,10 +155,23 @@ jobs:
           chmod 600 "$KEY_FILE"
           printf '%s\n' "$ORACLE_SSH_DEPLOY_KEY" > "$KEY_FILE"
 
-          # Probe via SSH so the mesh API stays bound to localhost on
-          # the Oracle host (no public exposure required). The remote
-          # command pipes the JSON response through jq to filter for
-          # active autonomous-build-a parent kickoffs.
+          # SAL-4058: probe the daemon's cockpit endpoint, NOT the mesh
+          # API. The mesh-tasks query (`?status=claimed&limit=50`) is
+          # unreliable for this purpose: parent kickoff tasks transition
+          # statuses internally (claimed → in-flight → orphan-recovered
+          # → pending) and a `?status=claimed` filter undercounts active
+          # in-process orchestrators. Substrate fix #80's boot-recovery
+          # in particular flips claims back to pending while the
+          # orchestrator is still running in memory. The 21:54Z deploy
+          # on 2026-05-02 hit this bug: probe returned 0 active while
+          # both AIO + MC v1 GA orchestrators were live in pid 990573;
+          # gate fail-passed and deploy killed both mid-flight.
+          #
+          # Cockpit's `active_orchestrators` is the in-process registry
+          # — the only source that reflects what's actually running. It
+          # binds localhost on the Oracle host (port 8090), is unauth'd
+          # for that reason, and exposes one entry per live orchestrator
+          # with a `task_id` field.
           probe_active() {
             ssh -i "$KEY_FILE" \
                 -o StrictHostKeyChecking=no \
@@ -173,8 +179,8 @@ jobs:
                 -o ConnectTimeout=10 \
                 -o BatchMode=yes \
                 "${ORACLE_SSH_USER}@${ORACLE_SSH_HOST}" \
-                "curl -fsS -H 'Authorization: Bearer ${SOUL_API_KEY}' 'http://localhost:8080/v1/mesh/tasks?status=claimed&limit=50' \
-                  | jq -r '.tasks[]? | select(.title | startswith(\"[persona:autonomous-build-a]\")) | .task_id' 2>/dev/null"
+                "curl -fsS 'http://localhost:8090/v1/cockpit/state' \
+                  | jq -r '.active_orchestrators[]? | .task_id' 2>/dev/null"
           }
 
           ACTIVE_TASK=""
@@ -182,8 +188,22 @@ jobs:
           while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
             ATTEMPT=$((ATTEMPT + 1))
 
+            # SAL-4058 fail-CLOSED: capture probe stderr and exit code.
+            # An exit code != 0 means the probe itself errored (SSH
+            # unreachable, cockpit 5xx, malformed JSON). Treat as
+            # "active orchestrator suspected" and defer rather than
+            # deploy blindly. Only an exit-0 + empty result counts as
+            # genuinely no active orchestrators.
             # shellcheck disable=SC2155
-            RESULT="$(probe_active 2>/dev/null || true)"
+            RESULT="$(probe_active 2>/dev/null)"
+            PROBE_EXIT=$?
+
+            if [ "$PROBE_EXIT" -ne 0 ]; then
+              echo "::warning::SAL-4058 probe failed (exit=${PROBE_EXIT}, attempt ${ATTEMPT}/${MAX_RETRIES}) — fail-CLOSED, treating as active; sleeping ${SLEEP_SECONDS}s"
+              sleep "$SLEEP_SECONDS"
+              continue
+            fi
+
             # First non-empty line is the task_id we treat as the active
             # orchestrator (multiple active is rare; we still surface
             # the count in the log).
