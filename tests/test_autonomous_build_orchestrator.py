@@ -7571,3 +7571,295 @@ async def test_hydrate_pre_dispatch_handles_issueupdate_success_false(monkeypatc
     assert n == 0
     # In-memory body untouched — mutation rejected at the API layer.
     assert orch.graph.nodes["u-1"].body == original_body
+
+
+# ── Pre-dispatch reference-content hydration ────────────────────────────────
+#
+# These tests cover ``_hydrate_references_pre_dispatch`` — the structural
+# fix that pre-fetches raw.githubusercontent.com/salucallc/* URLs cited in
+# ticket bodies and inlines the content as ``## Resolved References``
+# blocks in the in-memory ticket body. Builders read the resolved content
+# directly instead of being told to http_get plan-doc URLs (which the
+# persona prompt forbids — see the SAL-3823..3821 false-escalation history
+# referenced in alfred-coo-a Step 1(a)).
+
+
+class _FakeTextResp:
+    """Minimal httpx.Response stand-in for the GET-based reference fetch.
+
+    Carries ``status_code`` + ``text`` (not ``.json()`` like _FakeResp)
+    so we exercise the reference path without touching the canonical-APEV
+    fakes. Separate class keeps the existing test surface intact.
+    """
+
+    def __init__(self, status_code: int, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeGetClient:
+    """Script-driven AsyncClient replacement for GET-only reference fetches.
+
+    ``url_to_resp`` maps each URL → a single ``_FakeTextResp`` returned on
+    matching ``client.get(url)``. Unmapped URLs raise so tests catch
+    missing fakes loudly. Tracks every URL the orchestrator fetched so
+    assertions can check the fetch budget honoured the per-ticket cap.
+    """
+
+    def __init__(self, url_to_resp: dict):
+        self.url_to_resp = url_to_resp
+        self.fetched: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url):
+        self.fetched.append(url)
+        if url not in self.url_to_resp:
+            raise AssertionError(f"unexpected URL fetched in test: {url}")
+        return self.url_to_resp[url]
+
+
+def _patch_get_client(monkeypatch, fake: _FakeGetClient) -> None:
+    def factory(*args, **kwargs):
+        return fake
+    monkeypatch.setattr(
+        "alfred_coo.autonomous_build.orchestrator.httpx.AsyncClient", factory,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_skips_when_no_token(monkeypatch):
+    """Missing GITHUB_TOKEN → log + return 0, no httpx attempt. Builders
+    are still allowed the one-shot http_get fallback per persona Step 0.5."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    orch = _mk_orchestrator()
+    _seed_graph(orch, [
+        _t_with_body(
+            "u1", "SAL-1", "F01", 0,
+            "see https://raw.githubusercontent.com/salucallc/planning-artifacts/main/x.md",
+        ),
+    ])
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_inlines_fetched_content(monkeypatch):
+    """Happy path: a single URL in the ticket body is fetched, the content
+    is inlined under a ``## Resolved References`` heading with a code-fence
+    matched to the file extension, and the in-memory body is mutated."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    url = "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/cockpit-mockups/tokens.css"
+    _seed_graph(orch, [
+        _t_with_body(
+            "u1", "SAL-1", "F01", 0,
+            f"reference_paths:\n* {url} — read for token semantics\n",
+        ),
+    ])
+    fake = _FakeGetClient({url: _FakeTextResp(200, ":root { --bg: #000; }")})
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 1
+    body = orch.graph.nodes["u1"].body
+    assert "## Resolved References" in body
+    assert "### tokens.css" in body
+    assert ":root { --bg: #000; }" in body
+    # Code-fence language inferred from extension.
+    assert "```css" in body
+    # Original ticket body retained — append, not replace.
+    assert "reference_paths:" in body
+    # Single URL, single fetch, no over-budget calls.
+    assert fake.fetched == [url]
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_idempotent_when_already_resolved(monkeypatch):
+    """Tickets already carrying ``## Resolved References`` are skipped — a
+    re-run after a successful hydrate (or an already-hydrated body from
+    another path) must not double-fetch or double-append."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    url = "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/x.md"
+    _seed_graph(orch, [
+        _t_with_body(
+            "u1", "SAL-1", "F01", 0,
+            f"see {url}\n\n## Resolved References\n(already inlined)\n",
+        ),
+    ])
+    fake = _FakeGetClient({})  # no URL should be fetched
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 0
+    assert fake.fetched == []
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_skips_terminal_states(monkeypatch):
+    """MERGED_GREEN / FAILED tickets are not hydrated even if their bodies
+    cite reference URLs — they're outside the dispatch surface."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    url = "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/x.md"
+    _seed_graph(orch, [
+        _t_with_body(
+            "u-merged", "SAL-1", "F01", 0, f"see {url}",
+            status=TicketStatus.MERGED_GREEN,
+        ),
+        _t_with_body(
+            "u-active", "SAL-2", "F02", 0, f"see {url}",
+        ),
+    ])
+    fake = _FakeGetClient({url: _FakeTextResp(200, "active content")})
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 1
+    # Only the active ticket was fetched; the merged-green one was skipped.
+    assert orch.graph.nodes["u-active"].body.count("## Resolved References") == 1
+    assert "## Resolved References" not in orch.graph.nodes["u-merged"].body
+    assert fake.fetched == [url]
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_caps_per_ticket(monkeypatch):
+    """Ticket with > _PRE_DISPATCH_REFS_PER_TICKET URLs has the excess
+    dropped — bounded fetch budget so a runaway ticket can't burn all
+    Linear/GitHub rate budget on one dispatch."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    cap = orch._PRE_DISPATCH_REFS_PER_TICKET
+    urls = [
+        f"https://raw.githubusercontent.com/salucallc/planning-artifacts/main/file{i}.md"
+        for i in range(cap + 3)
+    ]
+    body = "\n".join(f"* {u}" for u in urls)
+    _seed_graph(orch, [_t_with_body("u1", "SAL-1", "F01", 0, body)])
+    fake = _FakeGetClient({u: _FakeTextResp(200, f"body{i}") for i, u in enumerate(urls)})
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 1
+    # Only the first ``cap`` URLs were fetched; the rest dropped on the floor.
+    assert len(fake.fetched) == cap
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_truncates_oversized_content(monkeypatch):
+    """Reference content larger than ``_PRE_DISPATCH_REFS_MAX_BYTES`` is
+    truncated with a clear marker so the prompt budget stays bounded.
+    The marker tells the builder where the full file lives so it can
+    one-shot http_get as a fallback if needed."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    url = "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/big.md"
+    big = "x" * (orch._PRE_DISPATCH_REFS_MAX_BYTES + 5_000)
+    _seed_graph(orch, [_t_with_body("u1", "SAL-1", "F01", 0, f"see {url}")])
+    fake = _FakeGetClient({url: _FakeTextResp(200, big)})
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 1
+    body = orch.graph.nodes["u1"].body
+    assert "[truncated at" in body
+    assert url in body  # full URL is in the truncation marker so builder can fallback
+    # Inlined content is at most cap bytes (+ marker overhead).
+    assert body.count("x") < orch._PRE_DISPATCH_REFS_MAX_BYTES + 100
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_records_fetch_failure(monkeypatch):
+    """Per-fetch HTTP errors are inlined as a ``(fetch failed: ...)`` note
+    so the builder can decide whether to fall back to an http_get of its
+    own. Critically the rest of the loop continues — one bad URL doesn't
+    stop hydration on other tickets."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    url_ok = "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/ok.md"
+    url_bad = "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/bad.md"
+    _seed_graph(orch, [
+        _t_with_body("u-ok", "SAL-1", "F01", 0, f"see {url_ok}"),
+        _t_with_body("u-bad", "SAL-2", "F02", 0, f"see {url_bad}"),
+    ])
+    fake = _FakeGetClient({
+        url_ok: _FakeTextResp(200, "happy content"),
+        url_bad: _FakeTextResp(404, ""),
+    })
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 2
+    body_ok = orch.graph.nodes["u-ok"].body
+    body_bad = orch.graph.nodes["u-bad"].body
+    assert "happy content" in body_ok
+    assert "fetch failed: HTTP 404" in body_bad
+    assert "you may http_get this URL once as a fallback" in body_bad
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_dedupes_within_ticket(monkeypatch):
+    """A ticket that mentions the same URL multiple times in body prose
+    (reference_paths block + inline mentions) only pays one fetch — dedupe
+    happens before the cap so capacity isn't wasted on duplicates."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    url = "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/tokens.css"
+    body = (
+        f"see {url}\n"
+        f"reference_paths:\n* {url} — for token semantics\n"
+        f"and again {url}\n"
+    )
+    _seed_graph(orch, [_t_with_body("u1", "SAL-1", "F01", 0, body)])
+    fake = _FakeGetClient({url: _FakeTextResp(200, ":root{}")})
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 1
+    assert fake.fetched == [url]
+
+
+@pytest.mark.asyncio
+async def test_refs_hydrate_ignores_non_allowlisted_urls(monkeypatch):
+    """URLs outside the salucallc raw-content path are ignored — the
+    pre-dispatch fetch is scoped to Saluca-owned content. Other URLs
+    (arxiv, vendor docs, etc.) the builder can still http_get on its own
+    if needed."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
+    orch = _mk_orchestrator()
+    body = (
+        "see https://raw.githubusercontent.com/some-other-org/repo/main/x.md\n"
+        "and https://example.com/x.md\n"
+        "and https://raw.githubusercontent.com/salucallc/planning-artifacts/main/x.md\n"
+    )
+    _seed_graph(orch, [_t_with_body("u1", "SAL-1", "F01", 0, body)])
+    fake = _FakeGetClient({
+        "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/x.md":
+            _FakeTextResp(200, "salucallc content"),
+    })
+    _patch_get_client(monkeypatch, fake)
+    n = await orch._hydrate_references_pre_dispatch()
+    assert n == 1
+    # Only the salucallc URL was fetched.
+    assert fake.fetched == [
+        "https://raw.githubusercontent.com/salucallc/planning-artifacts/main/x.md",
+    ]
+
+
+def test_refs_guess_code_lang_covers_common_extensions():
+    """Sanity check the language-fence lookup so the resolved-references
+    block renders with a useful syntax-highlight hint per file type."""
+    orch = _mk_orchestrator()
+    cases = {
+        "tokens.css": "css",
+        "DESIGN_NOTES.md": "markdown",
+        "page.html": "html",
+        "config.json": "json",
+        "loader.ts": "typescript",
+        "compose.yaml": "yaml",
+        "schema.toml": "toml",
+        "deploy.sh": "bash",
+        "migration.sql": "sql",
+        "no_extension": "",
+        "weird.unknown": "",
+    }
+    for filename, expected in cases.items():
+        assert orch._guess_code_lang(filename) == expected, filename
