@@ -8552,14 +8552,30 @@ class AutonomousBuildOrchestrator:
 
     def _is_wave_gate_excused(self, ticket: "Ticket") -> bool:
         """AB-17-w: True iff `ticket` should be excluded from the wave-gate
-        green-ratio denominator. See ``_wait_for_wave_gate`` for the three
-        excusal axes (human-assigned label, PATH_CONFLICT verification,
-        NO_HINT / unmapped code).
+        green-ratio denominator. See ``_wait_for_wave_gate`` for the
+        original three excusal axes (human-assigned label, PATH_CONFLICT
+        verification, NO_HINT / unmapped code) and ESCALATED status.
 
         Centralised so the same predicate is used in any future caller
         (e.g. status-tick rendering) and so tests can exercise the
         decision in isolation.
         """
+        # Axis 4 (substrate task #83, 2026-05-02): Linear state is one of
+        # the terminal-not-our-fault buckets (Canceled, Cancelled,
+        # Duplicate). Background: SAL-3610 was correctly Canceled tonight
+        # because soul-svc already covers external soulkey issuance, but
+        # the wave-gate still counted it as FAILED via the Linear-state
+        # → status mapping in graph.py:_linear_state_to_status, dragging
+        # the Agent-Ingest chain to green_ratio=0.00 and burning through
+        # the retry budget. Excuse those states here so a wave with one
+        # legitimately-descoped ticket doesn't fail the gate.
+        #
+        # Mirror the case set already used by every "already terminal"
+        # bail-out in this file (see e.g. lines 5939, 6361, 6417, 6549).
+        linear_state = (getattr(ticket, "linear_state", None) or "").strip().lower()
+        if linear_state in ("canceled", "cancelled", "duplicate"):
+            return True
+
         # Axis 1: human-assigned label (case-insensitive name match).
         labels = getattr(ticket, "labels", None) or []
         if any(
