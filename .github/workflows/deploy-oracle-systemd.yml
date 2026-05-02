@@ -36,9 +36,40 @@ name: Deploy to Oracle (systemd canonical)
 #
 #   ORACLE_SSH_USER        — login user (default: ubuntu).
 #
+#   SOUL_API_KEY           — bearer token for the mesh API on Oracle. Used by
+#                            the SAL-3924 pre-deploy gate to poll
+#                            /v1/mesh/tasks for active autonomous-build-a
+#                            kickoffs before restarting the daemon. If
+#                            missing, the gate logs a warning and proceeds
+#                            (fail-open, since the deploy itself is the
+#                            higher-priority operation).
+#
+#   SLACK_BOT_TOKEN        — bot token (xoxb-…) used by the SAL-3924 gate
+#                            to post a force-deploy warning to #batcave
+#                            (C0ASAKFTR1C) when the gate exhausts its
+#                            1-hour deferral budget with an active
+#                            orchestrator still running. Optional; if
+#                            missing the gate skips the Slack post but
+#                            still proceeds with the force-deploy.
+#
 # The workflow fails fast with a clear message if any required secret is
 # missing, so operators can see the gap in the Actions log instead of
 # the workflow silently no-op'ing.
+#
+# SAL-3924 (2026-05-02): Pre-deploy gate.
+# ---------------------------------------
+# Today's autonomous-build kickoff #4 was killed mid-wave-3 when its own
+# SAL-3618 PR auto-merged → publish workflow → THIS workflow → daemon
+# restart → in-process orchestrator died → SAL-3616 builder lost. Since
+# every future kickoff that ships an alfred-coo-svc PR will hit the same
+# trap, we now poll the mesh API for active
+# `[persona:autonomous-build-a]` claimed/in_progress parent tasks before
+# running the SSH deploy ritual. If any orchestrator is active we sleep
+# 60s and retry up to 60 times (1-hour budget), then force-deploy with a
+# Slack warning to #batcave. The daemon's substrate fix #80 (boot-time
+# orphan-claimed-task recovery) cleans up the resulting mesh state on
+# restart, but this gate is what lets the orchestrator complete its work
+# in the first place.
 
 on:
   workflow_run:
@@ -94,6 +125,107 @@ jobs:
             exit 1
           fi
           echo "ORACLE_SSH_DEPLOY_KEY is configured (length=${#KEY})"
+
+      - name: Wait for no active autonomous-build-a orchestrator (SAL-3924)
+        id: gate
+        # Pre-deploy gate. Polls Oracle's mesh API for active parent
+        # kickoffs whose title starts with `[persona:autonomous-build-a]`
+        # and whose status is `claimed` or `in_progress`. If any are
+        # active, sleeps 60s and retries up to 60 times (1-hour budget),
+        # then force-proceeds with a Slack warning. Fails open: if the
+        # gate itself errors (network, missing token, malformed
+        # response), it logs and proceeds rather than blocking the
+        # deploy indefinitely.
+        env:
+          ORACLE_SSH_HOST: ${{ secrets.ORACLE_SSH_HOST || '100.105.27.63' }}
+          ORACLE_SSH_USER: ${{ secrets.ORACLE_SSH_USER || 'ubuntu' }}
+          ORACLE_SSH_DEPLOY_KEY: ${{ secrets.ORACLE_SSH_DEPLOY_KEY }}
+          SOUL_API_KEY: ${{ secrets.SOUL_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: "C0ASAKFTR1C" # #batcave
+          MAX_RETRIES: "60"
+          SLEEP_SECONDS: "60"
+        run: |
+          set -uo pipefail
+
+          if [ -z "${SOUL_API_KEY:-}" ]; then
+            echo "::warning::SOUL_API_KEY not set — skipping autonomous-build orchestrator gate (fail-open)."
+            echo "force_deployed=false" >> "$GITHUB_OUTPUT"
+            echo "active_task=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Stage SSH key for one-shot ssh execution. We re-use the same
+          # ORACLE_SSH_DEPLOY_KEY that the deploy step uses so the gate
+          # doesn't need a separate credential.
+          KEY_FILE="$(mktemp)"
+          chmod 600 "$KEY_FILE"
+          printf '%s\n' "$ORACLE_SSH_DEPLOY_KEY" > "$KEY_FILE"
+
+          # Probe via SSH so the mesh API stays bound to localhost on
+          # the Oracle host (no public exposure required). The remote
+          # command pipes the JSON response through jq to filter for
+          # active autonomous-build-a parent kickoffs.
+          probe_active() {
+            ssh -i "$KEY_FILE" \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -o BatchMode=yes \
+                "${ORACLE_SSH_USER}@${ORACLE_SSH_HOST}" \
+                "curl -fsS -H 'Authorization: Bearer ${SOUL_API_KEY}' 'http://localhost:8080/v1/mesh/tasks?status=claimed&limit=50' \
+                  | jq -r '.tasks[]? | select(.title | startswith(\"[persona:autonomous-build-a]\")) | .task_id' 2>/dev/null"
+          }
+
+          ACTIVE_TASK=""
+          ATTEMPT=0
+          while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            # shellcheck disable=SC2155
+            RESULT="$(probe_active 2>/dev/null || true)"
+            # First non-empty line is the task_id we treat as the active
+            # orchestrator (multiple active is rare; we still surface
+            # the count in the log).
+            ACTIVE_TASK="$(printf '%s\n' "$RESULT" | awk 'NF { print; exit }')"
+            ACTIVE_COUNT="$(printf '%s\n' "$RESULT" | awk 'NF' | wc -l | tr -d ' ')"
+
+            if [ -z "$ACTIVE_TASK" ]; then
+              echo "::notice::deploy proceeding: no active autonomous-build-a kickoffs (attempt ${ATTEMPT}/${MAX_RETRIES})"
+              echo "force_deployed=false" >> "$GITHUB_OUTPUT"
+              echo "active_task=" >> "$GITHUB_OUTPUT"
+              rm -f "$KEY_FILE"
+              exit 0
+            fi
+
+            echo "::notice::deferred deploy: orchestrator ${ACTIVE_TASK} still active (count=${ACTIVE_COUNT}, attempt ${ATTEMPT}/${MAX_RETRIES}); sleeping ${SLEEP_SECONDS}s"
+            sleep "$SLEEP_SECONDS"
+          done
+
+          # Exhausted the budget. Force-proceed with a Slack warning.
+          echo "::warning::SAL-3924 force-deploying despite active orchestrator ${ACTIVE_TASK} after ${MAX_RETRIES}x${SLEEP_SECONDS}s deferral (~1h)"
+          echo "force_deployed=true" >> "$GITHUB_OUTPUT"
+          echo "active_task=${ACTIVE_TASK}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
+            MSG=":warning: SAL-3924 force-deploying despite active orchestrator ${ACTIVE_TASK} after 1h deferral"
+            curl -fsS -X POST https://slack.com/api/chat.postMessage \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+              -H "Content-Type: application/json; charset=utf-8" \
+              -d "$(jq -nc --arg ch "$SLACK_CHANNEL" --arg t "$MSG" '{channel:$ch, text:$t}')" \
+              > /tmp/slack_post.json || true
+            if grep -q '"ok":true' /tmp/slack_post.json 2>/dev/null; then
+              echo "::notice::Slack force-deploy warning posted to ${SLACK_CHANNEL}"
+            else
+              echo "::warning::Slack force-deploy warning post failed (see /tmp/slack_post.json in runner)"
+              cat /tmp/slack_post.json 2>/dev/null || true
+            fi
+          else
+            echo "::warning::SLACK_BOT_TOKEN not set — skipping Slack force-deploy warning."
+          fi
+
+          rm -f "$KEY_FILE"
+          # Fall through to the deploy step.
 
       - name: Deploy via systemd ritual
         uses: appleboy/ssh-action@v1.0.3
