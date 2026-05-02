@@ -6,7 +6,34 @@ Headless COO daemon that claims tasks from the Saluca mesh, routes them by perso
 
 - `src/alfred_coo/main.py` — poll → claim → dispatch → complete loop; loads persona-scoped soul memory as context; persists artifact paths + tool-call log on completion.
 - `src/alfred_coo/fleet_gateway/server.py` — sidecar WebSocket bridge at `/v1/fleet/link`, bearer auth via `FLEET_GATEWAY_KEY`. Uvicorn entry: `uvicorn alfred_coo.fleet_gateway.server:app --port 8090`.
-- `src/alfred_coo/fleet_voice/server.py` — sidecar WebSocket gateway at `/v1/fleet/voice` for the ReSpeaker XVF3800 voice puck (SAL-3997..4019) and the Alfred PWA. Bearer auth via `FLEET_VOICE_KEY`; admin sessions snapshot at `GET /v1/fleet/voice/sessions` (auth via `FLEET_VOICE_ADMIN_KEY`). Accepts opaque binary Opus frames + JSON control plane (`type`, `seq`, optional `payload`); server pings every 15s, closes 1011 on inactivity. STT/TTS adapters plug in via SAL-4003 / SAL-4005. Uvicorn entry: `uvicorn alfred_coo.fleet_voice.server:app --port 8091`.
+- `src/alfred_coo/fleet_voice/server.py` — sidecar WebSocket gateway at `/v1/fleet/voice` for the ReSpeaker XVF3800 voice puck (SAL-3997..4019) and the Alfred PWA. Bearer auth via `FLEET_VOICE_KEY`; admin sessions snapshot at `GET /v1/fleet/voice/sessions` (auth via `FLEET_VOICE_ADMIN_KEY`). Accepts binary Opus frames + JSON control plane (`type`, `seq`, optional `payload`); server pings every 15s, closes 1011 on inactivity. Uvicorn entry: `uvicorn alfred_coo.fleet_voice.server:app --port 8091`.
+- `src/alfred_coo/fleet_voice/stt.py` (SAL-4003) — Whisper-1 STT adapter that decodes the per-session Opus accumulator, segments on WebRTC VAD, transcribes via OpenAI `/v1/audio/transcriptions`, and relays the transcript to soul-svc `/v1/overview/chat`. Lazy-imports `opuslib` + `webrtcvad` so the module loads on dev boxes without `libopus.dll` on PATH; install via the optional `voice` extra (`pip install -e '.[voice]'`) and ensure `libopus0` is present in the runtime image. Env knobs: `OPENAI_API_KEY`, `SOUL_API_KEY`, `SOUL_API_URL`, `FLEET_VOICE_VAD_AGGRESSIVENESS` (0..3, default 2), `FLEET_VOICE_MIN_SEGMENT_MS` (default 300), `FLEET_VOICE_MAX_GAP_MS` (default 400), `FLEET_VOICE_WHISPER_MODEL` (default `whisper-1`).
+
+### fleet_voice control protocol
+
+Inbound from device (text JSON, all messages carry `type: str`, `seq: int >= 0`):
+
+| `type` | Meaning |
+|---|---|
+| `hello` | Client greeting; server replies `welcome` with `session_id` + `protocol_version`. |
+| `pong` | Reply to server `ping`; bumps `last_seen`, no outbound frame. |
+| `start_utterance` | Device VAD detected speech start; gateway drains the buffered Opus frames now. Server acks, then emits `transcript` (and `assistant_text` if soul-svc replies). |
+| `end_utterance` | Device VAD detected speech end; same drain trigger as `start_utterance`, different `source` label so logs distinguish. |
+| anything else | Ack-echoed (`{type:"ack", seq, echo_type}`) until a real handler lands. |
+
+Inbound binary: opaque Opus packets, one packet per WS binary frame. Each gets appended to `session.opus_buffer` in arrival order; the buffer drains on the next `start_utterance` / `end_utterance` (or when SAL-4012 wires server-side natural-silence auto-drain).
+
+Outbound from gateway (text JSON):
+
+| `type` | Shape |
+|---|---|
+| `hello` | `{type:"hello", seq:0, session_id, device_id, protocol_version, ping_interval_s}` on connect. |
+| `welcome` | `{type:"welcome", seq:<echoed>, session_id, device_id, protocol_version}` in reply to client `hello`. |
+| `ping` | `{type:"ping", seq}` every 15 s; client must reply `pong` within 45 s. |
+| `ack` | `{type:"ack", seq, echo_type}` for unhandled control types and for `start_utterance` / `end_utterance` (before drain). |
+| `transcript` | `{type:"transcript", seq, text, source, segment_count}` after STT drain. `source` is `"start_utterance"`, `"end_utterance"`, or (later) `"auto_vad"`. |
+| `assistant_text` | `{type:"assistant_text", seq, text}` Alfred's reply from soul-svc. TTS encoding lands in SAL-4005; until then the device renders or queues plain text. |
+| `error` | `{type:"error", reason, seq, detail?}` on malformed JSON or pipeline failure. Socket stays open so the client can recover. |
 - `src/alfred_coo/persona.py` — `BUILTIN_PERSONAS` registry; each entry bundles system prompt, preferred + fallback model, topic scope, and opt-in tool list.
 - `src/alfred_coo/dispatch.py` — model-agnostic caller; `select_model` resolves `[tag:code]` / `[tag:strategy]` overrides; `call_with_tools` runs the multi-turn tool loop (max 8 iterations) against Ollama or OpenRouter OpenAI-compatible endpoints.
 - `src/alfred_coo/tools.py` — five built-in tools (`linear_create_issue`, `slack_post`, `mesh_task_create`, `propose_pr`, `http_get`); each is an async handler with a JSON schema rendered to OpenAI function form.

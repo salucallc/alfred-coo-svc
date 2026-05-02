@@ -40,6 +40,21 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.10.0",
 ]
+# fleet_voice (SAL-4003 onwards): voice puck STT/TTS adapters. Optional so
+# the core COO daemon container doesn't have to ship libopus + webrtcvad
+# native deps unless the operator opts into the voice gateway sidecar.
+#   * openai: Whisper-1 transcription + tts-1 (SAL-4005) HTTP client.
+#   * webrtcvad-wheels: pure-wheel build of WebRTC VAD (no compile step on
+#     Windows dev boxes; Linux runtime is identical).
+#   * opuslib: ctypes binding to libopus. Requires libopus0 in the runtime
+#     image (`apt-get install libopus0` on the Pi / Cloud Run image, or
+#     `libopus.dll` on PATH on Windows). The fleet_voice.stt module
+#     lazy-imports it so the package still imports on bare boxes.
+voice = [
+    "openai>=1.0.0",
+    "webrtcvad-wheels>=2.0.10",
+    "opuslib>=3.0.1",
+]
 
 [project.scripts]
 alfred-coo = "alfred_coo.__main__:main"

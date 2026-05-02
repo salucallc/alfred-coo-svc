@@ -104,6 +104,13 @@ class VoiceSession:
     Once SAL-4017 lands, `device_id` becomes the JWT subject claim. For
     now it falls back to the `?device_id=` query param, or "anon-<uuid>"
     if the client omits one.
+
+    SAL-4003 (STT) extends this with the per-session Opus accumulator:
+      * `opus_buffer` — list of binary Opus frames received since the
+        last drain. Drained by `start_utterance` (caller-driven mode)
+        or by the `_maybe_autodrain` heuristic on natural silence.
+      * `transcript_seq` — outbound counter for `transcript` /
+        `assistant_text` frames so the device can detect drops.
     """
 
     session_id: str
@@ -117,6 +124,8 @@ class VoiceSession:
     bytes_in: int = 0
     bytes_out: int = 0
     last_seq_in: int | None = None
+    opus_buffer: list[bytes] = field(default_factory=list)
+    transcript_seq: int = 0
 
     async def send_text(self, payload: dict[str, Any]) -> None:
         """Send a JSON control message; updates outbound accounting."""
@@ -209,16 +218,85 @@ def _parse_control(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     return msg, None
 
 
+async def _drain_and_transcribe(session: VoiceSession, *, source: str) -> None:
+    """Pop the session Opus buffer, run STT, emit transcript + soul reply.
+
+    `source` is the trigger that caused the drain ("start_utterance",
+    "end_utterance", "auto_vad") and is logged + included in the
+    outbound transcript frame so the device knows whether the server
+    cut the segment itself or honored the device's hint.
+
+    Lazy-imports `stt` so the module can load on bare boxes without
+    libopus / webrtcvad. Errors are caught and surface as a single
+    `error` frame; the WS stays open.
+    """
+    if not session.opus_buffer:
+        return
+    frames = session.opus_buffer
+    session.opus_buffer = []
+    try:
+        from . import stt  # lazy: keeps module import-clean on dev boxes
+        pcm = stt.decode_opus_buffer(frames)
+        if not pcm:
+            return
+        segments = stt.segment_on_vad(pcm, stt.SAMPLE_RATE)
+        if not segments:
+            return
+        merged = b"".join(segments)
+        text = await stt.transcribe(merged)
+        if not text:
+            return
+        session.transcript_seq += 1
+        await session.send_text({
+            "type": "transcript",
+            "seq": session.transcript_seq,
+            "text": text,
+            "source": source,
+            "segment_count": len(segments),
+        })
+        reply = await stt.post_to_soul(text, session_id=session.device_id)
+        if reply:
+            session.transcript_seq += 1
+            await session.send_text({
+                "type": "assistant_text",
+                "seq": session.transcript_seq,
+                "text": reply,
+            })
+    except Exception as exc:
+        logger.exception(
+            "fleet_voice STT drain failed session=%s source=%s frames=%d",
+            session.session_id, source, len(frames),
+        )
+        try:
+            await session.send_text({
+                "type": "error",
+                "reason": "stt_drain_failed",
+                "detail": str(exc)[:200],
+                "seq": session.transcript_seq,
+            })
+        except Exception:
+            pass
+
+
 async def _handle_control(session: VoiceSession, msg: dict[str, Any]) -> None:
     """Dispatch a parsed control message.
 
-    Skeleton-level handling only:
+    Handlers:
       * `hello` → reply with `welcome` carrying server protocol version
       * `pong` → no-op (last_seen already bumped by the receive loop)
+      * `start_utterance` (SAL-4003) → drain pending Opus buffer right
+        now; device uses this when its on-board VAD fires the begin-
+        of-utterance edge. We accept that any audio still in flight
+        before this control arrives gets transcribed as "previous
+        utterance"; on re-thinking we could reset the buffer instead,
+        but draining is the safer default (no audio gets dropped).
+      * `end_utterance` (SAL-4003) → same drain, different label so we
+        know in logs whether the device thinks the user just stopped
+        talking versus just started.
       * everything else → ack-echo so the client can verify round-trip
 
-    SAL-4003 (STT) and SAL-4005 (TTS) will register additional handlers
-    here for `start_utterance` / `end_utterance` / `play_music` / etc.
+    SAL-4005 (TTS) and SAL-4014 (music orchestrator) will register
+    additional handlers here.
     """
     typ = msg["type"]
     seq = msg["seq"]
@@ -232,6 +310,12 @@ async def _handle_control(session: VoiceSession, msg: dict[str, Any]) -> None:
         })
         return
     if typ == "pong":
+        return
+    if typ in ("start_utterance", "end_utterance"):
+        # Ack first so the device knows we received the edge marker even
+        # if the drain itself fails or returns empty.
+        await session.send_text({"type": "ack", "seq": seq, "echo_type": typ})
+        await _drain_and_transcribe(session, source=typ)
         return
     # Default: echo-ack every other type until real handlers land.
     await session.send_text({"type": "ack", "seq": seq, "echo_type": typ})
@@ -362,14 +446,21 @@ async def fleet_voice(ws: WebSocket) -> None:
             etype = event.get("type")
             if etype == "websocket.disconnect":
                 break
-            # Binary frame → opaque Opus blob (SAL-4003 will subscribe).
+            # Binary frame → opaque Opus blob.
+            # SAL-4003 (STT): accumulate into per-session opus_buffer for
+            # drain on `start_utterance` / `end_utterance` control. The
+            # blob is appended verbatim; we trust the device to send one
+            # Opus packet per binary frame (matches firmware ticket
+            # SAL-4001's encoder loop).
             if "bytes" in event and event["bytes"] is not None:
                 blob: bytes = event["bytes"]
                 session.frames_in += 1
                 session.bytes_in += len(blob)
+                session.opus_buffer.append(blob)
                 logger.debug(
-                    "fleet_voice rx binary session=%s frame=%d bytes=%d",
+                    "fleet_voice rx binary session=%s frame=%d bytes=%d buffered=%d",
                     session_id, session.frames_in, len(blob),
+                    len(session.opus_buffer),
                 )
                 continue
             # Text frame → JSON control plane.
