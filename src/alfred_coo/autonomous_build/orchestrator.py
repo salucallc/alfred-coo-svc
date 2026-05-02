@@ -8108,20 +8108,37 @@ class AutonomousBuildOrchestrator:
         """Decide whether a wave-gate RuntimeError represents a retriable
         failure worth queuing a fresh kickoff for.
 
-        Retriable: green_ratio fell below threshold but no critical-path
-        ticket blew up. These are usually caused by upstream model/gateway
-        flakes, transient infra, or partial chain rotation — re-running
-        the wave on a clean orchestrator gives the chain another shot.
+        Retriable: green_ratio fell below threshold AND at least one
+        non-critical FAILED ticket pulled the ratio down. These are
+        usually caused by upstream model/gateway flakes, transient infra,
+        or partial chain rotation — re-running the wave on a clean
+        orchestrator gives the chain another shot.
 
-        NOT retriable: critical-path failure (a blocker ticket failed —
-        retrying will keep failing until the ticket substance changes) or
-        zero-scoreable-tickets (orchestrator state is corrupt).
+        NOT retriable:
+          - Critical-path failure (a blocker ticket failed — retrying
+            will keep failing until the ticket substance changes).
+          - Zero-scoreable-tickets (orchestrator state is corrupt).
+          - All-excused / "nothing shipped" (substrate task #85,
+            2026-05-02): every ticket in the wave was excused via
+            human-assigned label, PATH_CONFLICT, NEW_PATHS_COLLISION,
+            NO_HINT, ESCALATED, or Linear-Canceled. There is literally
+            no work to retry — the next kickoff would re-verify the same
+            tickets, get the same all-excused outcome, and loop forever.
+            Observed live 2026-05-02 04:29-04:34Z under sha-04fede1:
+            Cockpit-UX wave 1 (3 tickets, 1 path_conflict + 1
+            new_paths_collision + 1 already-shipped) generated 4+ retry
+            kickoffs in 5 minutes, all repeating the same green=0/
+            excused=3/ratio=0.00 failure. The "nothing shipped" suffix
+            is the unique signature of this case in
+            ``_wait_for_wave_gate``'s excused-dominant raise message.
         """
         msg = str(exc)
         msg_lower = msg.lower()
         if "critical-path" in msg_lower:
             return False
         if "zero scoreable tickets" in msg_lower:
+            return False
+        if "nothing shipped" in msg_lower:
             return False
         return "green_ratio=" in msg
 

@@ -606,6 +606,42 @@ def test_is_retriable_wave_fail_unrelated_runtime_error_not_retriable():
     assert AutonomousBuildOrchestrator._is_retriable_wave_fail(exc) is False
 
 
+def test_is_retriable_wave_fail_all_excused_not_retriable():
+    """Substrate task #85 (2026-05-02): an all-excused / "nothing shipped"
+    wave is NOT retriable. Re-running the wave on a clean orchestrator
+    re-verifies the same tickets and gets the same all-excused outcome,
+    so retrying loops forever.
+
+    Repro shape from 2026-05-02 04:29Z Cockpit-UX wave 1: 3 tickets
+    (1 path_conflict + 1 new_paths_collision + 1 already-shipped) →
+    green=0 / excused=3 / denominator=3 / ratio=0.00. Pre-fix this
+    looped through 4+ kickoffs in 5 minutes; post-fix the chain
+    terminates after the first failure.
+    """
+    exc = RuntimeError(
+        "wave 1 failed: green_ratio=0.00 < 0.90 "
+        "(green=0 excused=3 of 3); nothing shipped"
+    )
+    assert AutonomousBuildOrchestrator._is_retriable_wave_fail(exc) is False
+
+
+def test_is_retriable_wave_fail_partial_failure_with_excused_still_retriable():
+    """Sanity check for the task #85 split: a wave with both real
+    failures AND excused tickets (mixed-bag, ratio below threshold) is
+    STILL retriable. Only the all-excused / nothing-shipped shape is
+    excluded.
+
+    The "X non-critical failure(s)" suffix is the unique signature of
+    the failure-dominant raise message (vs the excused-dominant
+    "nothing shipped" suffix).
+    """
+    exc = RuntimeError(
+        "wave 2 failed: green_ratio=0.50 < 0.90 "
+        "and 1 non-critical failure(s)"
+    )
+    assert AutonomousBuildOrchestrator._is_retriable_wave_fail(exc) is True
+
+
 @pytest.mark.asyncio
 async def test_schedule_wave_retry_kickoff_queues_with_decremented_budget():
     """SAL-3807: when called, queues a new mesh task with budget-1 in
