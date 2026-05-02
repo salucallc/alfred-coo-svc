@@ -483,3 +483,92 @@ async def test_mixed_escalated_and_abandoned_split_correctly(monkeypatch):
     )
     # 2 / (2 + 3 + 2) = 2/7 ≈ 0.286
     assert halt.get("green_ratio") == pytest.approx(2 / 7, abs=1e-3)
+
+
+# ── Substrate task #83 (2026-05-02) — Linear Canceled excusal axis ─────────
+#
+# SAL-3610 was correctly Canceled tonight after the soul-svc=identity /
+# tiresias=policy architectural decision: the soulkey-issuance work the
+# ticket scoped is already shipped in soul-svc, so the ticket was
+# duplicative. But the wave-gate counted it as FAILED via
+# graph._linear_state_to_status's "canceled" → TicketStatus.FAILED
+# mapping — green=0/failed=1/excused=3/denom=4 → ratio=0.00, dragging
+# the Agent-Ingest chain budget to zero across multiple wave-1 retries.
+#
+# Fix: _is_wave_gate_excused now treats ticket.linear_state ∈
+# {Canceled, Cancelled, Duplicate} as an additional excusal axis (axis
+# 4 in the comment numbering) so descoped tickets don't fail the gate.
+
+
+async def test_canceled_linear_state_excused_post_task_83(monkeypatch):
+    """A ticket with Linear state == Canceled must be excused from the
+    wave-gate denominator regardless of its internal TicketStatus.
+
+    Repro of tonight's Agent-Ingest chain crash: green=0 failed=1
+    excused=3 denom=4 ratio=0.00 because SAL-3610 (correctly Canceled
+    after the soul-svc canonical decision) showed up in the failed
+    column. Post-fix: the Canceled ticket joins the excused bucket so
+    the denominator is 3 (all-excused empty wave) and the operator
+    message is the excused-dominant shape, not a spurious failure.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+
+    canceled = _t("uc-3610", "SAL-3610", "AI-W1B")
+    # Mirror what graph._linear_state_to_status produces for a Canceled
+    # Linear state: status=FAILED, linear_state="Canceled".
+    canceled.status = TicketStatus.FAILED
+    canceled.linear_state = "Canceled"
+
+    others = [_t(f"ueg{i}", f"SAL-EG{i}", f"AI-G{i:02d}") for i in range(3)]
+    for t in others:
+        t.status = TicketStatus.ESCALATED  # legitimate grounding-gap shape
+
+    _seed(orch, [canceled] + others)
+    await _patch_nosleep(monkeypatch)
+
+    # Sanity check: the predicate excuses the Canceled ticket directly.
+    assert orch._is_wave_gate_excused(canceled) is True
+
+    with pytest.raises(RuntimeError, match="nothing shipped|green_ratio"):
+        await orch._wait_for_wave_gate(1)
+
+    halt = next(
+        e for e in orch.state.events
+        if e["kind"] == "wave_halt_below_soft_green"
+    )
+    # All 4 are excused (1 Canceled + 3 ESCALATED); failed bucket empty.
+    assert halt.get("excused_count") == 4
+    assert halt.get("failed") == [], (
+        f"Canceled Linear state must NOT count in failed column post-#83; "
+        f"got failed={halt.get('failed')}"
+    )
+    # 0 green / (0 + 0 + 4 excused) = 0/4 (denominator is shifted excused-
+    # only). The post-SAL-3072 formula treats this as ratio=0.0; the test
+    # only locks behaviour at the bucket level so SAL-3072's all-excused
+    # ratio semantics can evolve without churning this test.
+    assert halt.get("green_ratio") == pytest.approx(0.0)
+
+
+async def test_duplicate_linear_state_also_excused(monkeypatch):
+    """``Duplicate`` is the third terminal-not-our-fault state — same
+    excusal contract as ``Canceled``. Mirrors the case-set already used
+    by every "already terminal" bail-out elsewhere in the orchestrator.
+    """
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+    dup = _t("ud", "SAL-DUP", "AI-DUP")
+    dup.status = TicketStatus.FAILED
+    dup.linear_state = "Duplicate"
+    assert orch._is_wave_gate_excused(dup) is True
+
+
+async def test_lowercase_cancelled_spelling_excused(monkeypatch):
+    """British / lowercase ``cancelled`` spelling is normalised the same
+    way as ``Canceled`` (case-insensitive lower() match)."""
+    orch = _mk_orch()
+    orch.poll_sleep_sec = 0
+    t = _t("ux", "SAL-X", "AI-X")
+    t.status = TicketStatus.FAILED
+    t.linear_state = "cancelled"  # lowercase, double-l British spelling
+    assert orch._is_wave_gate_excused(t) is True
