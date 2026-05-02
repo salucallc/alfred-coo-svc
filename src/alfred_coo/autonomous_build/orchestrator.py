@@ -45,6 +45,7 @@ from .destructive_guardrail import (
     compute_destructive_guardrails,
 )
 from .dry_run import maybe_apply_dry_run
+from .kickoff_schema import validate_and_normalize_kickoff_payload
 from .graph import (
     TERMINAL_STATES,
     Ticket,
@@ -3868,8 +3869,20 @@ class AutonomousBuildOrchestrator:
     # ── payload parsing ─────────────────────────────────────────────────────
 
     def _parse_payload(self) -> None:
-        """Parse the kickoff task description as JSON. Unknown keys are
-        logged-and-continued (forward compat per plan F §2)."""
+        """Parse the kickoff task description as JSON.
+
+        SAL-3922: as of 2026-05-02 the payload runs through
+        :func:`kickoff_schema.validate_and_normalize_kickoff_payload`
+        before field reads. The validator (a) auto-migrates the six
+        known flat-typo cases (``budget_usd``, ``waves`` etc.) into
+        their canonical nested form with a WARNING, (b) rejects any
+        remaining unknown top-level field with a ``RuntimeError`` that
+        names the offender plus a fix hint, and (c) catches typos
+        inside nested configs (``budget`` / ``concurrency`` /
+        ``status_cadence``) via pydantic ``extra='forbid'``. The
+        existing field-reading logic below is unchanged — the
+        validator just normalizes the dict shape.
+        """
         desc = self.task.get("description") or ""
         try:
             payload = json.loads(desc) if desc else {}
@@ -3884,6 +3897,15 @@ class AutonomousBuildOrchestrator:
                 type(payload).__name__,
             )
             payload = {}
+
+        # SAL-3922: schema-validate + auto-migrate flat typos into the
+        # canonical nested shape BEFORE the field-reads below. Unknown
+        # top-level fields raise a clear RuntimeError naming the
+        # offender + a fix hint. Nested typos (e.g. ``budget.max_usd_usd``)
+        # are caught the same way via pydantic ``extra='forbid'``. An
+        # empty or only-``linear_project_id`` payload remains valid.
+        if payload:
+            payload = validate_and_normalize_kickoff_payload(payload)
         self.payload = payload
 
         # Linear project.
