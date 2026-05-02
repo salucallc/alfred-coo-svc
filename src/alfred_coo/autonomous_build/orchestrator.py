@@ -266,6 +266,30 @@ PR_EXISTS_CACHE_TTL_SEC = 5 * 60
 PR_EXISTS_FRESH_PR_WINDOW_SEC = 7 * 24 * 60 * 60
 HAWKMAN_LOGIN = "salucatiresias"
 
+
+@dataclass(frozen=True)
+class _OpenPrCheck:
+    """Outcome of the dispatch-loop open-PR pre-flight.
+
+    Returned by ``_evaluate_pr_payload`` /
+    ``_ticket_has_open_pr_awaiting_review`` so the dispatch site can
+    distinguish two skip-dispatch reasons that previously collapsed onto
+    a single ``Optional[int]`` return:
+
+    * ``state == "awaiting_review"`` — open PR exists, no Hawkman APPROVE
+      yet. Skip dispatch and let the inherited-review path fire (existing
+      behaviour).
+    * ``state == "approved"`` — open PR exists AND Hawkman has APPROVED.
+      Skip dispatch AND fire ``_merge_pr`` directly. Without this branch,
+      an inherited approved PR sat open forever because the verdict path
+      in ``_poll_reviews`` only fires when the orchestrator owns the
+      review task; meanwhile the dispatch loop fell through to a
+      duplicate builder. Substrate task #82 (2026-05-02).
+    """
+    pr_number: int
+    pr_url: str
+    state: Literal["awaiting_review", "approved"]
+
 # Gap 4 (2026-04-29) — already-merged PR pre-flight. Before the dispatch
 # loop fires a builder for a ticket, search GitHub for a merged PR
 # mentioning the identifier; if one exists the ticket has already shipped
@@ -3587,7 +3611,9 @@ class AutonomousBuildOrchestrator:
         # cycle burned $0.50-2 producing nothing useful. Cache window is
         # short enough (5 min) that a real Hawkman approval lands on the
         # following dispatch tick at the latest.
-        self._pr_exists_cache: Dict[str, Tuple[float, Optional[int]]] = {}
+        self._pr_exists_cache: Dict[
+            str, Tuple[float, Optional[_OpenPrCheck]]
+        ] = {}
         # Process-local counter so an operator tailing logs / state events
         # can distinguish "wave is genuinely idle" from "wave is short-
         # circuiting on PRs awaiting review". Reset on restart.
@@ -4378,14 +4404,72 @@ class AutonomousBuildOrchestrator:
                 # already awaiting Hawkman review, skip dispatch and let
                 # the review path drive the ticket forward. Closes the
                 # 68-redispatch-storm observed on SAL-3038 / PR #214.
-                # Returns None when no such PR exists, the PR is too old
-                # (>7 days), Hawkman has approved, or GitHub is
-                # unreachable — in all those cases dispatch proceeds.
-                existing_pr = await self._ticket_has_open_pr_awaiting_review(
-                    ticket.identifier,
+                #
+                # Substrate task #82 (2026-05-02) — extended: when the open
+                # PR has already been APPROVED by Hawkman, fire ``_merge_pr``
+                # directly instead of dispatching a duplicate builder. Prior
+                # behaviour treated the APPROVED case as "fall through to
+                # dispatch" because the helper returned None; the comment
+                # claimed a merge bot would handle it but no such bot exists
+                # outside the verdict path in ``_poll_reviews``, which only
+                # fires for review tasks the orchestrator owns.
+                existing_pr_check = (
+                    await self._ticket_has_open_pr_awaiting_review(
+                        ticket.identifier,
+                    )
                 )
-                if existing_pr is not None:
+                if existing_pr_check is not None:
                     self._pr_exists_skips += 1
+                    if existing_pr_check.state == "approved":
+                        # Inherited approved PR — fire merge directly.
+                        # Populate ticket.pr_url from the helper's lookup so
+                        # ``_merge_pr``'s URL parser has owner/repo/number.
+                        if not ticket.pr_url and existing_pr_check.pr_url:
+                            ticket.pr_url = existing_pr_check.pr_url
+                        logger.info(
+                            "PR #%d for %s already Hawkman-APPROVED; "
+                            "firing merge directly (skips=%d)",
+                            existing_pr_check.pr_number,
+                            ticket.identifier,
+                            self._pr_exists_skips,
+                        )
+                        self.state.record_event(
+                            "pr_exists_approved_merge",
+                            identifier=ticket.identifier,
+                            pr_number=existing_pr_check.pr_number,
+                            pr_url=ticket.pr_url,
+                            skips_total=self._pr_exists_skips,
+                        )
+                        ticket.status = TicketStatus.MERGE_REQUESTED
+                        try:
+                            merged = await self._merge_pr(ticket)
+                        except Exception:
+                            logger.exception(
+                                "[merge-inherited] _merge_pr raised for %s; "
+                                "marking FAILED",
+                                ticket.identifier,
+                            )
+                            merged = False
+                        if merged:
+                            ticket.status = TicketStatus.MERGED_GREEN
+                            self.state.record_event(
+                                "ticket_merged",
+                                identifier=ticket.identifier,
+                                pr_url=ticket.pr_url,
+                                sha=self.state.merged_pr_urls.get(ticket.id),
+                                source="inherited_approved_pr",
+                            )
+                            await self._update_linear_state(ticket, "Done")
+                        else:
+                            ticket.status = TicketStatus.FAILED
+                            self.state.record_event(
+                                "ticket_merge_failed",
+                                identifier=ticket.identifier,
+                                pr_url=ticket.pr_url,
+                                source="inherited_approved_pr",
+                            )
+                            await self._update_linear_state(ticket, "Backlog")
+                        continue
                     # Inherited-PR review-fire (Gap 2, 2026-04-29): when an
                     # orchestrator inherits open PRs from a prior run, the
                     # builder->PR transition path in `_poll_children` never
@@ -4394,26 +4478,26 @@ class AutonomousBuildOrchestrator:
                     # registers an existing Hawkman QA task or fires a fresh
                     # one as appropriate; idempotent on `state.review_task_ids`.
                     review_task_id = await self._fire_review_for_inherited_pr(
-                        ticket, existing_pr=existing_pr,
+                        ticket, existing_pr=existing_pr_check.pr_number,
                     )
                     if review_task_id:
                         logger.info(
                             "PR #%d exists for %s; review task %s "
                             "registered, awaiting verdict (skips=%d)",
-                            existing_pr, ticket.identifier,
+                            existing_pr_check.pr_number, ticket.identifier,
                             review_task_id, self._pr_exists_skips,
                         )
                     else:
                         logger.info(
                             "skipping dispatch: PR #%d exists for ticket %s, "
                             "awaiting Hawkman review (skips=%d)",
-                            existing_pr, ticket.identifier,
+                            existing_pr_check.pr_number, ticket.identifier,
                             self._pr_exists_skips,
                         )
                     self.state.record_event(
                         "pr_exists_skip",
                         identifier=ticket.identifier,
-                        pr_number=existing_pr,
+                        pr_number=existing_pr_check.pr_number,
                         skips_total=self._pr_exists_skips,
                     )
                     continue
@@ -10287,9 +10371,10 @@ class AutonomousBuildOrchestrator:
 
     async def _ticket_has_open_pr_awaiting_review(
         self, ticket_ident: str,
-    ) -> Optional[int]:
-        """Return the PR number if an open PR for ``ticket_ident`` exists
-        on ``salucallc/*`` and is awaiting Hawkman review; else None.
+    ) -> Optional[_OpenPrCheck]:
+        """Return an ``_OpenPrCheck`` describing the open PR for
+        ``ticket_ident`` on ``salucallc/*``, or None if no usable PR was
+        found.
 
         Background: SAL-3038 (PR #214) was re-dispatched 68 times in 7
         days because the dispatch loop didn't check whether an open PR
@@ -10299,19 +10384,26 @@ class AutonomousBuildOrchestrator:
         ticket identifier in title or body and inspecting its review
         state.
 
-        Returns the PR number when ALL of:
+        Substrate task #82 (2026-05-02) extends the helper to also
+        return a non-None check for the Hawkman-APPROVED case so the
+        dispatch site can fire ``_merge_pr`` directly. Previously the
+        APPROVED case returned None and the caller fell through to a
+        duplicate builder dispatch — the comment claimed a merge bot
+        would handle it but no such bot exists outside the verdict path
+        in ``_poll_reviews``.
+
+        Returns ``_OpenPrCheck`` when ALL of:
           - At least one open PR matches the ticket identifier search.
           - The PR was created within ``PR_EXISTS_FRESH_PR_WINDOW_SEC``
             (default 7 days). Older PRs are treated as stale; dispatch
             proceeds to open a fresh attempt.
-          - The PR has NO APPROVED review from ``HAWKMAN_LOGIN``. Once
-            Hawkman approves, dispatch should proceed (the merge bot is
-            the next step, not another builder).
+
+        ``state == "awaiting_review"`` when no Hawkman APPROVED review
+        is on the PR; ``state == "approved"`` once one is.
 
         Returns None on any of:
           - No matching open PR found.
           - PR is too old (>7 days).
-          - Hawkman has already APPROVED.
           - GitHub API failure (degrades to "dispatch as before"; the
             existing dispatch idempotency + retry-budget paths still
             cap the blast radius).
@@ -10341,13 +10433,13 @@ class AutonomousBuildOrchestrator:
         now = time.time()
         cached = self._pr_exists_cache.get(ticket_ident)
         if cached is not None:
-            cached_at, cached_pr = cached
+            cached_at, cached_check = cached
             if now - cached_at < PR_EXISTS_CACHE_TTL_SEC:
-                return cached_pr
+                return cached_check
 
-        pr_number: Optional[int] = None
+        check: Optional[_OpenPrCheck] = None
         try:
-            pr_number = await self._fetch_open_pr_awaiting_review(
+            check = await self._fetch_open_pr_awaiting_review(
                 ticket_ident, now=now,
             )
         except Exception:
@@ -10356,14 +10448,14 @@ class AutonomousBuildOrchestrator:
                 "and proceeding with dispatch",
                 ticket_ident,
             )
-            pr_number = None
+            check = None
 
-        self._pr_exists_cache[ticket_ident] = (now, pr_number)
-        return pr_number
+        self._pr_exists_cache[ticket_ident] = (now, check)
+        return check
 
     async def _fetch_open_pr_awaiting_review(
         self, ticket_ident: str, *, now: float,
-    ) -> Optional[int]:
+    ) -> Optional[_OpenPrCheck]:
         """Inner half of ``_ticket_has_open_pr_awaiting_review``: do the
         actual GitHub round-trip (or stub call) and apply the freshness +
         APPROVED-review filters. Split out so the cache layer above stays
@@ -10443,6 +10535,11 @@ class AutonomousBuildOrchestrator:
                         "number": item.get("number"),
                         "created_at": item.get("created_at"),
                         "reviews": reviews,
+                        # html_url on the search item points at the issue/
+                        # PR view (e.g. .../pull/123). _merge_pr's regex
+                        # parses owner/repo/num from this URL, so plumb it
+                        # through whenever GitHub returns one.
+                        "html_url": item.get("html_url"),
                     }
                     decision = self._evaluate_pr_payload(payload, now=now)
                     if decision is not None:
@@ -10457,10 +10554,19 @@ class AutonomousBuildOrchestrator:
     @staticmethod
     def _evaluate_pr_payload(
         payload: Optional[Dict[str, Any]], *, now: float,
-    ) -> Optional[int]:
-        """Apply the freshness + Hawkman-APPROVED filter to a single PR
-        payload (search-item + reviews). Returns the PR number when the
-        short-circuit should fire, or None to fall through.
+    ) -> Optional[_OpenPrCheck]:
+        """Apply the freshness + Hawkman-review filter to a single PR
+        payload (search-item + reviews) and classify the outcome.
+
+        Returns:
+            ``None`` — no usable PR (no payload, no PR number, stale, or
+            unparseable timestamp). Caller proceeds with dispatch.
+            ``_OpenPrCheck(state="awaiting_review")`` — fresh open PR with
+            no Hawkman APPROVE on file. Caller skips dispatch and fires /
+            registers a Hawkman review task.
+            ``_OpenPrCheck(state="approved")`` — fresh open PR with at
+            least one Hawkman APPROVED review. Caller skips dispatch and
+            fires ``_merge_pr`` directly.
 
         Pulled out as a staticmethod so the live network branch and the
         stub-driven test branch share the exact same decision logic.
@@ -10483,18 +10589,30 @@ class AutonomousBuildOrchestrator:
             except (ValueError, TypeError):
                 # Unparseable date — treat as stale rather than skip dispatch.
                 return None
+        # Prefer an explicit html_url from the payload (live GitHub Search
+        # provides this on each item; tests can omit it). Fall back to the
+        # canonical salucallc placeholder so ``_merge_pr``'s URL parser
+        # has something to match — tests exercising the awaiting_review
+        # branch never reach the merge call so the placeholder is fine.
+        pr_url = ""
+        raw_url = payload.get("html_url")
+        if isinstance(raw_url, str) and raw_url:
+            pr_url = raw_url
         reviews = payload.get("reviews") or []
+        approved = False
         for rev in reviews:
             if not isinstance(rev, dict):
                 continue
             user = (rev.get("user") or {}).get("login") or ""
-            state = (rev.get("state") or "").upper()
-            if user == HAWKMAN_LOGIN and state == "APPROVED":
-                # Hawkman approved → merge bot is the next step, not
-                # another builder. Proceed with dispatch (None) so the
-                # merge path runs.
-                return None
-        return number
+            review_state = (rev.get("state") or "").upper()
+            if user == HAWKMAN_LOGIN and review_state == "APPROVED":
+                approved = True
+                break
+        return _OpenPrCheck(
+            pr_number=number,
+            pr_url=pr_url,
+            state="approved" if approved else "awaiting_review",
+        )
 
     # ── kickoff termination ─────────────────────────────────────────────────
 
