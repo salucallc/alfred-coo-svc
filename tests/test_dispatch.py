@@ -1700,3 +1700,298 @@ def test_peek_kickoff_payload_handles_malformed_block():
         "## Deliverable\nx\n"
     )
     assert _peek_kickoff_payload({"description": body}) is None
+
+
+# ── SAL-3939: size-aware dispatch ─────────────────────────────────────────
+#
+# Acceptance contract (verbatim from PR body):
+#   1. select_model("builder", size="S", payload={}) -> gpt-oss:120b-cloud, cap=4
+#   2. select_model("builder", size="M", payload={}) -> qwen3-coder:480b-cloud, cap=8
+#   3. select_model("builder", size="L", payload={}) -> kimi-k2-thinking:cloud, cap=12
+#   4. select_model("builder", size="XL", payload={}) -> kimi-k2-thinking:cloud, cap=16
+#   5. unknown / missing size -> kimi-k2-thinking:cloud, cap=12
+#   6. model_routing.builder override -> wins over size-aware
+#   7. model_routing.iteration_cap_by_size override -> wins over default mapping
+#   8. The legacy two-arg select_model(task, persona) MUST still work (back-compat).
+
+
+def test_size_aware_select_model_size_s():
+    """size=S → gpt-oss primary, fallback qwen3-coder local, cap=4."""
+    from alfred_coo.dispatch import select_model, SizeAwareDispatch
+
+    pick = select_model("builder", size="S", payload={})
+    assert isinstance(pick, SizeAwareDispatch)
+    assert pick.model == "gpt-oss:120b-cloud"
+    assert pick.iteration_cap == 4
+    assert pick.source == "size-default"
+    assert pick.cap_source == "size-default"
+    assert pick.fallback_model == "qwen3-coder:30b-a3b-q4_K_M"
+
+
+def test_size_aware_select_model_size_m():
+    """size=M → qwen3-coder:480b primary, fallback gpt-oss, cap=8."""
+    from alfred_coo.dispatch import select_model
+
+    pick = select_model("builder", size="M", payload={})
+    assert pick.model == "qwen3-coder:480b-cloud"
+    assert pick.iteration_cap == 8
+    assert pick.source == "size-default"
+    assert pick.fallback_model == "gpt-oss:120b-cloud"
+
+
+def test_size_aware_select_model_size_l():
+    """size=L → kimi-k2-thinking primary, fallback qwen3-coder:480b, cap=12."""
+    from alfred_coo.dispatch import select_model
+
+    pick = select_model("builder", size="L", payload={})
+    assert pick.model == "kimi-k2-thinking:cloud"
+    assert pick.iteration_cap == 12
+    assert pick.source == "size-default"
+    assert pick.fallback_model == "qwen3-coder:480b-cloud"
+
+
+def test_size_aware_select_model_size_xl():
+    """size=XL → kimi-k2-thinking primary (same as L), cap=16."""
+    from alfred_coo.dispatch import select_model
+
+    pick = select_model("builder", size="XL", payload={})
+    assert pick.model == "kimi-k2-thinking:cloud"
+    assert pick.iteration_cap == 16
+    assert pick.source == "size-default"
+    assert pick.fallback_model == "qwen3-coder:480b-cloud"
+
+
+def test_size_aware_select_model_unknown_size_falls_back_to_defaults():
+    """Unknown / missing size → pre-3939 defaults (kimi-thinking, cap=12)."""
+    from alfred_coo.dispatch import select_model
+
+    for bad in (None, "", "size-xxl", "weird", "Q"):
+        pick = select_model("builder", size=bad, payload={})
+        assert pick.model == "kimi-k2-thinking:cloud", f"bad size: {bad!r}"
+        assert pick.iteration_cap == 12, f"bad size: {bad!r}"
+        assert pick.source == "registry-default", f"bad size: {bad!r}"
+        assert pick.cap_source == "registry-default", f"bad size: {bad!r}"
+        assert pick.fallback_model is None, f"bad size: {bad!r}"
+
+
+def test_size_aware_select_model_no_payload():
+    """Payload omitted entirely (None) — must not raise; falls through to defaults."""
+    from alfred_coo.dispatch import select_model
+
+    pick = select_model("builder", size="S", payload=None)
+    assert pick.model == "gpt-oss:120b-cloud"
+    assert pick.iteration_cap == 4
+    assert pick.source == "size-default"
+
+
+def test_size_aware_select_model_canonicalises_label_forms():
+    """Accepts S / size-s / SIZE-S / size:s / lower / mixed case."""
+    from alfred_coo.dispatch import select_model
+
+    for label in ("S", "s", "size-s", "SIZE-S", "Size: S", "size:S"):
+        pick = select_model("builder", size=label, payload={})
+        assert pick.model == "gpt-oss:120b-cloud", f"label: {label!r}"
+        assert pick.iteration_cap == 4, f"label: {label!r}"
+    # XS collapses to S (orchestrator's ad-hoc XS label reuses size-S budget).
+    pick_xs = select_model("builder", size="XS", payload={})
+    assert pick_xs.model == "gpt-oss:120b-cloud"
+    assert pick_xs.iteration_cap == 4
+
+
+def test_size_aware_model_routing_override_wins():
+    """`model_routing.builder` in payload pins the model regardless of size."""
+    from alfred_coo.dispatch import select_model
+
+    payload = {"model_routing": {"builder": "deepseek-v3.2:cloud"}}
+    pick = select_model("builder", size="S", payload=payload)
+    assert pick.model == "deepseek-v3.2:cloud"
+    assert pick.source == "kickoff_override"
+    # Cap is independent — no override on cap, so size-S default (4) holds.
+    assert pick.iteration_cap == 4
+    assert pick.cap_source == "size-default"
+
+
+def test_size_aware_iteration_cap_by_size_override_wins():
+    """`model_routing.iteration_cap_by_size[<size>]` overrides the cap default."""
+    from alfred_coo.dispatch import select_model
+
+    payload = {"model_routing": {"iteration_cap_by_size": {"S": 2}}}
+    pick = select_model("builder", size="S", payload=payload)
+    assert pick.iteration_cap == 2
+    assert pick.cap_source == "kickoff_override"
+    # Model fell through to size-default since no model override given.
+    assert pick.model == "gpt-oss:120b-cloud"
+    assert pick.source == "size-default"
+
+
+def test_size_aware_iteration_cap_override_lowercase_key():
+    """Override key matching is case-insensitive — 's' and 'S' both work."""
+    from alfred_coo.dispatch import select_model
+
+    payload = {"model_routing": {"iteration_cap_by_size": {"s": 6}}}
+    pick = select_model("builder", size="S", payload=payload)
+    assert pick.iteration_cap == 6
+    assert pick.cap_source == "kickoff_override"
+
+
+def test_size_aware_iteration_cap_override_full_table():
+    """Operator can supply a full iteration_cap_by_size table at once."""
+    from alfred_coo.dispatch import select_model
+
+    cap_table = {"S": 2, "M": 4, "L": 6, "XL": 8}
+    payload = {"model_routing": {"iteration_cap_by_size": cap_table}}
+    expected = [("S", 2), ("M", 4), ("L", 6), ("XL", 8)]
+    for size, cap in expected:
+        pick = select_model("builder", size=size, payload=payload)
+        assert pick.iteration_cap == cap, (size, pick)
+        assert pick.cap_source == "kickoff_override"
+
+
+def test_size_aware_iteration_cap_override_clamped_at_ceiling():
+    """Even a deliberate 999 in the override is clamped at MAX_TOOL_ITERATIONS."""
+    from alfred_coo.dispatch import select_model, MAX_TOOL_ITERATIONS
+
+    payload = {"model_routing": {"iteration_cap_by_size": {"S": 999}}}
+    pick = select_model("builder", size="S", payload=payload)
+    assert pick.iteration_cap == MAX_TOOL_ITERATIONS
+
+
+def test_size_aware_qa_role_uses_default_model_but_honours_cap_override():
+    """Non-builder role: skip the size-aware MODEL table, but still honour
+    the iteration_cap_by_size override and the model_routing override.
+    """
+    from alfred_coo.dispatch import select_model
+
+    # No override → registry-default model, but cap is still picked from the
+    # size table (size-aware caps apply to any role).
+    pick = select_model("qa", size="L", payload={})
+    assert pick.model == "kimi-k2-thinking:cloud"  # the registry-default
+    assert pick.source == "registry-default"
+    assert pick.iteration_cap == 12
+    assert pick.cap_source == "size-default"
+
+    # Explicit QA override wins for model.
+    payload = {"model_routing": {"qa": "gpt-oss:120b-cloud"}}
+    pick2 = select_model("qa", size="L", payload=payload)
+    assert pick2.model == "gpt-oss:120b-cloud"
+    assert pick2.source == "kickoff_override"
+
+
+def test_size_aware_payload_propagation_via_description_envelope():
+    """When payload is a task dict whose `description` is a JSON envelope,
+    `model_routing` inside the envelope is honoured. This matches the legacy
+    `_peek_kickoff_payload` contract — the size-aware path uses the same
+    helper so the envelope works in both APIs.
+    """
+    from alfred_coo.dispatch import select_model
+
+    envelope = json.dumps(
+        {"model_routing": {"builder": "qwen3-coder:480b-cloud"}}
+    )
+    payload = {"description": envelope}
+    pick = select_model("builder", size="S", payload=payload)
+    assert pick.model == "qwen3-coder:480b-cloud"
+    assert pick.source == "kickoff_override"
+
+
+def test_size_aware_payload_propagation_via_html_comment_block():
+    """The `<!-- model_routing: {...} -->` propagation block on a child task
+    body is also honoured — same precedence as the JSON envelope.
+    """
+    from alfred_coo.dispatch import select_model
+
+    body = (
+        "Ticket: SAL-3939\n"
+        '<!-- model_routing: '
+        '{"model_routing": {"iteration_cap_by_size": {"M": 5}}} -->\n'
+        "## Deliverable\nx\n"
+    )
+    payload = {"description": body}
+    pick = select_model("builder", size="M", payload=payload)
+    assert pick.iteration_cap == 5
+    assert pick.cap_source == "kickoff_override"
+
+
+def test_legacy_select_model_still_works_two_arg_form(tmp_path, monkeypatch):
+    """Back-compat: select_model(task, persona) returns a string, not a
+    SizeAwareDispatch. The polymorphic dispatcher must not break the legacy
+    callsites in main.py / orchestrator.py.
+    """
+    from alfred_coo.dispatch import select_model
+    from alfred_coo.autonomous_build import model_registry as mr
+
+    # Registry pin the role so the legacy path returns a deterministic value.
+    p = tmp_path / "registry.yaml"
+    p.write_text(
+        "schema_version: 1\n"
+        "models:\n  qwen3-coder:480b-cloud: {provider: x, capabilities: [], status: active}\n"
+        "  gpt-oss:120b-cloud: {provider: x, capabilities: [], status: active}\n"
+        "roles:\n"
+        "  builder:\n"
+        "    primary: qwen3-coder:480b-cloud\n"
+        "    fallback_chain: []\n"
+        "    last_resort: gpt-oss:120b-cloud\n"
+        "stable_baseline:\n  builder: qwen3-coder:480b-cloud\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODEL_REGISTRY_PATH", str(p))
+    mr._reset_for_tests()
+
+    task = {"title": "[persona:alfred-coo-a] SAL-1 hello"}
+    persona = _MiniPersona("alfred-coo-a")
+    pick = select_model(task, persona)
+    assert isinstance(pick, str)
+    assert pick == "qwen3-coder:480b-cloud"
+    mr._reset_for_tests()
+
+
+def test_log_size_aware_dispatch_emits_canonical_line(caplog):
+    """`log_size_aware_dispatch` emits a single INFO line containing the
+    canonical (size, model, source, iteration_cap, cap_source) tuple. Tests
+    in observability dashboards grep on this shape.
+    """
+    import logging
+    from alfred_coo.dispatch import (
+        log_size_aware_dispatch,
+        SizeAwareDispatch,
+    )
+
+    pick = SizeAwareDispatch(
+        model="gpt-oss:120b-cloud",
+        iteration_cap=4,
+        source="size-default",
+        cap_source="size-default",
+        fallback_model="qwen3-coder:30b-a3b-q4_K_M",
+    )
+    with caplog.at_level(logging.INFO, logger="alfred_coo.dispatch"):
+        log_size_aware_dispatch(ticket="SAL-3939", size="S", pick=pick)
+    # Exactly one matching record.
+    relevant = [r for r in caplog.records if "dispatching SAL-3939" in r.message]
+    assert len(relevant) == 1
+    msg = relevant[0].message
+    assert "size=size-s" in msg
+    assert "model=gpt-oss:120b-cloud" in msg
+    assert "source=size-default" in msg
+    assert "iteration_cap=4" in msg
+    assert "cap_source=size-default" in msg
+
+
+def test_log_size_aware_dispatch_unknown_size_renders_unknown(caplog):
+    """When size is None / unknown, the log line says size=unknown not None."""
+    import logging
+    from alfred_coo.dispatch import (
+        log_size_aware_dispatch,
+        SizeAwareDispatch,
+    )
+
+    pick = SizeAwareDispatch(
+        model="kimi-k2-thinking:cloud",
+        iteration_cap=12,
+        source="registry-default",
+        cap_source="registry-default",
+    )
+    with caplog.at_level(logging.INFO, logger="alfred_coo.dispatch"):
+        log_size_aware_dispatch(ticket="SAL-3939", size=None, pick=pick)
+    relevant = [r for r in caplog.records if "dispatching SAL-3939" in r.message]
+    assert len(relevant) == 1
+    assert "size=unknown" in relevant[0].message

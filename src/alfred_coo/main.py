@@ -32,6 +32,7 @@ from .dispatch import (
     Dispatcher,
     DispatchContext,
     iteration_cap_for_dispatch,
+    log_size_aware_dispatch,
 )
 from .structured import OUTPUT_CONTRACT, parse_envelope
 from .artifacts import write_artifacts
@@ -885,6 +886,29 @@ async def main() -> None:
                         iteration_cap, size_label or "unknown",
                         is_fix_round,
                     )
+                    # SAL-3939: emit the canonical size-aware dispatch log
+                    # line so ops can correlate ticket-size → model →
+                    # iteration_cap in a single grep. The log helper does the
+                    # source resolution; this line is purely observational —
+                    # the actual model + cap above are still computed by
+                    # `select_model` and `_builder_iteration_cap` so existing
+                    # behaviour is unchanged.
+                    try:
+                        from .dispatch import _select_size_aware
+                        _saw = _select_size_aware(
+                            "builder",
+                            size=size_label,
+                            payload=task,
+                        )
+                        log_size_aware_dispatch(
+                            ticket=dispatch_ctx.linear_ticket or "-",
+                            size=size_label,
+                            pick=_saw,
+                        )
+                    except Exception as _e:  # noqa: BLE001 — log helper must not crash dispatch
+                        logger.debug(
+                            "size-aware dispatch log skipped (%s)", _e
+                        )
 
                 try:
                     if tool_specs:
