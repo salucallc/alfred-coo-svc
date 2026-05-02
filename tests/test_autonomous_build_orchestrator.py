@@ -4372,6 +4372,63 @@ async def test_check_cancel_signal_rejects_self_inflicted_duplicate_kickoff(capl
     assert "self-inflicted" in sal_logs[0].lower() or "ignoring" in sal_logs[0].lower()
 
 
+async def test_check_cancel_signal_ignores_orphaned_by_daemon_restart_when_alive(caplog):
+    """SAL-3924 follow-up: a live orchestrator cannot, by definition, be
+    ``orphaned_by_daemon_restart``. The boot-time orphan-recovery path is
+    meant only for stale claims left by a dead daemon. If THIS process is
+    executing the cancel-signal check, it is alive, and any external
+    stamp of ``reason=orphaned_by_daemon_restart`` is a misdiagnosis —
+    almost certainly a racing CI / runner / external script. Ignore the
+    signal and log a WARNING.
+
+    Live evidence 2026-05-02 23:23:56Z: MC v1 GA orchestrator 3b881c31
+    was actively dispatching wave-2 children when an external PATCH
+    from soul-svc's docker network gateway marked the parent task with
+    this reason; the orchestrator dutifully entered drain mode and lost
+    ~90 minutes of work despite the daemon never restarting.
+    """
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    async def _get_task(task_id):
+        return {
+            "id": task_id,
+            "status": "failed",
+            "result": {
+                "reason": "orphaned_by_daemon_restart",
+                "recovered_at": 1714665600.0,
+            },
+        }
+    mesh.get_task = _get_task
+
+    import logging as _logging
+    with caplog.at_level(
+        _logging.WARNING,
+        logger="alfred_coo.autonomous_build.orchestrator",
+    ):
+        observed = await orch._check_cancel_signal()
+
+    assert observed is False, (
+        "live orchestrator must NOT honor stale orphan-recovery signal"
+    )
+    assert orch._cancel_requested is False
+    assert orch._drain_mode is False
+    assert orch._cancel_reason == ""
+
+    # No cancel_requested event recorded.
+    cancel_events = [e for e in orch.state.events if e["kind"] == "cancel_requested"]
+    assert cancel_events == []
+
+    # WARNING emitted so the upstream race stays visible.
+    sal_logs = [
+        r.getMessage() for r in caplog.records
+        if r.levelname == "WARNING" and "orphan-recovery" in r.getMessage().lower()
+    ]
+    assert len(sal_logs) == 1, (
+        f"expected one stale-orphan-recovery WARNING; got: {sal_logs}"
+    )
+
+
 async def test_check_cancel_signal_honors_duplicate_kickoff_for_different_task_id():
     """The self-inflicted filter must only fire when the duplicate-kickoff
     reason names the orchestrator's OWN task id. A duplicate-kickoff message
