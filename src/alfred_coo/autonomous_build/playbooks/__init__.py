@@ -11,6 +11,9 @@ Adding a playbook:
 """
 
 from .base import Playbook, PlaybookResult
+from .container_service_restart_loop_detector import (
+    ContainerServiceRestartLoopDetectorPlaybook,
+)
 from .hydrate_apev import HydrateAPEVHeadingsPlaybook
 from .refresh_dashboard_next_gate import RefreshDashboardNextGatePlaybook
 from .restart_stalled_chains import RestartStalledChainsPlaybook
@@ -20,12 +23,14 @@ DEFAULT_PLAYBOOKS: list[Playbook] = [
     HydrateAPEVHeadingsPlaybook(),
     RefreshDashboardNextGatePlaybook(),
     RestartStalledChainsPlaybook(),
+    ContainerServiceRestartLoopDetectorPlaybook(),
 ]
 
 
 __all__ = [
     "Playbook",
     "PlaybookResult",
+    "ContainerServiceRestartLoopDetectorPlaybook",
     "HydrateAPEVHeadingsPlaybook",
     "RefreshDashboardNextGatePlaybook",
     "RestartStalledChainsPlaybook",
