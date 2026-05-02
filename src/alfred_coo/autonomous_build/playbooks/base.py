@@ -40,6 +40,10 @@ class PlaybookResult:
     dry_run: bool = True
     notable: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Intentional human-needed signals (e.g. retry budget exhausted).
+    # Distinct from ``errors`` so Phase 3b deviation detection doesn't
+    # misclassify a healthy escalation as a playbook regression.
+    escalations: list[str] = field(default_factory=list)
 
     def is_silent(self) -> bool:
         """True iff this playbook had nothing to say this tick.
@@ -52,6 +56,7 @@ class PlaybookResult:
             and self.actions_taken == 0
             and self.actions_skipped == 0
             and not self.errors
+            and not self.escalations
         )
 
     def render_digest_lines(self) -> list[str]:
@@ -68,11 +73,15 @@ class PlaybookResult:
         )
         if self.actions_skipped:
             head += f" skipped={self.actions_skipped}"
+        if self.escalations:
+            head += f" needs_human={len(self.escalations)}"
         if self.errors:
             head += f" errors={len(self.errors)}"
         lines = [head]
         for n in self.notable[:5]:
             lines.append(f"    · {n}")
+        for esc in self.escalations[:3]:
+            lines.append(f"    ⚠ needs human: {esc}")
         for e in self.errors[:3]:
             lines.append(f"    ! {e}")
         return lines

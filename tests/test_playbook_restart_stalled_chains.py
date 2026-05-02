@@ -366,8 +366,11 @@ async def test_execute_dry_run_does_not_mutate(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_execute_escalates_when_budget_exhausted(monkeypatch, tmp_path):
     """After ``DEFAULT_ATTEMPT_BUDGET`` restarts in the window, the
-    playbook STOPS auto-restarting and emits an error so the operator
-    sees that human attention is needed (not an auto-loop)."""
+    playbook STOPS auto-restarting and surfaces the project to the
+    operator. The signal lands in ``result.escalations`` (designed
+    human-needed signal), NOT ``result.errors`` (real failures), so
+    Phase 3b deviation detection won't misclassify a healthy
+    escalation as a playbook regression."""
     pid = "proj-1"
     history_path = str(tmp_path / "history.json")
     now = time.time()
@@ -388,11 +391,13 @@ async def test_execute_escalates_when_budget_exhausted(monkeypatch, tmp_path):
     # No restart attempt this tick.
     assert res.actions_taken == 0
     assert mesh.created == []
-    # Error reports the project + budget exhaustion + needs-human.
+    # Escalation surfaces the project + backlog count + budget exhaustion.
     assert any(
-        "MSSP-Fed" in e and "needs human" in e
-        for e in res.errors
-    ), res.errors
+        "MSSP-Fed" in e and "budget exhausted" in e
+        for e in res.escalations
+    ), res.escalations
+    # Errors stays empty — this is a designed signal, not a real failure.
+    assert res.errors == []
 
 
 @pytest.mark.asyncio
@@ -469,6 +474,42 @@ async def test_execute_handles_per_project_failures_independently(
     # project's failure is recorded.
     assert res.actions_taken == 1
     assert any("bad" in e and "backlog_query_failed" in e for e in res.errors)
+
+
+# ── PlaybookResult escalations rendering ──────────────────────────────────
+
+
+def test_playbook_result_is_silent_treats_escalations_as_signal():
+    """A budget-exhaustion escalation must NOT collapse to ``Substrate
+    quiet`` in the digest. Without this the operator would never see
+    the very signal the escalation was designed to surface."""
+    pr = PlaybookResult(kind="restart_stalled_chains", dry_run=False)
+    assert pr.is_silent() is True
+    pr.escalations.append("MSSP-Fed: budget exhausted")
+    assert pr.is_silent() is False
+
+
+def test_playbook_result_render_digest_separates_escalations_from_errors():
+    """Digest line: head shows ``needs_human=N`` distinctly from
+    ``errors=N`` so the operator (and Phase 3b deviation detection)
+    can tell a designed escalation from a real playbook regression."""
+    pr = PlaybookResult(
+        kind="restart_stalled_chains",
+        candidates_found=0,
+        actions_taken=0,
+        dry_run=False,
+        escalations=["MSSP-Fed: stalled with 7 backlog tickets; budget exhausted"],
+        errors=["mesh_check_failed: ConnectError"],
+    )
+    lines = pr.render_digest_lines()
+    head = lines[0]
+    assert "needs_human=1" in head
+    assert "errors=1" in head
+    # Escalation rendered as a "needs human" line, distinct from the
+    # error tail.
+    body = "\n".join(lines[1:])
+    assert "needs human:" in body
+    assert "MSSP-Fed" in body
 
 
 # ── Default registry ──────────────────────────────────────────────────────

@@ -527,6 +527,7 @@ class AlfredDoctorOrchestrator:
                 "acted": pr.actions_taken,
                 "skipped": pr.actions_skipped,
                 "errors": len(pr.errors),
+                "escalations": len(getattr(pr, "escalations", []) or []),
                 "dry_run": pr.dry_run,
             }
             for pr in playbook_results
@@ -583,6 +584,10 @@ class AlfredDoctorOrchestrator:
         if results:
             summary = ", ".join(
                 f"{pr.kind}=found:{pr.candidates_found}/acted:{pr.actions_taken}"
+                + (
+                    f"/esc:{len(pr.escalations)}"
+                    if getattr(pr, "escalations", None) else ""
+                )
                 + (f"/err:{len(pr.errors)}" if pr.errors else "")
                 for pr in results
             )

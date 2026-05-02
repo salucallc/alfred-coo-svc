@@ -384,13 +384,15 @@ class RestartStalledChainsPlaybook(Playbook):
             history, pid, now=now, window_sec=self.attempt_window_sec,
         )
         if len(recent) >= self.attempt_budget:
-            # Escalate, don't auto-loop.
+            # Escalate, don't auto-loop. ``escalations`` (not ``errors``) so
+            # Phase 3b deviation detection treats this as the designed signal
+            # it is, not as a playbook regression.
             window_min = self.attempt_window_sec // 60
-            result.errors.append(
-                f"{name}: stalled with {backlog} backlog ticket"
-                + ("s" if backlog != 1 else "")
-                + f"; restart budget exhausted "
-                f"({len(recent)} attempts in last {window_min}min) — needs human"
+            ticket_word = "ticket" if backlog == 1 else "tickets"
+            result.escalations.append(
+                f"{name}: stalled with {backlog} backlog {ticket_word}; "
+                f"restart budget exhausted "
+                f"({len(recent)} attempts in last {window_min}min)"
             )
             return
 
