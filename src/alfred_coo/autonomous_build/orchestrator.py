@@ -10969,6 +10969,42 @@ class AutonomousBuildOrchestrator:
                 # Caller treats False return as "no cancel observed."
                 return False
 
+            # SAL-3924 follow-up (2026-05-02): a live orchestrator cannot,
+            # by definition, be ``orphaned_by_daemon_restart``. The
+            # boot-time orphan-recovery path in ``orphan_recovery.py``
+            # is meant ONLY for stale claims left by a previous daemon's
+            # crash; if THIS orchestrator process is executing the cancel
+            # check loop, the daemon is alive and the orchestrator is not
+            # orphaned. An external PATCH stamping that reason on a live
+            # task is either (a) a misconfigured external script, (b) a
+            # racing duplicate orphan-recovery from a parallel CI / runner
+            # process, or (c) a soul-svc bug. None of those should
+            # silently kill an actively-progressing orchestrator.
+            #
+            # Live evidence 2026-05-02 23:23:56Z: MC v1 GA orchestrator
+            # 3b881c31 was actively dispatching wave-2 children (Hawkman
+            # cycles #2, #3 at 23:09Z and 23:12Z) when an external PATCH
+            # from soul-svc's docker network gateway (172.22.0.1) marked
+            # the parent task ``status=failed reason=orphaned_by_daemon_restart``
+            # at 23:23:48. The orchestrator dutifully entered drain mode
+            # and lost ~90 minutes of in-flight work despite the daemon
+            # never having restarted (PID 1085816 alive 22:33-23:24).
+            #
+            # Ignore the signal, log a WARNING so the upstream race
+            # remains visible. Real cancels (operator clicks "cancel"
+            # in cockpit, or a test sets cancel_flag=True) use a
+            # different reason and are still honored.
+            if reason.startswith("orphaned_by_daemon_restart"):
+                logger.warning(
+                    "[cancel] ignoring stale orphan-recovery signal for "
+                    "live kickoff %s (reason=%s); this process is alive "
+                    "and processing — orphan-recovery should only fire "
+                    "at boot for tasks left by a dead daemon. SAL-3924 "
+                    "follow-up.",
+                    self.task_id, reason,
+                )
+                return False
+
             self._cancel_requested = True
             self._cancel_reason = reason
             self._drain_mode = True
