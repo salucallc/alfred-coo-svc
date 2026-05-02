@@ -672,3 +672,60 @@ def test_alfred_coo_a_prompt_contains_all_ab17s_markers():
         assert marker in prompt, (
             f"alfred-coo-a missing AB-17-s marker {marker!r}"
         )
+
+
+# ── Substrate task #89 + #90 (2026-05-02): builder cognition for generated
+# files + PR-title literal SAL-XXXX requirement ───────────────────────────
+
+
+def test_alfred_coo_a_prompt_has_generated_file_guardrail():
+    """Substrate task #89: prompt must instruct builder NOT to bail when
+    ## Target lists generated artifacts (lockfiles, dist/, build/). Canonical
+    evidence 2026-05-02 04:00–05:55Z: SAL-3896 took 4 attempts to ship a
+    one-line package.json bump because each attempt got tangled in
+    package-lock.json regen and bailed (silent_with_tools / MAX_TOOL_ITERATIONS).
+    Fix path (a): omit lockfile from files dict + annotate PR body with
+    `## Scope narrowing` saying lockfile regen is delegated to CI."""
+    prompt = _alfred_prompt()
+    mandated = [
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "dist/",
+        "## Scope narrowing",
+        "delegated to CI",
+    ]
+    for marker in mandated:
+        assert marker in prompt, (
+            f"alfred-coo-a missing generated-file guardrail marker {marker!r}"
+        )
+
+
+def test_alfred_coo_a_prompt_requires_sal_xxxx_in_pr_title():
+    """Substrate task #90: prompt must instruct builder that propose_pr title
+    MUST contain literal SAL-XXXX. Canonical evidence 2026-05-02 06:33Z:
+    PR #27 alfred-portal (SAL-3897 FleetTopologyGraph) shipped autonomously
+    with title "feat: add FleetTopologyGraph component and types" — no
+    SAL-3897 literal. The orchestrator's GitHub merge-detection search
+    `is:pr is:merged in:title,body SAL-3897` returned 0 hits, daemon
+    re-dispatched on every wave-retry, produced duplicate PR #28.
+
+    Required: title contains the ticket identifier as exact substring,
+    so GitHub's search API matches it."""
+    prompt = _alfred_prompt()
+    mandated = [
+        "SAL-3897",  # the canonical-case ticket id
+        "is:merged",
+        "in:title,body",
+        # Recommended title formats — at least one of these phrases should
+        # appear so the prompt teaches the convention by example
+    ]
+    for marker in mandated:
+        assert marker in prompt, (
+            f"alfred-coo-a missing PR-title-literal marker {marker!r}"
+        )
+    # Either of these phrasings counts (we don't pin the exact wording).
+    assert ("`title` argument" in prompt or "PR title" in prompt or
+            "title arg" in prompt), (
+        "prompt must reference the propose_pr title argument explicitly"
+    )
