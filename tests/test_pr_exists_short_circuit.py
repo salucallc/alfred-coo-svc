@@ -26,6 +26,7 @@ from alfred_coo.autonomous_build.orchestrator import (
     AutonomousBuildOrchestrator,
     HAWKMAN_LOGIN,
     PR_EXISTS_FRESH_PR_WINDOW_SEC,
+    _OpenPrCheck,
 )
 
 
@@ -119,8 +120,8 @@ def _iso_minus_seconds(seconds: float) -> str:
 # ── Helper unit tests ──────────────────────────────────────────────────────
 
 
-async def test_open_pr_no_review_returns_pr_number():
-    """Open PR + zero reviews + recent → returns the PR number."""
+async def test_open_pr_no_review_returns_awaiting_review():
+    """Open PR + zero reviews + recent → awaiting_review check."""
     orch = _mk_orchestrator()
 
     async def stub(ident):
@@ -131,33 +132,48 @@ async def test_open_pr_no_review_returns_pr_number():
         }
 
     orch._gh_pr_open_search_fn = stub
-    pr = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    assert pr == 214
+    check = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    assert isinstance(check, _OpenPrCheck)
+    assert check.pr_number == 214
+    assert check.state == "awaiting_review"
 
 
-async def test_open_pr_hawkman_approved_returns_none():
-    """Hawkman APPROVED → None (proceed; merge bot is next, not a builder)."""
+async def test_open_pr_hawkman_approved_returns_approved_check():
+    """Hawkman APPROVED → approved check (caller fires _merge_pr).
+
+    Substrate task #82 (2026-05-02): previously this path returned None
+    and the dispatch loop fell through to a duplicate builder. Now the
+    helper signals the merge-ready state explicitly so the dispatch
+    site can short-circuit into ``_merge_pr``.
+    """
     orch = _mk_orchestrator()
 
     async def stub(ident):
         return {
             "number": 214,
             "created_at": _iso_minus_seconds(60),
+            "html_url": "https://github.com/salucallc/alfred-coo-svc/pull/214",
             "reviews": [
                 {"user": {"login": HAWKMAN_LOGIN}, "state": "APPROVED"},
             ],
         }
 
     orch._gh_pr_open_search_fn = stub
-    pr = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    assert pr is None
+    check = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    assert isinstance(check, _OpenPrCheck)
+    assert check.pr_number == 214
+    assert check.state == "approved"
+    assert check.pr_url == (
+        "https://github.com/salucallc/alfred-coo-svc/pull/214"
+    )
 
 
-async def test_open_pr_hawkman_request_changes_short_circuits():
-    """Hawkman REQUEST_CHANGES (not APPROVED) → still skip dispatch.
+async def test_open_pr_hawkman_request_changes_awaiting_review():
+    """Hawkman REQUEST_CHANGES (not APPROVED) → awaiting_review.
 
     The respawn path is what should fire next, not a fresh dispatch
-    against an already-flagged PR.
+    against an already-flagged PR — same skip semantics as the no-review
+    case, just driven by the review verdict path instead.
     """
     orch = _mk_orchestrator()
 
@@ -174,8 +190,10 @@ async def test_open_pr_hawkman_request_changes_short_circuits():
         }
 
     orch._gh_pr_open_search_fn = stub
-    pr = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    assert pr == 214
+    check = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    assert isinstance(check, _OpenPrCheck)
+    assert check.pr_number == 214
+    assert check.state == "awaiting_review"
 
 
 async def test_open_pr_too_old_returns_none():
@@ -193,8 +211,8 @@ async def test_open_pr_too_old_returns_none():
         }
 
     orch._gh_pr_open_search_fn = stub
-    pr = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    assert pr is None
+    check = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    assert check is None
 
 
 async def test_no_pr_match_returns_none():
@@ -205,8 +223,8 @@ async def test_no_pr_match_returns_none():
         return None
 
     orch._gh_pr_open_search_fn = stub
-    pr = await orch._ticket_has_open_pr_awaiting_review("SAL-9999")
-    assert pr is None
+    check = await orch._ticket_has_open_pr_awaiting_review("SAL-9999")
+    assert check is None
 
 
 async def test_cache_avoids_double_call(monkeypatch):
@@ -223,9 +241,12 @@ async def test_cache_avoids_double_call(monkeypatch):
         }
 
     orch._gh_pr_open_search_fn = stub
-    pr1 = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    pr2 = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    assert pr1 == pr2 == 214
+    c1 = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    c2 = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    assert c1 == c2
+    assert isinstance(c1, _OpenPrCheck)
+    assert c1.pr_number == 214
+    assert c1.state == "awaiting_review"
     assert call_count["n"] == 1, "second call should be served from cache"
 
 
@@ -237,8 +258,8 @@ async def test_stub_exception_treated_as_no_pr():
         raise RuntimeError("simulated GitHub outage")
 
     orch._gh_pr_open_search_fn = stub
-    pr = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    assert pr is None
+    check = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    assert check is None
 
 
 async def test_unparseable_created_at_returns_none():
@@ -253,8 +274,8 @@ async def test_unparseable_created_at_returns_none():
         }
 
     orch._gh_pr_open_search_fn = stub
-    pr = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
-    assert pr is None
+    check = await orch._ticket_has_open_pr_awaiting_review("SAL-3038")
+    assert check is None
 
 
 # ── Dispatch-loop integration ──────────────────────────────────────────────
@@ -283,15 +304,15 @@ async def test_dispatch_loop_skips_when_open_pr_awaiting_review():
 
     # Simulate the inner dispatch decision: replicate the wave-loop
     # branch around ``_dispatch_child`` exactly.
-    existing_pr = await orch._ticket_has_open_pr_awaiting_review(
+    existing_pr_check = await orch._ticket_has_open_pr_awaiting_review(
         ticket.identifier,
     )
-    if existing_pr is not None:
+    if existing_pr_check is not None:
         orch._pr_exists_skips += 1
         orch.state.record_event(
             "pr_exists_skip",
             identifier=ticket.identifier,
-            pr_number=existing_pr,
+            pr_number=existing_pr_check.pr_number,
             skips_total=orch._pr_exists_skips,
         )
     else:
@@ -320,14 +341,107 @@ async def test_dispatch_loop_proceeds_when_no_open_pr():
 
     orch._gh_pr_open_search_fn = stub
 
-    existing_pr = await orch._ticket_has_open_pr_awaiting_review(
+    existing_pr_check = await orch._ticket_has_open_pr_awaiting_review(
         ticket.identifier,
     )
-    if existing_pr is None:
+    if existing_pr_check is None:
         await orch._dispatch_child(ticket)
 
     assert len(mesh.created) == 1
     assert orch._pr_exists_skips == 0
+
+
+async def test_dispatch_loop_fires_merge_when_open_pr_already_approved():
+    """Substrate task #82 (2026-05-02): an inherited open PR that is
+    already Hawkman-APPROVED must trigger ``_merge_pr`` directly instead
+    of falling through to a duplicate builder dispatch.
+
+    Replicates the ``existing_pr_check.state == "approved"`` branch in
+    ``_dispatch_wave``. Mocks ``_merge_pr`` + ``_update_linear_state`` so
+    the test doesn't reach the real GitHub merge tool. Verifies:
+      - No builder mesh task created.
+      - ``_merge_pr`` invoked with the ticket whose ``pr_url`` was
+        populated from the helper's lookup.
+      - ``pr_exists_approved_merge`` state event recorded.
+      - Ticket transitions to MERGED_GREEN on a successful merge.
+    """
+    from alfred_coo.autonomous_build.graph import TicketStatus
+
+    mesh = _FakeMesh()
+    orch = _mk_orchestrator(mesh=mesh)
+
+    ticket = _t("uc", "SAL-3038", "OPS-14D", 1, "ops")
+    ticket.status = TicketStatus.PENDING
+    _seed_graph(orch, [ticket])
+
+    pr_html_url = "https://github.com/salucallc/alfred-coo-svc/pull/214"
+
+    async def stub(ident):
+        return {
+            "number": 214,
+            "created_at": _iso_minus_seconds(60),
+            "html_url": pr_html_url,
+            "reviews": [
+                {"user": {"login": HAWKMAN_LOGIN}, "state": "APPROVED"},
+            ],
+        }
+
+    orch._gh_pr_open_search_fn = stub
+
+    merge_calls: list[str] = []
+
+    async def fake_merge(t):
+        merge_calls.append(t.identifier)
+        # Simulate a successful merge by stamping merged_pr_urls so any
+        # idempotency checks downstream see the SHA.
+        orch.state.merged_pr_urls[t.id] = "fakedeadbeef"
+        return True
+
+    linear_calls: list[tuple[str, str]] = []
+
+    async def fake_linear(t, target):
+        linear_calls.append((t.identifier, target))
+
+    orch._merge_pr = fake_merge  # type: ignore[assignment]
+    orch._update_linear_state = fake_linear  # type: ignore[assignment]
+
+    # Replicate the dispatch-loop approved-PR branch from _dispatch_wave.
+    existing_pr_check = await orch._ticket_has_open_pr_awaiting_review(
+        ticket.identifier,
+    )
+    assert existing_pr_check is not None
+    assert existing_pr_check.state == "approved"
+
+    orch._pr_exists_skips += 1
+    if not ticket.pr_url and existing_pr_check.pr_url:
+        ticket.pr_url = existing_pr_check.pr_url
+    orch.state.record_event(
+        "pr_exists_approved_merge",
+        identifier=ticket.identifier,
+        pr_number=existing_pr_check.pr_number,
+        pr_url=ticket.pr_url,
+        skips_total=orch._pr_exists_skips,
+    )
+    ticket.status = TicketStatus.MERGE_REQUESTED
+    merged = await orch._merge_pr(ticket)
+    if merged:
+        ticket.status = TicketStatus.MERGED_GREEN
+        await orch._update_linear_state(ticket, "Done")
+
+    assert mesh.created == [], (
+        "must not dispatch a builder when PR is already approved"
+    )
+    assert merge_calls == ["SAL-3038"]
+    assert ticket.pr_url == pr_html_url
+    assert ticket.status == TicketStatus.MERGED_GREEN
+    assert linear_calls == [("SAL-3038", "Done")]
+    approve_events = [
+        e for e in orch.state.events
+        if e.get("kind") == "pr_exists_approved_merge"
+    ]
+    assert len(approve_events) == 1
+    assert approve_events[0]["pr_number"] == 214
+    assert approve_events[0]["pr_url"] == pr_html_url
 
 
 # ── pytest async config ────────────────────────────────────────────────────
