@@ -198,15 +198,128 @@ Reference values measured on the bench:
 A >12 dB delta between the silent and speaking RMS values proves the audio
 path is alive and channel-0 selection is correct.
 
+Note: as of SAL-4001 the per-500ms `[audio ...]` line is no longer printed
+(the standalone audio task was replaced by the encoder task which embeds
+the same DMA pull). The `[heartbeat ...]` and `[opus ...]` lines below
+carry the same information plus the codec stats.
+
+## Opus voice encode (SAL-4001)
+
+The encoder pipeline turns audio_io's 48 kHz / 32-bit / stereo blocks into
+16 kHz / mono / 20 ms Opus voice frames at ~24 kbps VBR. Per PLAN.md
+decision 11 this is the locked codec spec for the uplink (mic to gateway)
+voice path. Music downlink stays at native 48 kHz stereo and gets a
+separate codec instance once SAL-4014 lands.
+
+### Pipeline per 20 ms block
+
+1. `audio_io_read_block` pulls 960 stereo frames (7680 bytes int32 stereo).
+2. Channel 0 (left, AEC-clean) is selected and run through an 11-tap
+   Hamming-windowed FIR low-pass (fc ~7 kHz at 48 kHz). FIR state carries
+   between calls so the filter is continuous.
+3. Decimate by 3, scale int32 to int16 with saturating cast. Result is
+   320 int16 samples (20 ms at 16 kHz mono).
+4. `opus_encode` with `OPUS_APPLICATION_VOIP`, `OPUS_SET_BITRATE(24000)`,
+   `OPUS_SET_VBR(1)`, `OPUS_SET_COMPLEXITY(3)`,
+   `OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE)`,
+   `OPUS_SET_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND)`, `OPUS_SET_DTX(1)`,
+   `OPUS_SET_INBAND_FEC(1)`, `OPUS_SET_PACKET_LOSS_PERC(5)`.
+   Complexity is held at 3 to keep the warm-up encode call under the
+   10 ms budget on the XIAO ESP32-S3 at 240 MHz with FIXED_POINT;
+   complexity 5 measured 12.4 ms on the warm-up frame which is
+   technically still under the 20 ms hard ceiling but exceeds the
+   acceptance budget. Quality difference at 24 kbps voice is
+   imperceptible per upstream Opus docs.
+5. Resulting payload (~30..100 bytes typical, up to 200 reserved) is
+   packed into an `EncodedFrame{seq, timestamp_ms, length, data[200]}`
+   and pushed into a 100-deep FreeRTOS queue. On overflow the oldest
+   frame is dropped (drop-oldest is the right policy for live voice).
+
+### Library choice and licensing note
+
+We pull the codec via `lib_deps = sh123/esp32_opus@^1.0.3` in
+`platformio.ini`. The wrapper LICENSE file says GPL-3 but every source
+file under its `src/` carries the upstream xiph BSD-3 header (verified by
+inspection of `opus.c`, `silk_encoder.c`, `celt_encoder.c`, etc). The
+wrapper just defines `FIXED_POINT` and `OPUS_BUILD` and packages the
+sources as an Arduino library. If a future licensing review demands
+fully owning the source tree, vendor `opus-1.4` under `lib/opus/src/`
+and drop the `lib_deps` entry; the application code does not change.
+
+The float build of Opus is explicitly NOT what we want on this target
+(per the SAL-4001 brief). `FIXED_POINT` is set in the wrapper's
+`config.h` and is the build flavor we're using.
+
+### Task topology
+
+| Task | Core | Priority | Stack | Job |
+|------|------|----------|-------|-----|
+| loopTask (Arduino) | 0 | 1 | 8 KB | heartbeat every 5 s |
+| voice_enc | 1 | 5 | 16 KB | I2S DMA pull + downsample + opus_encode + queue push |
+| voice_drain | 0 | 4 | 4 KB | queue pop + per-second log line; SAL-4006 will swap this for the WS sender |
+
+Why the encoder task does both reading and encoding in one loop: keeping
+the I2S read and the Opus encode on the same task and same core lets
+audio_io's DMA back-pressure us directly when the encoder falls behind
+(i2s_read times out -> audio underruns are visible). Splitting them
+across tasks would just hide the back-pressure in another queue.
+
+### Reading the Opus log
+
+Expect one `[opus ...]` line per second from the drain task plus the
+existing `[heartbeat ...]` every 5 s with the codec stats appended:
+
+```
+[opus seq=49 fps=50.0 avg=58.4 min=42 max=74 bps=23360 qd=0/100 tot_frames=50 tot_bytes=2920 enc_us_max=4870 enc_overruns=0 enc_errors=0]
+[heartbeat seq=1 uptime=5s heap=270440 psram=8385536 audio_frames=240000 under=0 opus_frames=250 opus_bytes=14600 max_enc_us=4870 over=0]
+```
+
+Field meaning:
+* `seq` — sequence of the most recent frame popped from the queue.
+* `fps` — frames/sec over the 1 s window. Should be ~50 in steady state.
+* `avg`, `min`, `max` — bytes per frame across the window.
+* `bps` — bits/sec over the wire (avg * fps * 8). Target ~24000 for
+  speech, lower for silence (DTX), higher for transients.
+* `qd=N/M` — outbound queue depth N out of capacity M. Should stay
+  near 0 in normal operation; non-zero means the consumer (currently the
+  drain task, eventually the WS sender) is falling behind.
+* `enc_us_max` — slowest encode call since boot, in microseconds.
+  Hard ceiling is 20000 (20 ms wallclock budget per frame).
+* `enc_overruns` — count of encode calls that exceeded the 20 ms
+  budget. MUST stay at 0; if non-zero we will starve I2S.
+* `enc_errors` — count of `opus_encode` negative returns.
+
+Reference values measured on the bench (SAL-4001 acceptance log
+`Z:/_planning/respeaker-xvf3800-alfred/p1_3_opus_encode.log`, COM5,
+complexity 3):
+
+| Acoustic state | avg bytes/frame | bps |
+|----------------|-----------------|-----|
+| Silence (DTX 1-byte frames mixed with ambient) | min=1, avg 30..40 | ~12000..16000 |
+| Ambient room noise / mic self-noise | avg 40..50 | ~16000..20000 |
+| Speech / tone burst | avg 50..70 | ~20000..28000 |
+
+`enc_us_max` on the XIAO ESP32-S3 at 240 MHz with complexity 3 is
+typically 3..5 ms per 20 ms frame in steady state; the very first
+encode call after `voice_codec_init()` is the warmup outlier and
+measured 8.6 ms in the acceptance run. Both are comfortably under the
+10 ms acceptance budget and the 20 ms hard ceiling.
+
+Acceptance run also showed: free heap 297624 B / 320 KB internal,
+free PSRAM 8326071 B / 8 MB Octal, both stable over 60+ s with
+zero `audio_io.underruns`, `enc_overruns`, or `enc_errors`.
+
 ## Future hooks
 
-When SAL-4001 (Opus encode) lands, vendor libopus under `lib/opus/` and add
-`lib_deps = file://lib/opus` to the `[env:arduino]` block. Tap into
-`audio_io_read_block()` directly; the 20 ms block size already matches
-Opus framing.
-
-When SAL-4003 (WebSocket transport) lands, add `lib_deps = WebSockets` and
-keep TLS roots in `data/` so they ship in the SPIFFS partition.
+When SAL-4003 / SAL-4006 (WebSocket transport + end-to-end voice-in)
+lands, the drain task body is replaced with a WS sender: pop
+`EncodedFrame` from the same outbound queue, ship `frame.data[0..length]`
+as a binary WebSocket frame to `wss://gateway/v1/fleet/voice`. The
+queue's drop-oldest semantics already handle Wi-Fi back-pressure
+gracefully (latest audio wins).
 
 When SAL-4014 (I2S TX to codec) lands, extend `audio_io` with a TX path
-on GPIO44 sharing the same BCK/WS pins (full duplex on I2S0).
+on GPIO44 sharing the same BCK/WS pins (full duplex on I2S0). The Opus
+decoder for the downlink path lives in a sibling component
+(`lib/voice_codec/decode_*` or a new `lib/music_codec/` for the 48 kHz
+music path).
