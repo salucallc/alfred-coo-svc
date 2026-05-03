@@ -305,6 +305,53 @@ MERGED_PR_CACHE_TTL_SEC = 5 * 60
 # Default Slack channel for the cadence poster if the payload omits it.
 DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 
+# SAL-4120 (substrate doctor signal, 2026-05-03) — cross-project drift detection
+# in wave-cohort assembly. When a ticket's `## Target` block is re-authored to
+# point at a repo outside the orchestrator's expected scope (operator workflow:
+# edit Target, forget to also move Linear project membership), the orchestrator
+# would pull the ticket as wave-cohort, fail to dispatch (target mismatch), and
+# grace-coerce to FAILED every 15 min cycle indefinitely. Live evidence twice
+# on 2026-05-03: wave-2 cluster (SAL-3116/3117/3118/3135/2740, 07:30Z) and
+# wave-3 cluster (SAL-3121/3124/.../2743, 08:31Z), both resolved by manual
+# Linear project move. The fix below SKIPs out-of-scope tickets at cohort
+# assembly so they never enter the deadlock-grace count, and posts a
+# Slack #batcave Tier-2 alert when N skips in one cycle exceed
+# `TARGET_REPO_DRIFT_ALERT_THRESHOLD` (default 3) so the operator can do the
+# project move with intent rather than discovering it via failed wave gate.
+#
+# Mapping is `linear_project_id` → frozenset of `owner/repo` strings the
+# orchestrator's wave-0..N tickets are expected to target. To extend: add a
+# new entry below. Project IDs are stable Linear UUIDs (see Linear API
+# `projects { nodes { id, name } }`).
+ORCHESTRATOR_REPO_SCOPE: Dict[str, frozenset[str]] = {
+    # Mission Control v1.0 GA — Tiresias + Aletheia + Fleet + Ops + Soul-gap
+    "8c1d8f69-359d-457a-a11c-2e650863774c": frozenset({
+        "salucallc/alfred-coo-svc",
+    }),
+    # Cockpit Consumer UX
+    "5a014234-df36-47a0-9abb-eac093e27539": frozenset({
+        "salucallc/alfred-coo-svc",
+    }),
+    # MSSP Extraction
+    "39e340a8-26d2-4439-8582-caf94a263c7e": frozenset({
+        "salucallc/alfred-coo-svc",
+    }),
+    # MSSP Federation
+    "a9d93b23-96b4-4a77-be18-b709f72fa3ce": frozenset({
+        "salucallc/alfred-coo-svc",
+    }),
+    # Agent Ingest — Plugin surface
+    "9db00c4f-17a4-4b7a-8cd8-ea62f45d55b8": frozenset({
+        "salucallc/alfred-coo-svc",
+    }),
+}
+# Slack `#batcave` Tier-2 alert threshold — emit one alert per dispatch cycle
+# when the orchestrator skips this many or more out-of-scope tickets, so the
+# operator gets a high-signal nudge to do the manual Linear project move.
+# Override via env `TARGET_REPO_DRIFT_ALERT_THRESHOLD`. Default = 3 to match
+# the observed cluster size (wave-2 had 5; wave-3 had 12 — both >> 3).
+DEFAULT_TARGET_REPO_DRIFT_ALERT_THRESHOLD = 3
+
 # AB-08: hard cap on REQUEST_CHANGES → respawn cycles. Tickets that blow the
 # cap are marked FAILED; the wave gate's existing critical-path + soft-green
 # logic handles the rest.
@@ -4302,12 +4349,161 @@ class AutonomousBuildOrchestrator:
 
     # ── dispatch ────────────────────────────────────────────────────────────
 
+    def _filter_out_of_scope_tickets(
+        self,
+        wave_tickets: List[Ticket],
+        wave_n: int,
+    ) -> Tuple[List[Ticket], List[Tuple[Ticket, str]]]:
+        """SAL-4120 — drop wave-cohort tickets whose ``## Target`` block points
+        at a repo outside this orchestrator's configured project scope.
+
+        Returns a 2-tuple ``(in_scope, skipped)`` where ``skipped`` is a list
+        of ``(ticket, "owner/repo")`` pairs. Each skip emits a structured
+        ``target-repo-skip`` log line plus a ``ticket_target_repo_skip``
+        state event so the deadlock-grace counter never sees the ticket and
+        no FAIL coercion fires on it.
+
+        Behaviour:
+
+        * Looks up ``self.linear_project_id`` in
+          :data:`ORCHESTRATOR_REPO_SCOPE`. If absent (the orchestrator's
+          project is not yet registered in the scope map), returns the input
+          unchanged — preserves legacy behaviour for un-registered projects.
+        * Parses each ticket body via the existing
+          :func:`_parse_target_from_ticket_body` helper. Tickets whose body
+          has no ``## Target`` block (parser returns None), or whose Target
+          block omits ``owner``/``repo``, are NOT skipped — the legacy
+          dispatch path resolves them via ``_TARGET_HINTS`` registry.
+        * Only when the parsed target produces a concrete
+          ``owner/repo`` string AND that string is not in the orchestrator's
+          scope set does the ticket get skipped.
+        """
+        scope = ORCHESTRATOR_REPO_SCOPE.get(self.linear_project_id)
+        if not scope:
+            # Project not registered — preserve legacy behaviour. The audit
+            # script (`tools/audit_target_repo_project_drift.py`) catches
+            # this offline.
+            return list(wave_tickets), []
+
+        in_scope: List[Ticket] = []
+        skipped: List[Tuple[Ticket, str]] = []
+        scope_str = ",".join(sorted(scope))
+
+        for ticket in wave_tickets:
+            body = getattr(ticket, "body", "") or ""
+            try:
+                parsed = _parse_target_from_ticket_body(body)
+            except Exception:
+                # Defensive: parser exceptions never break dispatch
+                # (mirrors `_resolve_via_body`).
+                logger.exception(
+                    "[target-repo-filter] _parse_target_from_ticket_body "
+                    "crashed for %s; treating as in-scope",
+                    ticket.identifier,
+                )
+                in_scope.append(ticket)
+                continue
+            if not parsed:
+                in_scope.append(ticket)
+                continue
+            owner = (parsed.get("owner") or "").strip()
+            repo = (parsed.get("repo") or "").strip()
+            if not owner or not repo:
+                in_scope.append(ticket)
+                continue
+            target_repo = f"{owner}/{repo}"
+            if target_repo in scope:
+                in_scope.append(ticket)
+                continue
+            # Out-of-scope — SKIP and emit structured log + state event.
+            logger.warning(
+                "target-repo-skip ticket=%s target_repo=%s "
+                "orchestrator_scope=%s wave=%d project=%s",
+                ticket.identifier, target_repo, scope_str, wave_n,
+                self.linear_project_id,
+            )
+            try:
+                self.state.record_event(
+                    "ticket_target_repo_skip",
+                    identifier=ticket.identifier,
+                    target_repo=target_repo,
+                    orchestrator_scope=sorted(scope),
+                    wave=wave_n,
+                    project_id=self.linear_project_id,
+                )
+            except Exception:
+                # Never let state-event failure silently re-include the ticket.
+                logger.exception(
+                    "[target-repo-filter] state.record_event failed for %s; "
+                    "ticket still skipped",
+                    ticket.identifier,
+                )
+            skipped.append((ticket, target_repo))
+        return in_scope, skipped
+
+    async def _maybe_post_target_repo_drift_alert(
+        self,
+        skipped: List[Tuple[Ticket, str]],
+        wave_n: int,
+    ) -> None:
+        """SAL-4120 — post a Slack ``#batcave`` Tier-2 alert when this cycle's
+        skip count meets ``TARGET_REPO_DRIFT_ALERT_THRESHOLD``. Best-effort:
+        a Slack post failure never breaks dispatch.
+        """
+        try:
+            threshold = int(
+                os.environ.get(
+                    "TARGET_REPO_DRIFT_ALERT_THRESHOLD",
+                    DEFAULT_TARGET_REPO_DRIFT_ALERT_THRESHOLD,
+                )
+            )
+        except (TypeError, ValueError):
+            threshold = DEFAULT_TARGET_REPO_DRIFT_ALERT_THRESHOLD
+        if len(skipped) < max(1, threshold):
+            return
+        ids = ", ".join(t.identifier for t, _ in skipped[:20])
+        suffix = "" if len(skipped) <= 20 else f" (+{len(skipped) - 20} more)"
+        message = (
+            ":rotating_light: [target-repo drift] orchestrator skipped "
+            f"{len(skipped)} out-of-scope tickets in wave {wave_n} "
+            f"(project={self.linear_project_id}). "
+            "Operator: re-author Target → also move project membership. "
+            f"Skipped: {ids}{suffix}"
+        )
+        try:
+            await self.cadence.post(message)
+        except Exception:
+            logger.exception(
+                "[target-repo-filter] Slack drift alert post failed; "
+                "skips already logged"
+            )
+
     async def _dispatch_wave(self, wave_n: int) -> None:
         """Dispatch + poll tickets in `wave_n` until every one of them is in
         a terminal state. Inner loop = one 45s tick."""
         wave_tickets = self.graph.tickets_in_wave(wave_n)
         if not wave_tickets:
             logger.info("wave %d has no tickets; skipping", wave_n)
+            return
+
+        # SAL-4120 (2026-05-03) — cross-project drift filter. Drop any ticket
+        # whose `## Target` block points at a repo NOT in this orchestrator's
+        # configured scope BEFORE the deadlock-grace counter sees them.
+        # Without this, the wave-2 cluster (07:30Z) and wave-3 cluster
+        # (08:31Z) failure mode repeats: ticket project_id is still MC v1
+        # GA but body retargets to alfred-portal, dispatcher refuses, grace
+        # coerces to FAILED every cycle. See ORCHESTRATOR_REPO_SCOPE.
+        wave_tickets, skipped = self._filter_out_of_scope_tickets(
+            wave_tickets, wave_n,
+        )
+        if skipped:
+            await self._maybe_post_target_repo_drift_alert(skipped, wave_n)
+        if not wave_tickets:
+            logger.info(
+                "wave %d has no in-scope tickets after target-repo filter "
+                "(skipped=%d); skipping",
+                wave_n, len(skipped),
+            )
             return
 
         # AB-17-d · Plan I §1.4 + §2.3 — skip dispatch for tickets whose
