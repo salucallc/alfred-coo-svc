@@ -74,8 +74,13 @@ _SIZE_LINE_RE = re.compile(
 # AB-17-m: label-style size tag (`size-S`, `size-l`, etc.) as a fallback if the
 # `Size:` line is absent — the orchestrator labels Linear issues with these
 # and they sometimes surface in the mesh task title.
+# SAL-4101 (2026-05-03): accept `size:M` (colon) too. SAL-2740 was authored
+# with the colon form by a planner sub; the strict dash-only regex rejected it
+# and the ticket was eligibility-gated out of dispatch indefinitely. Tolerating
+# both separators removes the silent-filter trap. The orchestrator continues to
+# emit only the dash form on its own writes; this is read-side leniency.
 _SIZE_LABEL_RE = re.compile(
-    r"\bsize-(xs|s|m|l|xl)\b",
+    r"\bsize[-:](xs|s|m|l|xl)\b",
     re.IGNORECASE,
 )
 
