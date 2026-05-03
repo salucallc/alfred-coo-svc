@@ -358,3 +358,169 @@ def test_module_constant_uses_resolver(monkeypatch):
         # Reset to default for downstream tests.
         monkeypatch.delenv("EXISTING_PR_SKIP_WINDOW_DAYS", raising=False)
         importlib.reload(orch_mod)
+
+
+# ── End-to-end behavioral test: drive _dispatch_wave through the patched
+# ── dispatch site and assert the production code (not the test) emits the
+# ── log line + records the event + skips _dispatch_child. ─────────────────
+#
+# This pins the actual dispatch-site insert at orchestrator.py L4810 (post-
+# rebase line numbering): if a future refactor accidentally drops the
+# `logger.info("existing-pr-skip ...")` call or the `state.record_event(
+# "existing_pr_skip", ...)` call from `_dispatch_wave`, this test fails —
+# whereas the two earlier tautological tests would still pass because they
+# emit the log line / event from the test body itself, not from production.
+#
+# Reviewer NEEDS_FIX call (PR #379, 2026-05-03): "Add one async test that
+# drives _dispatch_wave end-to-end with a stubbed
+# _ticket_has_open_pr_awaiting_review returning
+# _OpenPrCheck(state='awaiting_review'), then assert (a) the real
+# production caplog entry appears, (b) _dispatch_child was NOT called
+# (mock asserts zero invocations), (c) state.events[-1]['kind'] ==
+# 'existing_pr_skip'."
+
+
+@pytest.mark.asyncio
+async def test_dispatch_wave_emits_existing_pr_skip_via_production_path(
+    monkeypatch, caplog,
+):
+    """End-to-end: drive `_dispatch_wave(0)` through the real dispatch
+    loop with a stubbed `_ticket_has_open_pr_awaiting_review` returning
+    `_OpenPrCheck(state='awaiting_review')`. Assert the production
+    dispatch-site (orchestrator.py:_dispatch_wave) — not the test —
+    emits the structured log, records the event, and skips
+    `_dispatch_child`.
+
+    This is the behavioral counterpart to
+    `test_existing_pr_skip_emits_structured_log_and_event` above, which
+    builds the payload by hand and emits the log/event from the test
+    body. That test pins the *contract* (shape of the log line + event);
+    THIS test pins the *production wiring* (that the dispatch loop
+    actually calls those emitters).
+    """
+    import logging as _logging
+    from unittest.mock import AsyncMock
+
+    caplog.set_level(
+        _logging.INFO, logger="alfred_coo.autonomous_build.orchestrator",
+    )
+
+    orch = _mk_orch()
+
+    # Wave-0 ticket, PENDING, no deps → `_select_ready` will pick it up.
+    t = _t("u-4115-e2e", "SAL-4115-E2E", code="OPS-99", wave=0, epic="ops")
+    t.status = TicketStatus.PENDING
+    _seed_graph(orch, [t])
+    orch.state = OrchestratorState(kickoff_task_id="kick-sal4115")
+
+    # ── Stub the GitHub-PR pre-flight to return an awaiting-review check.
+    # This is the input that drives the dispatch loop into the SAL-4115
+    # branch. The real production code path runs from here on out.
+    open_pr_payload = orch_mod._OpenPrCheck(
+        pr_number=4242,
+        pr_url="https://github.com/salucallc/alfred-coo-svc/pull/4242",
+        state="awaiting_review",
+    )
+    monkeypatch.setattr(
+        orch, "_ticket_has_open_pr_awaiting_review",
+        AsyncMock(return_value=open_pr_payload),
+    )
+    # No merged PR for this ticket — must run BEFORE the open-PR check
+    # in the production dispatch loop, so stub it to None to fall through.
+    monkeypatch.setattr(
+        orch, "_ticket_has_merged_pr", AsyncMock(return_value=None),
+    )
+
+    # ── The mock that proves `_dispatch_child` was NOT called.
+    dispatch_child_mock = AsyncMock()
+    monkeypatch.setattr(orch, "_dispatch_child", dispatch_child_mock)
+
+    # ── Stub the inherited-review fire so we don't need to plumb a full
+    # mesh + Hawkman QA dispatch path. The fire flips the ticket to a
+    # terminal state (ESCALATED) so the `_dispatch_wave` loop's
+    # `if all(t.status in TERMINAL_STATES)` exit condition trips after
+    # the first tick — keeps the test deterministic and bounded.
+    async def _fake_fire_review(ticket, *, existing_pr):
+        ticket.status = TicketStatus.ESCALATED
+        return "fake-review-task-id"
+    monkeypatch.setattr(
+        orch, "_fire_review_for_inherited_pr", _fake_fire_review,
+    )
+
+    # ── Stub all periodic / persistence hooks the dispatch loop calls
+    # per tick. We only care about the dispatch branch behavior.
+    monkeypatch.setattr(
+        orch, "_check_cancel_signal", AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        orch, "_reconcile_orphan_active", AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        orch, "_mark_repo_missing_tickets", AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        orch, "_poll_children", AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        orch, "_poll_reviews", AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(orch, "_check_budget", AsyncMock(return_value=None))
+    monkeypatch.setattr(orch, "_status_tick", AsyncMock(return_value=None))
+    monkeypatch.setattr(orch, "_stall_watcher", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        orch, "_maybe_force_pass_stalled_wave", AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        orch, "_update_linear_state", AsyncMock(return_value=None),
+    )
+    # Skip the SAL-4120 cross-project drift filter for this single in-scope
+    # ticket — it has no Target block / repo scope. Patch to identity so the
+    # ticket flows through to the dispatch loop.
+    monkeypatch.setattr(
+        orch, "_filter_out_of_scope_tickets",
+        lambda wave_tickets, wave_n: (wave_tickets, []),
+    )
+    # `checkpoint` is a module-level coroutine that writes to soul; stub.
+    monkeypatch.setattr(
+        orch_mod, "checkpoint", AsyncMock(return_value=None),
+    )
+
+    # ── Drive the production dispatch loop.
+    await orch._dispatch_wave(0)
+
+    # ── (a) Real production caplog entry appears.
+    skip_logs = [
+        rec for rec in caplog.records
+        if rec.getMessage().startswith("existing-pr-skip")
+        and "ticket=SAL-4115-E2E" in rec.getMessage()
+        and "existing_pr=4242" in rec.getMessage()
+    ]
+    assert len(skip_logs) >= 1, (
+        "production dispatch site must emit the `existing-pr-skip ticket=... "
+        "existing_pr=... action=...` log line; saw caplog records: %r"
+        % [r.getMessage() for r in caplog.records]
+    )
+
+    # ── (b) `_dispatch_child` was NOT called — proves the skip branch
+    # short-circuited the dispatch loop before the fresh-builder path.
+    assert dispatch_child_mock.call_count == 0, (
+        "existing-pr-skip branch must NOT fall through to _dispatch_child; "
+        "got %d invocations" % dispatch_child_mock.call_count
+    )
+
+    # ── (c) `state.events[-1]['kind'] == 'existing_pr_skip'`. Tail of the
+    # event log must be the skip event the production dispatch site
+    # recorded (not a downstream event from a poll hook).
+    assert orch.state.events, "production dispatch site must record an event"
+    skip_events = [
+        evt for evt in orch.state.events
+        if evt.get("kind") == "existing_pr_skip"
+    ]
+    assert len(skip_events) >= 1, (
+        "production dispatch site must record an `existing_pr_skip` event; "
+        "got events: %r" % orch.state.events
+    )
+    evt = skip_events[-1]
+    assert evt["identifier"] == "SAL-4115-E2E"
+    assert evt["existing_pr"] == 4242
+    assert evt["action"] == "skipped"
