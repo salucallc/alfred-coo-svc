@@ -260,11 +260,32 @@ DEFAULT_BUILDER_FALLBACK_CHAIN: Tuple[str, ...] = (
 #     API on a 16-ticket wave that's mostly idle.
 #   - PR_EXISTS_FRESH_PR_WINDOW_SEC=7d — PRs older than this are treated
 #     as "stale", and dispatch proceeds to open a fresh attempt rather
-#     than waiting indefinitely on a forgotten PR.
+#     than waiting indefinitely on a forgotten PR. Env-overridable via
+#     ``EXISTING_PR_SKIP_WINDOW_DAYS`` (SAL-4115, default 7) so operators
+#     can tighten the window during incident remediation without a
+#     redeploy.
 #   - HAWKMAN_LOGIN — the GitHub user whose APPROVED review releases the
 #     short-circuit. Hardcoded to match the existing Hawkman QA persona.
 PR_EXISTS_CACHE_TTL_SEC = 5 * 60
-PR_EXISTS_FRESH_PR_WINDOW_SEC = 7 * 24 * 60 * 60
+
+
+def _resolve_existing_pr_window_sec() -> int:
+    """Read ``EXISTING_PR_SKIP_WINDOW_DAYS`` (SAL-4115) and return the
+    freshness window in seconds. Default 7 days. Invalid / non-positive
+    values fall back to the default rather than wedging the orchestrator
+    on a typo in operator-provided config.
+    """
+    raw = os.environ.get("EXISTING_PR_SKIP_WINDOW_DAYS", "")
+    try:
+        days = int(raw) if raw else 7
+    except ValueError:
+        days = 7
+    if days <= 0:
+        days = 7
+    return days * 24 * 60 * 60
+
+
+PR_EXISTS_FRESH_PR_WINDOW_SEC = _resolve_existing_pr_window_sec()
 HAWKMAN_LOGIN = "salucatiresias"
 
 
@@ -4768,6 +4789,35 @@ class AutonomousBuildOrchestrator:
                 )
                 if existing_pr_check is not None:
                     self._pr_exists_skips += 1
+                    # SAL-4115 substrate doctor signal: emit the
+                    # `existing-pr-skip` structured log line for every
+                    # ticket where this check fires, with action label so
+                    # operators can monitor mass-kickoff cohorts for
+                    # duplicate-PR clusters. Action label is computed
+                    # from the existing PR state:
+                    #   approved          -> dispatched_fix_round (we
+                    #                        will fire _merge_pr below)
+                    #   awaiting_review   -> skipped (deferred to review
+                    #                        path; either fix-round when
+                    #                        Hawkman REQUEST_CHANGES, or
+                    #                        merge when APPROVE)
+                    _existing_pr_skip_action = (
+                        "dispatched_fix_round"
+                        if existing_pr_check.state == "approved"
+                        else "skipped"
+                    )
+                    logger.info(
+                        "existing-pr-skip ticket=%s existing_pr=%d action=%s",
+                        ticket.identifier,
+                        existing_pr_check.pr_number,
+                        _existing_pr_skip_action,
+                    )
+                    self.state.record_event(
+                        "existing_pr_skip",
+                        identifier=ticket.identifier,
+                        existing_pr=existing_pr_check.pr_number,
+                        action=_existing_pr_skip_action,
+                    )
                     if existing_pr_check.state == "approved":
                         # Inherited approved PR — fire merge directly.
                         # Populate ticket.pr_url from the helper's lookup so
