@@ -59,21 +59,29 @@ try:
     )
     PROJECT_REPO_SCOPE: Dict[str, FrozenSet[str]] = dict(_LIVE_SCOPE)
 except Exception:  # pragma: no cover — defensive fallback only
+    # SAL-4121 (2026-05-03): widened per drift-sweep audit; see
+    # Z:/_planning/drift-sweep-triage-2026-05-03.md. Must mirror the
+    # ORCHESTRATOR_REPO_SCOPE constant in orchestrator.py exactly.
     PROJECT_REPO_SCOPE = {
         "8c1d8f69-359d-457a-a11c-2e650863774c": frozenset({
             "salucallc/alfred-coo-svc",
+            "salucallc/tiresias",
         }),
         "5a014234-df36-47a0-9abb-eac093e27539": frozenset({
             "salucallc/alfred-coo-svc",
+            "salucallc/alfred-portal",
         }),
         "39e340a8-26d2-4439-8582-caf94a263c7e": frozenset({
             "salucallc/alfred-coo-svc",
         }),
         "a9d93b23-96b4-4a77-be18-b709f72fa3ce": frozenset({
             "salucallc/alfred-coo-svc",
+            "salucallc/soul-svc",
         }),
         "9db00c4f-17a4-4b7a-8cd8-ea62f45d55b8": frozenset({
             "salucallc/alfred-coo-svc",
+            "salucallc/saluca-plugins",
+            "salucallc/alfred-portal",
         }),
     }
 

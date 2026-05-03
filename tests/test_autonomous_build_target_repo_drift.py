@@ -239,3 +239,69 @@ def test_filter_keeps_partial_target_block() -> None:
 
     assert in_scope == [t]
     assert skipped == []
+
+
+# ── SAL-4121: scope widening for cross-repo project work ───────────────────
+#
+# 2026-05-03 drift-sweep audit found 75 records that were NOT ticket-routing
+# bugs but symptoms of an over-narrow ORCHESTRATOR_REPO_SCOPE map. Operator
+# (Cristian) approved widening per
+# Z:/_planning/drift-sweep-triage-2026-05-03.md. These tests pin the new
+# (project, repo) pairs so accidental rollback is caught at CI time.
+
+AGENT_INGEST_PROJECT_ID = "9db00c4f-17a4-4b7a-8cd8-ea62f45d55b8"
+MSSP_FEDERATION_PROJECT_ID = "a9d93b23-96b4-4a77-be18-b709f72fa3ce"
+COCKPIT_CONSUMER_UX_PROJECT_ID = "5a014234-df36-47a0-9abb-eac093e27539"
+MSSP_EXTRACTION_PROJECT_ID = "39e340a8-26d2-4439-8582-caf94a263c7e"
+
+
+@pytest.mark.parametrize(
+    "project_id,repo",
+    [
+        (AGENT_INGEST_PROJECT_ID, "salucallc/saluca-plugins"),
+        (AGENT_INGEST_PROJECT_ID, "salucallc/alfred-portal"),
+        (MSSP_FEDERATION_PROJECT_ID, "salucallc/soul-svc"),
+        (COCKPIT_CONSUMER_UX_PROJECT_ID, "salucallc/alfred-portal"),
+        ("8c1d8f69-359d-457a-a11c-2e650863774c", "salucallc/tiresias"),
+    ],
+)
+def test_sal_4121_widened_scope_pairs_in_scope(project_id: str, repo: str) -> None:
+    """Each newly-added (project, repo) pair must be in scope after SAL-4121.
+    Pin the wired-in mapping at CI time so a future refactor doesn't silently
+    revert the operator-approved widening."""
+    scope = ORCHESTRATOR_REPO_SCOPE.get(project_id)
+    assert scope is not None, f"project_id {project_id} unregistered"
+    assert repo in scope, (
+        f"{repo} expected in scope for project {project_id}; "
+        f"got {sorted(scope)}"
+    )
+
+
+def test_sal_4121_widened_scope_keeps_alfred_coo_svc_anchor() -> None:
+    """All registered projects MUST keep ``salucallc/alfred-coo-svc`` as an
+    anchor — widening adds repos, never removes the substrate-tier baseline.
+    """
+    for project_id, scope in ORCHESTRATOR_REPO_SCOPE.items():
+        assert "salucallc/alfred-coo-svc" in scope, (
+            f"project {project_id} dropped alfred-coo-svc anchor: {sorted(scope)}"
+        )
+
+
+def test_sal_4121_mssp_extraction_remains_single_repo() -> None:
+    """MSSP Extraction is intentionally single-repo per the 2026-05-03 audit
+    (Cristian explicit: 'don't over-extend'). Pin so accidental drift is
+    caught."""
+    scope = ORCHESTRATOR_REPO_SCOPE.get(MSSP_EXTRACTION_PROJECT_ID)
+    assert scope == frozenset({"salucallc/alfred-coo-svc"}), (
+        f"MSSP Extraction scope drifted: {sorted(scope) if scope else None}"
+    )
+
+
+def test_sal_4121_unregistered_repo_not_in_any_scope() -> None:
+    """Negative test: a repo that was NOT part of the widening (e.g. a random
+    other Saluca repo) must NOT appear in any project's scope."""
+    bogus_repo = "salucallc/random-other-repo"
+    for project_id, scope in ORCHESTRATOR_REPO_SCOPE.items():
+        assert bogus_repo not in scope, (
+            f"{bogus_repo} unexpectedly in scope for {project_id}: {sorted(scope)}"
+        )
