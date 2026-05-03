@@ -4,6 +4,7 @@
 #include "transport.h"
 
 #include <Arduino.h>
+#include <atomic>
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <WebSocketsClient.h>
@@ -74,6 +75,13 @@ WebSocketsClient g_ws;
 
 // Live stats.
 TransportStats g_stats = {};
+
+// SAL-4007 audio sink callbacks. Plain function pointers (atomic
+// load/store on the function-pointer width is safe on Xtensa). main.cpp
+// registers these before transport_init.
+std::atomic<AudioStartCb> g_on_audio_start{nullptr};
+std::atomic<AudioBinCb>   g_on_audio_bin{nullptr};
+std::atomic<AudioEndCb>   g_on_audio_end{nullptr};
 
 // Hello-frame seq counter (we use 0 for the first hello, then increment
 // for any subsequent client-driven control frames; pong frames echo
@@ -246,18 +254,54 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
         ++g_stats.transcripts_recv;
       } else if (typ == "assistant_text") {
         ++g_stats.assistant_text_recv;
+      } else if (typ == "audio_start") {
+        // SAL-4007: open the decode + I2S TX pipeline.
+        AudioStartInfo info = {};
+        const int seq          = extractIntField(body, "seq");
+        const int sample_rate  = extractIntField(body, "sample_rate");
+        const int channels     = extractIntField(body, "channels");
+        const int frame_ms     = extractIntField(body, "frame_ms");
+        info.seq         = (seq          > 0) ? static_cast<uint32_t>(seq)         : 0;
+        info.sample_rate = (sample_rate  > 0) ? static_cast<uint32_t>(sample_rate) : 16000;
+        info.channels    = (channels     > 0) ? static_cast<uint8_t>(channels)     : 1;
+        info.frame_ms    = (frame_ms     > 0) ? static_cast<uint16_t>(frame_ms)    : 20;
+        AudioStartCb cb = g_on_audio_start.load(std::memory_order_relaxed);
+        if (cb != nullptr) {
+          cb(info);
+        }
+      } else if (typ == "audio_end") {
+        AudioEndInfo info = {};
+        const int seq    = extractIntField(body, "seq");
+        const int frames = extractIntField(body, "frames");
+        const int bytes_ = extractIntField(body, "bytes");
+        info.seq    = (seq    > 0) ? static_cast<uint32_t>(seq)    : 0;
+        info.frames = (frames > 0) ? static_cast<uint32_t>(frames) : 0;
+        info.bytes  = (bytes_ > 0) ? static_cast<uint32_t>(bytes_) : 0;
+        AudioEndCb cb = g_on_audio_end.load(std::memory_order_relaxed);
+        if (cb != nullptr) {
+          cb(info);
+        }
       }
-      // welcome / ack / audio_start / audio_end / error: just logged
-      // above. Nothing else to do device-side for SAL-4006.
+      // welcome / ack / error: just logged above.
       break;
     }
 
-    case WStype_BIN:
+    case WStype_BIN: {
       ++g_stats.frames_recv_binary;
       g_stats.bytes_recv_binary += length;
-      // SAL-4007 will Opus-decode + I2S-TX these; for now just log.
-      Serial.printf("[ws] rx binary len=%u\r\n", (unsigned)length);
+      // SAL-4007: hand off to the audio sink (Opus decoder + I2S TX).
+      // Stay quiet on the serial here once a callback is registered;
+      // the playback path logs its own counters via the heartbeat.
+      AudioBinCb cb = g_on_audio_bin.load(std::memory_order_relaxed);
+      if (cb != nullptr) {
+        cb(payload, length);
+      } else {
+        // No sink wired (SAL-4006 baseline) — log so the bench can see
+        // the gateway is shipping bytes.
+        Serial.printf("[ws] rx binary len=%u (no sink)\r\n", (unsigned)length);
+      }
       break;
+    }
 
     case WStype_PING:
       // links2004 lib auto-pongs WS protocol pings; nothing for us to do.
@@ -501,6 +545,16 @@ bool transport_init(QueueHandle_t outbound_q) {
 
 TransportStats transport_get_stats() {
   return g_stats;
+}
+
+void transport_set_audio_callbacks(AudioStartCb on_start,
+                                   AudioBinCb   on_bin,
+                                   AudioEndCb   on_end) {
+  g_on_audio_start.store(on_start, std::memory_order_relaxed);
+  g_on_audio_bin.store(on_bin,     std::memory_order_relaxed);
+  g_on_audio_end.store(on_end,     std::memory_order_relaxed);
+  Serial.printf("[transport] audio callbacks set: start=%p bin=%p end=%p\r\n",
+                (void*)on_start, (void*)on_bin, (void*)on_end);
 }
 
 }  // namespace transport

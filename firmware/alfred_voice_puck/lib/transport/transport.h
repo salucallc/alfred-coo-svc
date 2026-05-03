@@ -98,5 +98,56 @@ bool transport_init(QueueHandle_t outbound_q);
 // Snapshot of live counters. Safe to call from any task.
 TransportStats transport_get_stats();
 
+// ---------------------------------------------------------------------------
+// SAL-4007 audio sink callbacks.
+//
+// main.cpp wires these to the Opus decoder + I2S TX path so the
+// transport module stays codec-agnostic (no opus.h include here). The
+// callbacks fire on the transport task thread (`voice_ws`, core 0).
+// They MUST be cheap; long-running decode + I2S writes should be
+// dispatched onto a dedicated audio task (see main.cpp's playbackTask)
+// rather than blocking the WS receive loop.
+//
+// Lifecycle:
+//   * AudioStartCb fires once per `audio_start` JSON envelope from the
+//     gateway. Payload is the parsed envelope; for SAL-4007 the
+//     interesting fields are `sample_rate`, `channels`, `frame_ms`.
+//     Optional `stream_id` is currently absent in fleet_voice/server.py
+//     (it ships `seq` instead); main.cpp may use the seq as the stream
+//     identifier.
+//   * AudioBinCb fires once per binary WS frame received between
+//     audio_start and audio_end. The byte buffer is owned by the
+//     WebSockets library and only valid for the duration of the
+//     callback; copy if you need to enqueue.
+//   * AudioEndCb fires once per `audio_end` envelope, signalling end-
+//     of-utterance.
+// ---------------------------------------------------------------------------
+
+struct AudioStartInfo {
+  uint32_t seq;            // gateway-side seq matching the audio_end
+  uint32_t sample_rate;    // Hz, from the envelope (typically 16000)
+  uint8_t  channels;       // typically 1
+  uint16_t frame_ms;       // typically 20
+};
+
+struct AudioEndInfo {
+  uint32_t seq;            // matching the audio_start envelope
+  uint32_t frames;         // frames the gateway claims it sent
+  uint32_t bytes;          // bytes the gateway claims it sent
+};
+
+using AudioStartCb = void (*)(const AudioStartInfo& info);
+using AudioBinCb   = void (*)(const uint8_t* data, size_t length);
+using AudioEndCb   = void (*)(const AudioEndInfo& info);
+
+// Register the audio sink callbacks. Pass nullptr for any you don't
+// want; subsequent registrations replace the previous handler.
+//
+// Idempotent and safe to call before transport_init (the transport task
+// reads the callbacks via std::atomic so there's no race).
+void transport_set_audio_callbacks(AudioStartCb on_start,
+                                   AudioBinCb   on_bin,
+                                   AudioEndCb   on_end);
+
 }  // namespace transport
 }  // namespace alfred

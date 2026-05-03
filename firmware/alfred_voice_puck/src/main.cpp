@@ -29,20 +29,30 @@
 //      on core 0 logs queue stats so we can see encoding is staying ahead
 //      of audio capture.
 //
-// Task topology (as of SAL-4006):
+// Task topology (as of SAL-4007):
 //   * loopTask (Arduino, core 0)        : heartbeats every 5 s; now also
-//                                          dumps transport stats so ops
-//                                          can see Wi-Fi + WS health from
+//                                          dumps transport + decoder + I2S
+//                                          TX stats so ops can see the full
+//                                          mic-to-speaker pipeline from
 //                                          the same one-line view.
 //   * encoderTask (core 1, prio 5)      : drains audio_io blocks, encodes,
 //                                          pushes EncodedFrame to outbound q.
+//   * playbackTask (core 1, prio 4)     : drains the inbound playback q
+//                                          (Opus packets pushed by the WS
+//                                          callback), decodes 16k mono ->
+//                                          int16, upsamples 3x to 48k,
+//                                          stereo-duplicates, promotes to
+//                                          int32, pushes to I2S TX. SAL-4007.
 //   * voice_ws (core 0, prio 3)         : owns Wi-Fi STA + WebSocket
 //                                          client; pumps EncodedFrame
 //                                          out as binary WS messages,
 //                                          handles inbound JSON control
-//                                          + binary TTS frames. See
+//                                          + binary TTS frames; for SAL-4007
+//                                          fires the audio_start /
+//                                          audio_bin / audio_end callbacks
+//                                          which copy packets onto the
+//                                          playback queue. See
 //                                          lib/transport/transport.cpp.
-//                                          Replaces SAL-4001's drainTask.
 //
 // Why these pinnings: PLAN.md risk #1 says Opus on ESP32-S3 may starve I2S
 // DMA. We pin both the I2S DMA reader and the encoder to core 1 so they
@@ -51,14 +61,20 @@
 // nearly no work and is naturally where the WS client will land.
 //
 // Future tickets plug in here:
-//   * SAL-4007 (Opus decode + I2S TX)      -> add an inbound Opus decoder
-//                                              fed by transport's WStype_BIN
-//                                              frames, write decoded PCM to
-//                                              audio_io's TX path on GPIO44.
+//   * SAL-4007 (Opus decode + I2S TX) - DONE in this file. Inbound Opus
+//                                       packets shipped down by the gateway
+//                                       are queued by the transport task,
+//                                       drained by playbackTask, decoded
+//                                       to 16 kHz mono int16 PCM, upsampled
+//                                       to 48 kHz, stereo-duplicated, and
+//                                       pushed out I2S DOUT (GPIO44) into
+//                                       the TLV320AIC3104 codec on the
+//                                       ReSpeaker carrier.
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <atomic>
+#include <string.h>
 #include <esp_chip_info.h>
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
@@ -68,6 +84,8 @@
 #include <freertos/task.h>
 
 #include "audio_io.h"
+#include "i2s_tx.h"
+#include "opus_decoder.h"
 #include "transport.h"
 #include "voice_codec.h"
 
@@ -97,11 +115,43 @@ constexpr size_t kAudioBlockFrames = alfred::codec::kInputBlockFrames;
 // move the queue to PSRAM via xQueueCreateStatic in PSRAM-backed memory.
 constexpr UBaseType_t kOutboundQueueDepth = 100;
 
+// SAL-4007 inbound playback queue. Each PlaybackPacket carries one Opus
+// packet (max 256 bytes payload + length). 100 entries = ~26 KB of
+// internal RAM, covers 2 s of 50 fps TTS with comfortable headroom for
+// I2S backpressure on a stalled speaker. Queue lives in internal RAM
+// because the playback task hits it at 50 Hz and PSRAM would blow the
+// per-access budget.
+constexpr UBaseType_t kPlaybackQueueDepth = 100;
+
+// Maximum Opus packet bytes we'll buffer per WS frame. Matches
+// alfred::codec::kDecodeMaxPacketBytes upper bound but capped tight
+// since the TTS adapter ships at 32 kbps / 20 ms / mono ≈ 80 bytes/frame.
+constexpr size_t kPlaybackPacketMaxBytes = 256;
+
+struct PlaybackPacket {
+  uint16_t length;                          // bytes used in `data`
+  uint8_t  data[kPlaybackPacketMaxBytes];   // raw Opus packet
+};
+
 uint32_t g_last_heartbeat_ms = 0;
 uint32_t g_heartbeat_seq = 0;
 
 // Outbound encoded-frame queue. encoderTask pushes; drainTask pops.
 QueueHandle_t g_outbound_q = nullptr;
+
+// SAL-4007 inbound playback queue. transport's audio_bin callback
+// pushes PlaybackPacket items; playbackTask drains them.
+QueueHandle_t g_playback_q = nullptr;
+
+// SAL-4007 playback counters. Updated only by playbackTask + the
+// audio sink callbacks (single writer per field), read by the
+// heartbeat. Atomic for safe cross-core reads.
+std::atomic<uint32_t> g_playback_starts{0};      // audio_start envelopes received
+std::atomic<uint32_t> g_playback_ends{0};        // audio_end envelopes received
+std::atomic<uint32_t> g_playback_pkts_queued{0}; // binary frames pushed onto playback_q
+std::atomic<uint32_t> g_playback_pkts_dropped{0};// binary frames dropped (queue full)
+std::atomic<uint32_t> g_playback_pkts_decoded{0};// packets the playback task decoded
+std::atomic<uint32_t> g_playback_frames_tx{0};   // I2S TX frame count (stereo frames)
 
 // Monotonic sequence number for outbound frames.
 std::atomic<uint32_t> g_frame_seq{0};
@@ -177,12 +227,17 @@ void printHeartbeat() {
   ++g_heartbeat_seq;
   alfred::audio::AudioStats a = alfred::audio::audio_io_get_stats();
   alfred::codec::CodecStats c = alfred::codec::voice_codec_get_stats();
+  alfred::codec::DecoderStats d = alfred::codec::opus_decoder_get_stats();
+  alfred::audio::I2sTxStats x = alfred::audio::i2s_tx_get_stats();
   alfred::transport::TransportStats t = alfred::transport::transport_get_stats();
   Serial.printf("[heartbeat seq=%lu uptime=%lus heap=%lu psram=%lu "
                 "audio_frames=%llu under=%lu opus_frames=%llu opus_bytes=%llu "
                 "max_enc_us=%lu over=%lu wifi=%d rssi=%lu ws=%d "
                 "tx_frames=%llu tx_bytes=%llu rx_text=%llu rx_bin=%llu "
-                "drop_off=%llu]\r\n",
+                "drop_off=%llu "
+                "pb_starts=%lu pb_ends=%lu pb_qd=%lu pb_drop=%lu "
+                "dec_pkts=%llu dec_err=%llu dec_samples=%llu max_dec_us=%lu "
+                "i2stx_frames=%llu i2stx_err=%lu i2stx_short=%lu max_w_us=%lu]\r\n",
                 (unsigned long)g_heartbeat_seq,
                 (unsigned long)(millis() / 1000UL),
                 (unsigned long)ESP.getFreeHeap(),
@@ -200,7 +255,19 @@ void printHeartbeat() {
                 (unsigned long long)t.bytes_sent,
                 (unsigned long long)t.frames_recv_text,
                 (unsigned long long)t.frames_recv_binary,
-                (unsigned long long)t.frames_dropped_offline);
+                (unsigned long long)t.frames_dropped_offline,
+                (unsigned long)g_playback_starts.load(std::memory_order_relaxed),
+                (unsigned long)g_playback_ends.load(std::memory_order_relaxed),
+                (unsigned long)g_playback_pkts_queued.load(std::memory_order_relaxed),
+                (unsigned long)g_playback_pkts_dropped.load(std::memory_order_relaxed),
+                (unsigned long long)d.packets_decoded,
+                (unsigned long long)d.packets_errored,
+                (unsigned long long)d.samples_out,
+                (unsigned long)d.max_decode_us,
+                (unsigned long long)x.frames_out,
+                (unsigned long)x.write_errors,
+                (unsigned long)x.write_short,
+                (unsigned long)x.max_write_us);
 }
 
 // FreeRTOS task: drain audio_io, encode, push EncodedFrame onto the
@@ -280,6 +347,162 @@ void encoderTask(void* /*arg*/) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SAL-4007 audio sink callbacks (fired by transport on the voice_ws task).
+//
+// Keep these short. They MUST NOT block the WS receive loop:
+//   * onAudioStart: open the decoder. Cheap (~10s of microseconds).
+//   * onAudioBin:   copy the packet into the playback queue. If the
+//                   queue is full, drop the OLDEST item then push (drop-
+//                   oldest semantics, same as the encoder side, so a
+//                   transient I2S stall doesn't accumulate stale audio).
+//   * onAudioEnd:   close the decoder. Decoder destroy is heavy-ish
+//                   (frees ~10 KB) but not blocking on anything outside
+//                   itself; runs on the WS task which is fine.
+// ---------------------------------------------------------------------------
+
+void onAudioStart(const alfred::transport::AudioStartInfo& info) {
+  g_playback_starts.fetch_add(1, std::memory_order_relaxed);
+  Serial.printf("[playback] audio_start seq=%lu sample_rate=%lu ch=%u frame_ms=%u\r\n",
+                (unsigned long)info.seq,
+                (unsigned long)info.sample_rate,
+                (unsigned)info.channels,
+                (unsigned)info.frame_ms);
+  // Sanity-check the format. Decoder is hard-wired to 16k mono right
+  // now; if the gateway ships a different envelope we still try (the
+  // decoder is created with kDecodeSampleRateHz/kDecodeChannels) but
+  // log a warning so the bench can spot the mismatch.
+  if (info.sample_rate != alfred::codec::kDecodeSampleRateHz ||
+      info.channels != alfred::codec::kDecodeChannels) {
+    Serial.printf("[playback] WARN: envelope says %lu Hz x %u ch but decoder is %lu Hz x %u\r\n",
+                  (unsigned long)info.sample_rate, (unsigned)info.channels,
+                  (unsigned long)alfred::codec::kDecodeSampleRateHz,
+                  (unsigned)alfred::codec::kDecodeChannels);
+  }
+  if (!alfred::codec::opus_decoder_open()) {
+    Serial.println(F("[playback] FAIL: opus_decoder_open"));
+  }
+}
+
+void onAudioBin(const uint8_t* data, size_t length) {
+  if (g_playback_q == nullptr || data == nullptr || length == 0) {
+    return;
+  }
+  if (length > kPlaybackPacketMaxBytes) {
+    Serial.printf("[playback] drop oversized packet %u > %u\r\n",
+                  (unsigned)length, (unsigned)kPlaybackPacketMaxBytes);
+    g_playback_pkts_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  // Stack-allocate the packet; FreeRTOS copies by value into the queue.
+  PlaybackPacket pkt;
+  pkt.length = static_cast<uint16_t>(length);
+  memcpy(pkt.data, data, length);
+  if (xQueueSend(g_playback_q, &pkt, 0) != pdTRUE) {
+    // Drop oldest, push new (same policy as encoder outbound).
+    PlaybackPacket stale;
+    xQueueReceive(g_playback_q, &stale, 0);
+    g_playback_pkts_dropped.fetch_add(1, std::memory_order_relaxed);
+    xQueueSend(g_playback_q, &pkt, 0);
+  }
+  g_playback_pkts_queued.fetch_add(1, std::memory_order_relaxed);
+}
+
+void onAudioEnd(const alfred::transport::AudioEndInfo& info) {
+  g_playback_ends.fetch_add(1, std::memory_order_relaxed);
+  Serial.printf("[playback] audio_end seq=%lu gw_frames=%lu gw_bytes=%lu "
+                "(local: queued=%lu dropped=%lu decoded=%lu i2s_frames=%lu)\r\n",
+                (unsigned long)info.seq,
+                (unsigned long)info.frames,
+                (unsigned long)info.bytes,
+                (unsigned long)g_playback_pkts_queued.load(std::memory_order_relaxed),
+                (unsigned long)g_playback_pkts_dropped.load(std::memory_order_relaxed),
+                (unsigned long)g_playback_pkts_decoded.load(std::memory_order_relaxed),
+                (unsigned long)g_playback_frames_tx.load(std::memory_order_relaxed));
+  // Don't close the decoder synchronously — there may still be packets
+  // queued behind us that the playbackTask hasn't drained yet. A
+  // sentinel zero-length packet enqueued here would let the playback
+  // task close at the right boundary, but the simpler equivalent for
+  // SAL-4007 is to just leave the session open; the next audio_start
+  // will reset it. opus_decoder_open() handles that case.
+}
+
+// FreeRTOS task: drain g_playback_q, decode each Opus packet, upsample
+// 16k mono → 48k mono linearly, stereo-duplicate + promote int16 → int32,
+// push to I2S TX. Pinned to core 1 alongside the encoder so the network
+// stack on core 0 never preempts audio (PLAN.md risk #1).
+void playbackTask(void* /*arg*/) {
+  // Scratch buffers. Sized for the largest single decode call we'll
+  // make: kDecodeMaxSamplesPerCall samples = 1920 = 120 ms at 16 kHz.
+  // PCM16 mono after decode: 1920 * 2 = 3840 bytes.
+  // PCM16 mono after 3x upsample: 5760 samples = 11520 bytes.
+  // PCM32 stereo after promote: 5760 * 2 * 4 = 46080 bytes.
+  // Total ~62 KB; allocate from internal RAM since the I2S DMA path is
+  // hot. We allocate on the heap (not the task stack) for the same
+  // reason voice_codec/encoderTask does: keeps the task stack small.
+  constexpr size_t kPcmInMax    = alfred::codec::kDecodeMaxSamplesPerCall;
+  constexpr size_t kPcmUpMax    = kPcmInMax * 3;
+  constexpr size_t kPcmStereoMax = kPcmUpMax * 2;
+
+  int16_t* pcm_in     = (int16_t*)heap_caps_malloc(kPcmInMax * sizeof(int16_t),
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  int16_t* pcm_up     = (int16_t*)heap_caps_malloc(kPcmUpMax * sizeof(int16_t),
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  int32_t* pcm_stereo = (int32_t*)heap_caps_malloc(kPcmStereoMax * sizeof(int32_t),
+                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (pcm_in == nullptr || pcm_up == nullptr || pcm_stereo == nullptr) {
+    Serial.println(F("[playback] FATAL: heap_caps_malloc for decode buffers failed"));
+    if (pcm_in)     free(pcm_in);
+    if (pcm_up)     free(pcm_up);
+    if (pcm_stereo) free(pcm_stereo);
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  Serial.println(F("[playback] task running; draining playback_q -> decode -> "
+                   "upsample 3x -> stereo int32 -> I2S TX"));
+
+  // Carry the last input sample across blocks so linear interpolation
+  // is continuous at block boundaries.
+  int16_t last_in_for_upsample = 0;
+
+  PlaybackPacket pkt;
+  for (;;) {
+    // Block up to 50 ms waiting for a packet. When idle, this just
+    // releases the CPU; the I2S TX side has tx_desc_auto_clear=true so
+    // the DMA emits silence on its own.
+    if (xQueueReceive(g_playback_q, &pkt, pdMS_TO_TICKS(50)) != pdTRUE) {
+      continue;
+    }
+
+    size_t samples_decoded = 0;
+    const bool ok = alfred::codec::opus_decoder_decode(
+        pkt.data, pkt.length,
+        pcm_in, kPcmInMax,
+        &samples_decoded);
+    if (!ok || samples_decoded == 0) {
+      continue;
+    }
+    g_playback_pkts_decoded.fetch_add(1, std::memory_order_relaxed);
+
+    // Upsample 16k → 48k linearly (3x).
+    last_in_for_upsample = alfred::audio::upsample_3x_linear_mono(
+        pcm_in, samples_decoded, last_in_for_upsample, pcm_up);
+    const size_t up_samples = samples_decoded * 3;
+
+    // Stereo-duplicate + promote int16 → int32.
+    alfred::audio::mono_int16_to_stereo_int32(pcm_up, up_samples, pcm_stereo);
+
+    // Push to I2S TX. Block up to 50 ms per call — at 48 kHz stereo
+    // 5760 samples = 120 ms of audio so DMA should always have room
+    // unless the speaker is wedged.
+    const size_t got = alfred::audio::i2s_tx_write_block(
+        pcm_stereo, up_samples, /*timeout_ms=*/50);
+    g_playback_frames_tx.fetch_add(static_cast<uint32_t>(got),
+                                   std::memory_order_relaxed);
+  }
+}
+
 }  // namespace
 
 void setup() {
@@ -309,6 +532,22 @@ void setup() {
     return;
   }
   Serial.println(F("[audio] audio_io_init OK."));
+
+  // SAL-4007: bring up I2S TX (duplex slave RX+TX) immediately after
+  // audio_io_init() and BEFORE the encoder task spawns. i2s_tx_init()
+  // calls i2s_driver_uninstall + reinstall to flip the port from RX-only
+  // to RX+TX; if the encoder task is already running, its in-flight
+  // i2s_read() collides with the uninstall and trips the IDF spinlock
+  // assert (`spinlock_acquire ... result == core_id || SPINLOCK_FREE`,
+  // verified on the first run after this code landed). Doing the
+  // duplex flip here, before any task is consuming I2S, sequences the
+  // driver state cleanly and the encoder/playback tasks both see the
+  // final RX+TX configuration on first read/write.
+  if (!alfred::audio::i2s_tx_init()) {
+    Serial.println(F("[i2s_tx] FAIL: i2s_tx_init returned false; playback degraded."));
+  } else {
+    Serial.println(F("[i2s_tx] i2s_tx_init OK (duplex slave RX+TX on I2S0)."));
+  }
 
   const bool codec_ok = alfred::codec::voice_codec_init();
   if (!codec_ok) {
@@ -352,6 +591,44 @@ void setup() {
   if (rc != pdPASS) {
     Serial.println(F("[encoder] FAIL: xTaskCreatePinnedToCore returned !pdPASS."));
   }
+  // SAL-4007: allocate the playback queue + spawn the playbackTask.
+  // i2s_tx_init() already ran above (before the encoder task) so the
+  // driver is in duplex mode by now. The playback queue + task are
+  // independent of the actual I2S TX init result; if TX init failed
+  // we still boot and the heartbeat surfaces it.
+  g_playback_q = xQueueCreate(kPlaybackQueueDepth, sizeof(PlaybackPacket));
+  if (g_playback_q == nullptr) {
+    Serial.println(F("[playback] FAIL: xQueueCreate returned NULL; playback disabled."));
+  } else {
+    Serial.printf("[playback] queue: %u entries x %u bytes = %u bytes\r\n",
+                  (unsigned)kPlaybackQueueDepth,
+                  (unsigned)sizeof(PlaybackPacket),
+                  (unsigned)(kPlaybackQueueDepth * sizeof(PlaybackPacket)));
+
+    // Spawn playbackTask BEFORE wiring callbacks so the first incoming
+    // audio_start has a queue + drain ready. Stack: 12 KB. opus_decode
+    // in FIXED_POINT mode is lighter than encode (no autocorrelation /
+    // LPC search) so 12 KB is comfortable; 16 KB if anything fluctuates.
+    BaseType_t prc = xTaskCreatePinnedToCore(
+        playbackTask, "voice_play",
+        /*stack=*/16 * 1024,
+        /*arg=*/nullptr,
+        /*priority=*/4,        // Below encoder (5), above transport (3) so
+                                // playback drains the queue ahead of WS.
+        /*handle=*/nullptr,
+        /*core=*/1);            // Same core as encoder; both audio paths
+                                 // share core 1, network stays on core 0.
+    if (prc != pdPASS) {
+      Serial.println(F("[playback] FAIL: xTaskCreatePinnedToCore !pdPASS"));
+    }
+  }
+
+  // Register transport audio sink callbacks BEFORE transport_init so
+  // any audio frames that arrive during the first WS connect race land
+  // in the playback path. Idempotent and lock-free; safe pre-init.
+  alfred::transport::transport_set_audio_callbacks(
+      onAudioStart, onAudioBin, onAudioEnd);
+
   // SAL-4006: bring up Wi-Fi STA + WebSocket client. The transport
   // module owns its own task (voice_ws on core 0) and pulls
   // EncodedFrame items out of g_outbound_q. The setup is fire-and-
