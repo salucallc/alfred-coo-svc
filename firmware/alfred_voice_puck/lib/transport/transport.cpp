@@ -87,6 +87,15 @@ String g_device_id;
 // on every disconnect.
 bool g_hello_sent = false;
 
+// SAL-4006 smoke helper: periodically tell the gateway to drain its
+// per-session Opus buffer and run STT, since we don't yet have on-
+// device VAD edge detection. Cadence is high enough that any phrase
+// the user utters will land within one window. SAL-4012 (on-device
+// VAD signaling) replaces this with real start/end utterance edges.
+constexpr uint32_t kEndUtterancePeriodMs = 6000;
+uint32_t g_last_end_utterance_ms = 0;
+uint32_t g_end_utterance_seq = 100;  // start above the hello seq to avoid collision
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -122,6 +131,15 @@ String pongJson(int seq) {
   String s;
   s.reserve(48);
   s += "{\"type\":\"pong\",\"seq\":";
+  s += seq;
+  s += "}";
+  return s;
+}
+
+String endUtteranceJson(uint32_t seq) {
+  String s;
+  s.reserve(48);
+  s += "{\"type\":\"end_utterance\",\"seq\":";
   s += seq;
   s += "}";
   return s;
@@ -402,8 +420,22 @@ void transportTask(void* /*arg*/) {
     // threads ever touch g_ws simultaneously.
     pumpOnce();
 
-    // Cheap Wi-Fi health check every second.
     const uint32_t now = millis();
+
+    // SAL-4006 smoke: fire end_utterance periodically so the gateway
+    // drains the per-session Opus buffer and runs STT. Without this
+    // the gateway just buffers forever waiting for an edge marker.
+    // Replaced by real on-device VAD edges in SAL-4012.
+    if (g_stats.ws_connected &&
+        (now - g_last_end_utterance_ms) >= kEndUtterancePeriodMs) {
+      g_last_end_utterance_ms = now;
+      String msg = endUtteranceJson(g_end_utterance_seq++);
+      if (g_ws.sendTXT(msg)) {
+        Serial.printf("[ws] tx %s\r\n", msg.c_str());
+      }
+    }
+
+    // Cheap Wi-Fi health check every second.
     if (now - last_wifi_check_ms >= 1000) {
       last_wifi_check_ms = now;
       const bool up = WiFi.status() == WL_CONNECTED;
