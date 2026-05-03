@@ -98,6 +98,36 @@ TTS_INPUT_SAMPLE_RATE = int(os.getenv("FLEET_VOICE_TTS_INPUT_SAMPLE_RATE", "2400
 
 HTTP_TIMEOUT_S = float(os.getenv("FLEET_VOICE_TTS_HTTP_TIMEOUT_S", "30"))
 
+# ---------------------------------------------------------------------------
+# ElevenLabs TTS config (alternative backend)
+# ---------------------------------------------------------------------------
+
+TTS_BACKEND = os.getenv("FLEET_VOICE_TTS_BACKEND", "openai").lower()
+"""Which TTS service to call. Values: ``openai`` (default), ``elevenlabs``.
+Switch to ``elevenlabs`` when the ``OPENAI_API_KEY`` is OpenRouter (no
+``/v1/audio/speech`` proxy) or when better voice quality is wanted."""
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+
+ELEVENLABS_VOICE_ID = os.getenv(
+    "FLEET_VOICE_ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb"
+)
+"""Default to George (British male) — Alfred-appropriate.
+Other stock voices: 21m00Tcm4TlvDq8ikWAM (Rachel), TxGEqnHWrfWFTfGW9XjX (Josh)."""
+
+ELEVENLABS_MODEL = os.getenv(
+    "FLEET_VOICE_ELEVENLABS_MODEL", "eleven_turbo_v2_5"
+)
+"""eleven_turbo_v2_5 (fast, multilingual). eleven_flash_v2_5 = fastest, slightly
+lower quality. eleven_multilingual_v2 = highest quality, slower."""
+
+ELEVENLABS_TTS_URL = (
+    "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+    "?output_format=pcm_16000"
+)
+"""ElevenLabs streaming endpoint. ``pcm_16000`` = 16 kHz mono int16 LE,
+matches OUTPUT_SAMPLE_RATE so no resample needed."""
+
 # Opus frame bookkeeping derived from the codec params above.
 SAMPLES_PER_FRAME = OUTPUT_SAMPLE_RATE * OUTPUT_FRAME_MS // 1000
 """Samples per 20 ms Opus frame. At 16 kHz that's 320."""
@@ -128,48 +158,60 @@ def _pcm_to_opus_frames(pcm_16khz_mono: bytes) -> Iterator[bytes]:
     if not pcm_16khz_mono:
         return
     try:
-        import opuslib  # type: ignore[import-not-found]
+        import av  # type: ignore[import-not-found]
+        import numpy as np  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover - exercised only on bare boxes
         raise RuntimeError(
-            "opuslib unavailable (install libopus on Linux: "
-            "`apt-get install libopus0`; on Windows: opuslib needs "
-            "libopus.dll on PATH). Original error: {}".format(exc)
+            "pyav/numpy unavailable for TTS opus encode. "
+            "Original error: {}".format(exc)
         ) from exc
 
-    encoder = opuslib.Encoder(
-        OUTPUT_SAMPLE_RATE, OUTPUT_CHANNELS, opuslib.APPLICATION_VOIP
-    )
-    # CBR at 32 kbps. opuslib exposes the underlying encoder ctl knobs via
-    # the integer constants in opuslib.constants; setting bitrate first then
-    # forcing VBR off matches the C-API recipe.
+    # PyAV/libopus encoder. Bundles libopus on Windows via the pyav wheel,
+    # so no separate libopus.dll install is needed (the historical pain
+    # point for opuslib on this dev box). Same pattern STT uses for decode.
+    codec = av.CodecContext.create("opus", "w")
+    codec.sample_rate = OUTPUT_SAMPLE_RATE
+    codec.layout = "mono" if OUTPUT_CHANNELS == 1 else "stereo"
+    codec.format = "s16"
+    codec.bit_rate = OUTPUT_BITRATE_BPS
     try:
-        encoder.bitrate = OUTPUT_BITRATE_BPS
-    except Exception:
-        # Older opuslib builds expose this as a setter method; fall back.
-        try:
-            encoder._set_bitrate(OUTPUT_BITRATE_BPS)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    try:
-        encoder.vbr = False  # CBR
+        codec.options = {"vbr": "off", "application": "voip"}
     except Exception:
         pass
 
     bytes_per_frame = BYTES_PER_FRAME
     samples_per_frame = SAMPLES_PER_FRAME
     total = len(pcm_16khz_mono)
+    pts = 0
     for i in range(0, total - bytes_per_frame + 1, bytes_per_frame):
         chunk = pcm_16khz_mono[i:i + bytes_per_frame]
+        samples = np.frombuffer(chunk, dtype=np.int16).copy()
+        frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1),
+                                           format="s16",
+                                           layout=codec.layout.name)
+        frame.sample_rate = OUTPUT_SAMPLE_RATE
+        frame.pts = pts
+        pts += samples_per_frame
         try:
-            packet = encoder.encode(chunk, samples_per_frame)
+            for packet in codec.encode(frame):
+                pkt_bytes = bytes(packet)
+                if pkt_bytes:
+                    yield pkt_bytes
         except Exception as exc:
             logger.warning(
                 "fleet_voice TTS opus encode failed on frame "
                 "offset=%d bytes=%d: %s", i, len(chunk), exc
             )
             continue
-        if packet:
-            yield packet
+
+    # Flush any held samples in the encoder buffer.
+    try:
+        for packet in codec.encode(None):
+            pkt_bytes = bytes(packet)
+            if pkt_bytes:
+                yield pkt_bytes
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +241,25 @@ def _resample_to_16k_mono(pcm: bytes, src_rate: int, state: object | None) -> tu
 
 
 async def synthesize_to_opus_frames(
+    text: str,
+    *,
+    voice: str | None = None,
+    model: str | None = None,
+) -> AsyncIterator[bytes]:
+    """Backend-agnostic entry. Routes to OpenAI or ElevenLabs based on
+    ``FLEET_VOICE_TTS_BACKEND`` env var."""
+    if not text or not text.strip():
+        return
+    backend = TTS_BACKEND
+    if backend == "elevenlabs":
+        async for pkt in _synthesize_elevenlabs_to_opus_frames(text, voice=voice, model=model):
+            yield pkt
+        return
+    async for pkt in _synthesize_openai_to_opus_frames(text, voice=voice, model=model):
+        yield pkt
+
+
+async def _synthesize_openai_to_opus_frames(
     text: str,
     *,
     voice: str | None = None,
@@ -250,31 +311,31 @@ async def synthesize_to_opus_frames(
     # Re-encode state across chunk boundaries.
     resample_state: object | None = None
     pcm_carry = b""
-    # Lazy-build a per-call encoder via _pcm_to_opus_frames; we cannot reuse
-    # that helper directly because it constructs its own encoder per call
-    # and would emit boundary clicks on partial frames. Instead, hand-roll
-    # a single Encoder here so the same encoder spans all chunks.
+    # Hand-roll a single pyav opus encoder here so the same encoder state
+    # spans all chunks (avoids boundary clicks). Same lib choice as
+    # _pcm_to_opus_frames -- pyav bundles libopus on Windows.
     try:
-        import opuslib  # type: ignore[import-not-found]
+        import av  # type: ignore[import-not-found]
+        import numpy as np  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover - bare box only
         raise RuntimeError(
-            "opuslib unavailable for TTS (install libopus). Original: {}".format(exc)
+            "pyav/numpy unavailable for TTS opus encode. Original: {}".format(exc)
         ) from exc
 
-    encoder = opuslib.Encoder(
-        OUTPUT_SAMPLE_RATE, OUTPUT_CHANNELS, opuslib.APPLICATION_VOIP
-    )
+    codec = av.CodecContext.create("opus", "w")
+    codec.sample_rate = OUTPUT_SAMPLE_RATE
+    codec.layout = "mono" if OUTPUT_CHANNELS == 1 else "stereo"
+    codec.format = "s16"
+    codec.bit_rate = OUTPUT_BITRATE_BPS
     try:
-        encoder.bitrate = OUTPUT_BITRATE_BPS
-    except Exception:
-        pass
-    try:
-        encoder.vbr = False
+        codec.options = {"vbr": "off", "application": "voip"}
     except Exception:
         pass
 
     bytes_per_frame = BYTES_PER_FRAME
     samples_per_frame = SAMPLES_PER_FRAME
+    pts = 0
+    layout_name = codec.layout.name
 
     started = time.monotonic()
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
@@ -294,29 +355,170 @@ async def synthesize_to_opus_frames(
                 while len(pcm_carry) >= bytes_per_frame:
                     frame_pcm = pcm_carry[:bytes_per_frame]
                     pcm_carry = pcm_carry[bytes_per_frame:]
+                    samples = np.frombuffer(frame_pcm, dtype=np.int16).copy()
+                    frame = av.AudioFrame.from_ndarray(
+                        samples.reshape(1, -1), format="s16", layout=layout_name
+                    )
+                    frame.sample_rate = OUTPUT_SAMPLE_RATE
+                    frame.pts = pts
+                    pts += samples_per_frame
                     try:
-                        packet = encoder.encode(frame_pcm, samples_per_frame)
+                        for packet in codec.encode(frame):
+                            pkt_bytes = bytes(packet)
+                            if pkt_bytes:
+                                yield pkt_bytes
                     except Exception as exc:
                         logger.warning(
                             "fleet_voice TTS encode failure mid-stream: %s", exc
                         )
                         continue
-                    if packet:
-                        yield packet
     # Flush trailing partial frame: pad with zeros to one full frame so we
-    # don't truncate the last syllable's tail. This is one extra 20 ms Opus
-    # packet at most; the device will treat it as silence.
+    # don't truncate the last syllable's tail.
     if pcm_carry:
         padded = pcm_carry + (b"\x00" * (bytes_per_frame - len(pcm_carry)))
+        samples = np.frombuffer(padded, dtype=np.int16).copy()
+        frame = av.AudioFrame.from_ndarray(
+            samples.reshape(1, -1), format="s16", layout=layout_name
+        )
+        frame.sample_rate = OUTPUT_SAMPLE_RATE
+        frame.pts = pts
         try:
-            packet = encoder.encode(padded, samples_per_frame)
+            for packet in codec.encode(frame):
+                pkt_bytes = bytes(packet)
+                if pkt_bytes:
+                    yield pkt_bytes
         except Exception as exc:
             logger.warning("fleet_voice TTS final-frame encode failure: %s", exc)
-        else:
-            if packet:
-                yield packet
+    # Drain encoder.
+    try:
+        for packet in codec.encode(None):
+            pkt_bytes = bytes(packet)
+            if pkt_bytes:
+                yield pkt_bytes
+    except Exception:
+        pass
     elapsed_ms = int((time.monotonic() - started) * 1000)
     logger.info(
         "fleet_voice TTS synthesis complete chars=%d elapsed_ms=%d",
         len(text), elapsed_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs TTS streaming
+# ---------------------------------------------------------------------------
+
+
+async def _synthesize_elevenlabs_to_opus_frames(
+    text: str,
+    *,
+    voice: str | None = None,
+    model: str | None = None,
+) -> AsyncIterator[bytes]:
+    """Stream ``text`` through ElevenLabs and yield 16 kHz mono Opus frames.
+
+    Uses the ``pcm_16000`` output format (mono int16 LE 16 kHz) which matches
+    OUTPUT_SAMPLE_RATE — no resample needed (compare OpenAI which delivers
+    24 kHz and forces a downsample). Same pyav opus encoder pattern as the
+    OpenAI path so the wire shape is identical at the device end.
+    """
+    if not ELEVENLABS_API_KEY:
+        logger.warning(
+            "fleet_voice TTS: ELEVENLABS_API_KEY unset; skipping synthesis"
+        )
+        return
+
+    voice_id = voice or ELEVENLABS_VOICE_ID
+    payload = {
+        "text": text,
+        "model_id": model or ELEVENLABS_MODEL,
+    }
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/pcm",
+    }
+    url = ELEVENLABS_TTS_URL.format(voice_id=voice_id)
+
+    try:
+        import av  # type: ignore[import-not-found]
+        import numpy as np  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise RuntimeError(
+            "pyav/numpy unavailable for TTS opus encode. Original: {}".format(exc)
+        ) from exc
+
+    codec = av.CodecContext.create("opus", "w")
+    codec.sample_rate = OUTPUT_SAMPLE_RATE
+    codec.layout = "mono" if OUTPUT_CHANNELS == 1 else "stereo"
+    codec.format = "s16"
+    codec.bit_rate = OUTPUT_BITRATE_BPS
+    try:
+        codec.options = {"vbr": "off", "application": "voip"}
+    except Exception:
+        pass
+
+    bytes_per_frame = BYTES_PER_FRAME
+    samples_per_frame = SAMPLES_PER_FRAME
+    pts = 0
+    layout_name = codec.layout.name
+    pcm_carry = b""
+
+    started = time.monotonic()
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+        async with client.stream("POST", url, headers=headers, json=payload) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes():
+                if not chunk:
+                    continue
+                # ElevenLabs returns PCM directly at 16 kHz mono int16 LE.
+                pcm_carry += chunk
+                while len(pcm_carry) >= bytes_per_frame:
+                    frame_pcm = pcm_carry[:bytes_per_frame]
+                    pcm_carry = pcm_carry[bytes_per_frame:]
+                    samples = np.frombuffer(frame_pcm, dtype=np.int16).copy()
+                    frame = av.AudioFrame.from_ndarray(
+                        samples.reshape(1, -1), format="s16", layout=layout_name
+                    )
+                    frame.sample_rate = OUTPUT_SAMPLE_RATE
+                    frame.pts = pts
+                    pts += samples_per_frame
+                    try:
+                        for packet in codec.encode(frame):
+                            pkt_bytes = bytes(packet)
+                            if pkt_bytes:
+                                yield pkt_bytes
+                    except Exception as exc:
+                        logger.warning(
+                            "fleet_voice TTS encode failure mid-stream: %s", exc
+                        )
+                        continue
+
+    if pcm_carry:
+        padded = pcm_carry + (b"\x00" * (bytes_per_frame - len(pcm_carry)))
+        samples = np.frombuffer(padded, dtype=np.int16).copy()
+        frame = av.AudioFrame.from_ndarray(
+            samples.reshape(1, -1), format="s16", layout=layout_name
+        )
+        frame.sample_rate = OUTPUT_SAMPLE_RATE
+        frame.pts = pts
+        try:
+            for packet in codec.encode(frame):
+                pkt_bytes = bytes(packet)
+                if pkt_bytes:
+                    yield pkt_bytes
+        except Exception as exc:
+            logger.warning("fleet_voice TTS final-frame encode failure: %s", exc)
+    try:
+        for packet in codec.encode(None):
+            pkt_bytes = bytes(packet)
+            if pkt_bytes:
+                yield pkt_bytes
+    except Exception:
+        pass
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    logger.info(
+        "fleet_voice TTS (elevenlabs) synthesis complete chars=%d elapsed_ms=%d "
+        "voice=%s model=%s",
+        len(text), elapsed_ms, voice_id, payload["model_id"],
     )
