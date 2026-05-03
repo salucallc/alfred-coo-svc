@@ -344,14 +344,20 @@ DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 # orchestrator's wave-0..N tickets are expected to target. To extend: add a
 # new entry below. Project IDs are stable Linear UUIDs (see Linear API
 # `projects { nodes { id, name } }`).
+# SAL-4121 (2026-05-03): widened per drift-sweep audit; see
+# Z:/_planning/drift-sweep-triage-2026-05-03.md. Cross-repo entries below
+# reflect legitimate substrate work (plugin surface, soul-svc federation,
+# portal-side cockpit UX, tiresias-side MC GA) — not ticket-routing bugs.
 ORCHESTRATOR_REPO_SCOPE: Dict[str, frozenset[str]] = {
     # Mission Control v1.0 GA — Tiresias + Aletheia + Fleet + Ops + Soul-gap
     "8c1d8f69-359d-457a-a11c-2e650863774c": frozenset({
         "salucallc/alfred-coo-svc",
+        "salucallc/tiresias",
     }),
     # Cockpit Consumer UX
     "5a014234-df36-47a0-9abb-eac093e27539": frozenset({
         "salucallc/alfred-coo-svc",
+        "salucallc/alfred-portal",
     }),
     # MSSP Extraction
     "39e340a8-26d2-4439-8582-caf94a263c7e": frozenset({
@@ -360,10 +366,13 @@ ORCHESTRATOR_REPO_SCOPE: Dict[str, frozenset[str]] = {
     # MSSP Federation
     "a9d93b23-96b4-4a77-be18-b709f72fa3ce": frozenset({
         "salucallc/alfred-coo-svc",
+        "salucallc/soul-svc",
     }),
     # Agent Ingest — Plugin surface
     "9db00c4f-17a4-4b7a-8cd8-ea62f45d55b8": frozenset({
         "salucallc/alfred-coo-svc",
+        "salucallc/saluca-plugins",
+        "salucallc/alfred-portal",
     }),
 }
 # Slack `#batcave` Tier-2 alert threshold — emit one alert per dispatch cycle
