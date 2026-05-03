@@ -213,6 +213,36 @@ def test_parse_target_handles_linear_markdown_round_trip() -> None:
     assert parsed["notes"].startswith("(auto-derived")
 
 
+def test_parse_target_unwraps_tiptap_autolink_markdown_links() -> None:
+    """SAL-4100: Tiptap (Linear's editor) auto-linkifies bare strings that
+    look like URLs. A bullet ``- README.md`` POSTed via API may come back
+    as ``- [README.md](<http://README.md>)`` after a save-load round-trip
+    through the web UI. Reproduced 2026-05-03 on SAL-3975 [MC-AIO-W1-D]:
+    the parser extracted the literal markdown-link string as the path,
+    builders dispatched against a non-existent
+    ``[README.md](<http://README.md>)`` filename, every retry burned a
+    wave-retry budget slot.
+    """
+    body = (
+        "## Target\n"
+        "\n"
+        "owner: salucallc\n"
+        "repo: tiresias-platform\n"
+        "paths:\n"
+        "\n"
+        "- [README.md](<http://README.md>)\n"
+        "new_paths:\n"
+        "\n"
+        "- Dockerfile\n"
+        "- [docs/index.md](<http://docs/index.md>)\n"
+        "base_branch: main\n"
+    )
+    parsed = _parse_target_from_ticket_body(body)
+    assert parsed is not None
+    assert parsed["paths"] == ("README.md",)
+    assert parsed["new_paths"] == ("Dockerfile", "docs/index.md")
+
+
 # ── 2. Parser rejection paths ────────────────────────────────────────
 
 

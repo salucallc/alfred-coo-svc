@@ -6960,6 +6960,16 @@ class AutonomousBuildOrchestrator:
         # retry-1 kickoff 9e335979 (kimi-k2-thinking:cloud http_get loop).
         if result.get("silent_with_tools") is True:
             return True
+        # SAL-4100 (2026-05-03): dispatch.py sets `silent_no_tools=True` when
+        # the model returned no tool_calls AND no terminal tool ever fired.
+        # gpt-oss:120b-cloud silent-completed SAL-3971 in 7s with chatty
+        # `content` text but zero tool_calls; the empty-text check at the
+        # bottom returned False, the fallback-chain rotation never fired,
+        # and the ticket burned its wave-retry budget on the same failing
+        # model. Treating the flag as silent-complete routes the failure
+        # through the existing builder.fallback_chain rotation path.
+        if result.get("silent_no_tools") is True:
+            return True
         summary = result.get("summary")
         content = result.get("content")
         # Either field can carry the textual summary depending on persona.

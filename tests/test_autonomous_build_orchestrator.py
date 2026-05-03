@@ -1269,6 +1269,20 @@ async def test_poll_children_marks_failed_when_no_pr_url(monkeypatch):
         {"silent_with_tools": True},
         True, "silent_with_tools_minimal",
     ),
+    # SAL-4100: silent_no_tools=True must short-circuit to silent even when
+    # `content` carries chatty text — this is the gpt-oss 7-second silent-
+    # complete pattern that slipped past the empty-text check below.
+    (
+        {"silent_no_tools": True,
+         "content": "I'll work on this ticket. Let me start by ...",
+         "tool_calls": []},
+        True, "silent_no_tools_with_chatty_content",
+    ),
+    # SAL-4100: silent_no_tools without supplementary content (defensive).
+    (
+        {"silent_no_tools": True},
+        True, "silent_no_tools_minimal",
+    ),
 ])
 def test_envelope_is_silent_complete_classification(envelope, expected, case):
     """SAL-2978: shape classifier covers truncated, empty-summary, non-dict
