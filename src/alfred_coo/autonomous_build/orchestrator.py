@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -287,6 +288,187 @@ def _resolve_existing_pr_window_sec() -> int:
 
 PR_EXISTS_FRESH_PR_WINDOW_SEC = _resolve_existing_pr_window_sec()
 HAWKMAN_LOGIN = "salucatiresias"
+
+
+# ── SAL-4148: already-shipped-skip dispatch predicate ───────────────────────
+#
+# Companion to SAL-4115 (existing-open-PR detect): SAL-4115 catches OPEN PRs
+# at dispatch time, but does NOT detect tickets whose work was already
+# MERGED to ``main`` of the target repo (e.g. via a sibling parallel
+# orchestrator run, or by a manual operator commit referencing the ticket
+# key in the commit message). The 2026-04-26 → 2026-04-28 NEEDS_REWORK
+# triage showed 12 of 15 stale-PR cases were duplicate work where main
+# had already received the change. ``_ticket_has_merged_pr`` (Gap 4,
+# 2026-04-29) catches the GitHub-PR-search variant of this; SAL-4148
+# adds the strictly-stronger git-log variant: if any commit on
+# ``origin/main`` of the target repo's local clone mentions the ticket
+# key, the ticket is treated as already-shipped and dispatch is skipped.
+#
+# Env gates:
+#   - ALREADY_SHIPPED_SKIP_ENABLED  (default ``true``) — set to ``false``
+#     to make the predicate inert WITHOUT a code change. Useful during
+#     incident remediation if the predicate over-fires (e.g. ticket key
+#     accidentally matches an unrelated revert commit message).
+#   - ALREADY_SHIPPED_REPO_ROOT     (default ``/opt/alfred-coo/repos``) —
+#     filesystem path containing the local clones the predicate walks.
+#     Each repo is expected at ``<root>/<repo-name>`` (no owner segment;
+#     mirrors the daemon's existing checkout layout). Override for tests
+#     or alternate deployment topologies.
+
+
+def _resolve_already_shipped_skip_enabled() -> bool:
+    """Read ``ALREADY_SHIPPED_SKIP_ENABLED`` (SAL-4148) and return whether
+    the predicate is active. Default ``True``. Any value other than the
+    canonical truthy set (``true``/``1``/``yes``/``on``, case-insensitive)
+    disables the predicate. Empty / unset → enabled.
+    """
+    raw = os.environ.get("ALREADY_SHIPPED_SKIP_ENABLED", "").strip().lower()
+    if not raw:
+        return True
+    return raw in ("true", "1", "yes", "on")
+
+
+def _resolve_already_shipped_repo_root() -> str:
+    """Read ``ALREADY_SHIPPED_REPO_ROOT`` (SAL-4148) and return the on-disk
+    path under which the orchestrator looks for local repo clones. Default
+    ``/opt/alfred-coo/repos``. The dispatch-loop predicate needs a
+    filesystem checkout to run ``git log`` against; this resolver lets
+    operators relocate the checkout root without a code change.
+    """
+    raw = os.environ.get("ALREADY_SHIPPED_REPO_ROOT", "").strip()
+    return raw or "/opt/alfred-coo/repos"
+
+
+ALREADY_SHIPPED_GIT_LOG_LIMIT = 5
+
+
+def _ticket_has_main_commit(
+    ticket_ident: str,
+    owner_repo: str,
+    *,
+    repo_root: Optional[str] = None,
+    runner: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
+) -> Optional[str]:
+    """Return the SHA of a commit on ``main`` mentioning ``ticket_ident``
+    in its commit message, else ``None``. SAL-4148 already-shipped-skip
+    dispatch predicate (companion to SAL-4115).
+
+    The ticket is considered already-shipped when the target repo's local
+    clone contains at least one commit reachable from ``origin/main``
+    (or ``main`` if ``origin/main`` is absent — ``git log`` walks both
+    via the ``main`` ref) whose message body matches the ticket key under
+    ``--grep``. A non-empty ``git log`` result returns the first SHA
+    encountered; empty stdout returns ``None`` and dispatch proceeds.
+
+    Parameters
+    ----------
+    ticket_ident
+        Linear ticket identifier, e.g. ``SAL-4148``. Used as the
+        ``--grep`` pattern. Empty / falsy values short-circuit to ``None``
+        so an unhydrated ticket never triggers a false skip.
+    owner_repo
+        ``"owner/repo"`` string parsed from the ticket's ``## Target``
+        block (or the ``_TARGET_HINTS`` fallback). The owner segment is
+        stripped — the predicate looks for ``<repo_root>/<repo-name>`` on
+        disk (mirrors the daemon's existing checkout layout).
+    repo_root
+        Override for the on-disk root containing local clones. Defaults
+        to :func:`_resolve_already_shipped_repo_root`. Tests override this
+        to point at a tmp_path checkout.
+    runner
+        Override for ``subprocess.run``. Tests inject a stub that returns
+        a configurable ``CompletedProcess`` so the predicate can be
+        exercised without spawning ``git``. Production callers leave this
+        as ``None`` so the canonical ``subprocess.run`` is used.
+
+    Behaviour
+    ---------
+    * Env-gate: if ``ALREADY_SHIPPED_SKIP_ENABLED`` is ``false``, returns
+      ``None`` immediately WITHOUT invoking the runner. This keeps the
+      predicate inert under operator override and lets tests pin the
+      env-gated short-circuit without monkeypatching subprocess.
+    * Empty ``ticket_ident`` or ``owner_repo`` → returns ``None``. Dispatch
+      proceeds; the v7aj no-hint excusal path handles the missing-target
+      case downstream.
+    * Repo path missing on disk → returns ``None``. The orchestrator's
+      hint-verification step (``_verify_wave_hints`` / ``REPO_MISSING``)
+      already handles missing-repo dispatch refusal; this predicate
+      stays a strict additional skip layer rather than duplicating that
+      escalation.
+    * ``git log`` non-zero exit → returns ``None``. A transient git
+      failure must NOT cause an over-skip; fail-OPEN to dispatch. The
+      exception is logged at the call site.
+    * ``git log`` stdout empty → returns ``None``. No commit references
+      this ticket; dispatch proceeds.
+    * ``git log`` stdout populated → returns the leading whitespace-
+      trimmed SHA from the first line of stdout. Caller logs + emits
+      structured event.
+
+    The five-line ``-n 5`` cap on ``git log`` keeps the predicate cheap
+    even on large monorepos. The first match wins; the dispatch site
+    only needs ``some commit, any commit`` evidence to skip — not a
+    full enumeration.
+    """
+    if not ticket_ident or not owner_repo:
+        return None
+    if not _resolve_already_shipped_skip_enabled():
+        return None
+
+    # Strip owner segment if present — the daemon's checkout layout is
+    # ``<root>/<repo-name>``, NOT ``<root>/<owner>/<repo-name>``.
+    repo_name = owner_repo.split("/", 1)[-1].strip()
+    if not repo_name:
+        return None
+
+    root = repo_root if repo_root is not None else _resolve_already_shipped_repo_root()
+    repo_path = os.path.join(root, repo_name)
+    if not os.path.isdir(repo_path):
+        # Repo not checked out locally — predicate cannot fire. Fail-OPEN
+        # to dispatch (the orchestrator's hint-verification step catches
+        # genuinely-missing repos via the REPO_MISSING path).
+        return None
+
+    run_fn = runner if runner is not None else subprocess.run
+    try:
+        result = run_fn(
+            [
+                "git", "log", "main",
+                "--grep", ticket_ident,
+                "--oneline",
+                "-n", str(ALREADY_SHIPPED_GIT_LOG_LIMIT),
+            ],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        # Fail-OPEN: a transient git failure should NOT cause us to skip a
+        # legitimate dispatch. Caller can rely on this returning None for
+        # "I do not know" as well as "I know there is no commit".
+        logger.exception(
+            "[already-shipped-skip] git log raised for %s in %s; "
+            "treating as no-commit and proceeding with dispatch",
+            ticket_ident, repo_path,
+        )
+        return None
+
+    if getattr(result, "returncode", 0) != 0:
+        return None
+
+    stdout = (getattr(result, "stdout", "") or "").strip()
+    if not stdout:
+        return None
+
+    # First line of `--oneline` is `<sha> <subject>`. Take the first
+    # whitespace-delimited token as the SHA. Defensive against trailing
+    # whitespace and CR injection.
+    first_line = stdout.splitlines()[0].strip()
+    sha = first_line.split(None, 1)[0] if first_line else ""
+    return sha or None
+
+
 
 
 @dataclass(frozen=True)
@@ -4776,6 +4958,66 @@ class AutonomousBuildOrchestrator:
                     # ``_update_linear_state`` and swallowed — the local
                     # graph remains source of truth, and the stale-sweep
                     # / restore paths reconcile on the next run.
+                    await self._update_linear_state(ticket, "Done")
+                    continue
+                # SAL-4148 (2026-05-03): already-shipped-skip dispatch
+                # predicate (companion to SAL-4115). Strictly STRONGER
+                # than ``_ticket_has_merged_pr``: rather than asking
+                # GitHub Search for a merged PR mentioning the ticket,
+                # we walk the local clone's ``git log main --grep
+                # <ticket>`` and skip dispatch if ANY commit on main
+                # references this ticket key. Catches the case where a
+                # sibling parallel orchestrator merged the work via a
+                # PR whose title did not exactly match the search
+                # heuristic, or where an operator hand-merged a fix
+                # referencing the ticket key. Env-gated:
+                # ``ALREADY_SHIPPED_SKIP_ENABLED=false`` makes the
+                # predicate inert. Resolver + helper documented above.
+                already_shipped_sha: Optional[str] = None
+                already_shipped_owner_repo: Optional[str] = None
+                try:
+                    _hint, _hint_source = _resolve_target_hint(ticket)
+                    if _hint is not None and _hint.owner and _hint.repo:
+                        already_shipped_owner_repo = (
+                            f"{_hint.owner}/{_hint.repo}"
+                        )
+                        already_shipped_sha = _ticket_has_main_commit(
+                            ticket.identifier,
+                            already_shipped_owner_repo,
+                        )
+                except Exception:
+                    # Defensive: a predicate exception MUST NOT break
+                    # dispatch. Log + fall through to the legacy path.
+                    logger.exception(
+                        "[already-shipped-skip] predicate raised for %s; "
+                        "treating as no-commit and proceeding with dispatch",
+                        ticket.identifier,
+                    )
+                    already_shipped_sha = None
+                if already_shipped_sha:
+                    self._merged_pr_skips += 1
+                    logger.info(
+                        "already-shipped-skip ticket=%s repo=%s commit=%s "
+                        "action=skip (skips=%d)",
+                        ticket.identifier,
+                        already_shipped_owner_repo or "?",
+                        already_shipped_sha,
+                        self._merged_pr_skips,
+                    )
+                    self.state.record_event(
+                        "already_shipped_skip",
+                        identifier=ticket.identifier,
+                        repo=already_shipped_owner_repo,
+                        commit=already_shipped_sha,
+                        action="skip",
+                        skips_total=self._merged_pr_skips,
+                    )
+                    # Reuse the merged-PR-skip terminal: the ticket has
+                    # already shipped, so MERGED_GREEN + Linear "Done"
+                    # is the correct end-state. Avoids parking the
+                    # ticket in AWAITING_REVIEW (which would need a
+                    # PR + reviewer that no longer exist).
+                    ticket.status = TicketStatus.MERGED_GREEN
                     await self._update_linear_state(ticket, "Done")
                     continue
                 # SAL-3038 (2026-04-28): if an open PR for this ticket is
