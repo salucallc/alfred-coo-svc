@@ -88,6 +88,20 @@ class TicketStatus(str, Enum):
     # respawn-path mirror at line ~6910) where the orchestrator never had a
     # workable scope.
     ABANDONED = "abandoned"
+    # SAL-4101 (2026-05-03): a ticket whose review loop has fired N
+    # consecutive REQUEST_CHANGES verdicts from the same QA persona on the
+    # same PR with overlapping gate-failure citations (e.g. same `Gate 1`
+    # token in 3+ consecutive review bodies). Production evidence: PR #279
+    # / SAL-3243 sat in this loop for 4 days with 7 consecutive same-gate
+    # CHANGES_REQUESTED reviews until manually closed. TRIAGE_NEEDED is the
+    # orchestrator-side terminal-non-failure escape hatch: stop respawning
+    # the builder, mark the Linear ticket Triage, and surface a Tier-2
+    # #batcave alert. Distinct from FAILED (which is "we tried and the
+    # builder couldn't ship") and ESCALATED (which is "the persona's own
+    # escalate path fired"); TRIAGE_NEEDED is "the builder *can* ship a PR
+    # but Hawkman keeps rejecting on the same gate, structural human review
+    # is required".
+    TRIAGE_NEEDED = "triage_needed"
 
 
 # Terminal states — once a ticket lands here the wave loop stops polling it.
@@ -99,6 +113,7 @@ TERMINAL_STATES: frozenset[TicketStatus] = frozenset(
         TicketStatus.FAILED,
         TicketStatus.ESCALATED,  # SAL-2886
         TicketStatus.ABANDONED,  # SAL-3676
+        TicketStatus.TRIAGE_NEEDED,  # SAL-4101
     }
 )
 

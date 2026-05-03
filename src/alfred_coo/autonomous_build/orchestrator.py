@@ -321,6 +321,78 @@ DEFAULT_STATUS_CHANNEL = "C0ASAKFTR1C"  # #batcave
 # or surface that human review is needed.
 MAX_REVIEW_CYCLES = 2
 
+# SAL-4101 (substrate doctor, retry-loop side, 2026-05-03): when the
+# orchestrator's review-loop handler sees N consecutive REQUEST_CHANGES
+# verdicts from the same QA persona on the same PR with overlapping
+# gate-failure citations (e.g. same `Gate 1` token in 3+ consecutive
+# review bodies), the ticket is force-coerced to TRIAGE_NEEDED instead of
+# being respawned. Production trigger: PR #279 / SAL-3243 sat in this
+# loop for 4 days with 7 consecutive same-gate CHANGES_REQUESTED reviews
+# until manually closed. Threshold env-overridable; default 3.
+#
+# Note: this trips even WITHIN MAX_REVIEW_CYCLES — they are independent
+# circuits. MAX_REVIEW_CYCLES bounds total respawn attempts; this bound
+# kicks in earlier when the failures are *structurally identical* (same
+# gate citation), avoiding a wasted cycle on a known-unfixable pattern.
+TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD_DEFAULT = 3
+
+
+def _triage_needed_gate_repeat_threshold() -> int:
+    """Resolve ``TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD`` from env at call
+    time so tests + ops overrides (``export
+    TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD=5``) take effect without a process
+    restart. Falls back to the module default on missing / unparseable /
+    non-positive values (a 0 or negative threshold would coerce on the
+    very first REQUEST_CHANGES, which is never the desired semantics).
+    """
+    raw = os.getenv("TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD")
+    if not raw:
+        return TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD_DEFAULT
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD_DEFAULT
+    if n <= 0:
+        return TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD_DEFAULT
+    return n
+
+
+# SAL-4101: compiled regex to extract ``Gate <token>`` citations from a
+# review body. Matches Hawkman's canonical citation forms:
+#   "Gate 1"      → "Gate 1"      (numeric)
+#   "Gate 5a"     → "Gate 5a"     (numeric+suffix)
+#   "Gate A"      → "Gate A"      (alpha; rarer but present in some specs)
+#   "gate-1"      → "Gate 1"      (normalized)
+# Case-insensitive on the leading "Gate" token; the trailing identifier is
+# normalized to lowercase so "Gate 1" and "gate 1" hash to the same key.
+# Lookahead/lookbehind avoid matching mid-word tokens like "Investigate".
+_GATE_CITATION_RE = re.compile(
+    r"(?<![A-Za-z])gate[\s\-_:]*([0-9]+[a-z]?|[a-z])\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_gate_citations(body: str) -> frozenset[str]:
+    """Return the set of normalized ``gate <token>`` citations in ``body``.
+
+    Tokens are normalized to lowercase to make the comparison
+    case-insensitive (``Gate 1`` and ``gate 1`` collapse). Returns an
+    empty frozenset on empty/None input. Stable across calls — Hawkman's
+    citation form is regex-extractable; if the format ever drifts the
+    consequence is the doctor signal silently no-ops (set never matches
+    across reviews → counter never increments → existing
+    ``MAX_REVIEW_CYCLES`` cap remains the backstop).
+    """
+    if not body or not isinstance(body, str):
+        return frozenset()
+    seen: set[str] = set()
+    for m in _GATE_CITATION_RE.finditer(body):
+        tok = (m.group(1) or "").strip().lower()
+        if tok:
+            seen.add(f"gate {tok}")
+    return frozenset(seen)
+
+
 # AB-08: compiled regexes for verdict extraction. Safety-net only — the
 # explicit pr_review tool-call path (see _extract_verdict) has higher
 # precedence and remains the canonical channel.
@@ -7550,6 +7622,20 @@ class AutonomousBuildOrchestrator:
             return
 
         if verdict == "REQUEST_CHANGES":
+            # SAL-4101 (substrate doctor, retry-loop side): check the
+            # same-gate-streak counter BEFORE the MAX_REVIEW_CYCLES cap so
+            # tickets whose failures are structurally identical surface as
+            # TRIAGE_NEEDED (clear signal-to-human) rather than generic
+            # FAILED. Operates orthogonally to MAX_REVIEW_CYCLES — both
+            # are independent circuits; whichever trips first wins.
+            review_body_for_triage = self._extract_review_body(result)
+            triage_fired = await self._maybe_coerce_triage_needed(
+                ticket, review_body_for_triage
+            )
+            if triage_fired:
+                updated.append(ticket)
+                return
+
             if ticket.review_cycles >= MAX_REVIEW_CYCLES:
                 ticket.status = TicketStatus.FAILED
                 self.state.record_event(
@@ -7658,6 +7744,148 @@ class AutonomousBuildOrchestrator:
                 ticket.identifier,
             )
         updated.append(ticket)
+
+    # ── SAL-4101: retry-loop coercion to TRIAGE_NEEDED ──────────────────────
+
+    @staticmethod
+    def _gate_repeat_state_key(
+        ticket: Ticket, qa_persona: str = "hawkman-qa-a"
+    ) -> str:
+        """Stable composite key for ``state.consecutive_same_gate_skips``.
+
+        Keyed on ``(ticket_uuid, pr_url, qa_persona)`` so a fresh PR for
+        the same ticket starts a clean counter, and a hypothetical second
+        QA persona reviewing the same PR doesn't pollute the first
+        persona's streak. ``pr_url`` is normalized to the empty string when
+        absent so a transitional state (PR closed but ticket still in
+        REVIEWING) doesn't crash the keying.
+        """
+        pr_url = (getattr(ticket, "pr_url", None) or "").strip()
+        return f"{ticket.id}|{pr_url}|{qa_persona}"
+
+    async def _maybe_coerce_triage_needed(
+        self, ticket: Ticket, review_body: str,
+    ) -> bool:
+        """SAL-4101 retry-loop coercion.
+
+        Inspect the freshly-extracted ``review_body`` for ``Gate <token>``
+        citations. Compare against the most recent record kept on
+        ``state.consecutive_same_gate_skips``. If any token overlaps, the
+        per-(ticket, PR, persona) counter is incremented; otherwise the
+        record is reset to the current citation set with count=1.
+
+        When the count reaches
+        ``TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD`` (default 3, env-overridable
+        via ``TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD``), the ticket is moved
+        to ``TicketStatus.TRIAGE_NEEDED``, Linear is updated to the
+        ``Triage`` workflow state, a Tier-2 ``#batcave`` Slack alert is
+        emitted (best-effort), and ``True`` is returned so the caller
+        skips the respawn + cycle-counter bump and exits the wave-retry
+        loop without consuming further budget.
+
+        Returns ``False`` (the no-op path) when:
+          - the review body contains no extractable gate citation,
+          - the citation does not overlap with the prior streak,
+          - the threshold has not yet been crossed.
+
+        On the no-op path the bookkeeping is still updated so the next
+        review can detect the streak — this method has the side effect of
+        recording the latest citation regardless of whether it coerces.
+        """
+        citations = _extract_gate_citations(review_body or "")
+        key = self._gate_repeat_state_key(ticket)
+        prior = (self.state.consecutive_same_gate_skips or {}).get(key) or {}
+        prior_gate = (prior.get("gate") or "").strip().lower() if isinstance(
+            prior, dict
+        ) else ""
+        prior_count = int(prior.get("count") or 0) if isinstance(prior, dict) else 0
+
+        # No citation → reset to a fresh empty record. The previous gate's
+        # streak does not survive a review that didn't cite anything
+        # (could be a different failure pattern entirely).
+        if not citations:
+            if prior_count:
+                self.state.consecutive_same_gate_skips[key] = {
+                    "gate": "",
+                    "count": 0,
+                }
+            return False
+
+        # If the prior gate is in the new citation set, the streak
+        # continues on that gate. Otherwise pick the alphabetically-first
+        # citation from the new set as the streak's anchor (deterministic
+        # so tests don't flake on dict ordering) and reset the counter.
+        if prior_gate and prior_gate in citations:
+            new_gate = prior_gate
+            new_count = prior_count + 1
+        else:
+            new_gate = sorted(citations)[0]
+            new_count = 1
+
+        self.state.consecutive_same_gate_skips[key] = {
+            "gate": new_gate,
+            "count": new_count,
+        }
+
+        threshold = _triage_needed_gate_repeat_threshold()
+        if new_count < threshold:
+            return False
+
+        # Threshold crossed → coerce to TRIAGE_NEEDED.
+        ticket.status = TicketStatus.TRIAGE_NEEDED
+        # Clear the stale review task pointer so a future re-open of the
+        # PR (after human triage) does not leave a dangling pointer.
+        ticket.review_task_id = None
+        self.state.review_task_ids.pop(ticket.id, None)
+        self.state.record_event(
+            "ticket_triage_needed",
+            identifier=ticket.identifier,
+            pr_url=ticket.pr_url,
+            gate=new_gate,
+            count=new_count,
+            threshold=threshold,
+        )
+        logger.warning(
+            "[SAL-4101] %s coerced to TRIAGE_NEEDED: %d consecutive "
+            "REQUEST_CHANGES on PR %s citing %s (threshold=%d)",
+            ticket.identifier, new_count, ticket.pr_url or "(no PR)",
+            new_gate, threshold,
+        )
+        await self._update_linear_state(ticket, "Triage")
+        await self._post_triage_needed_alert(
+            ticket, gate=new_gate, count=new_count, threshold=threshold,
+        )
+        return True
+
+    async def _post_triage_needed_alert(
+        self,
+        ticket: Ticket,
+        *,
+        gate: str,
+        count: int,
+        threshold: int,
+    ) -> None:
+        """Emit a Tier-2 ``#batcave`` alert announcing the TRIAGE_NEEDED
+        coercion. Best-effort: a Slack outage must not block the state
+        transition (the orchestrator is the source of truth, the alert is
+        the signal-to-human). Mirrors the cadence.post failure pattern
+        used elsewhere for auto-rollback alerts.
+        """
+        msg = (
+            f":rotating_light: [SAL-4101 TRIAGE_NEEDED] "
+            f"{ticket.identifier} {ticket.code or ''} — "
+            f"{count} consecutive REQUEST_CHANGES citing `{gate}` "
+            f"on PR {ticket.pr_url or '(no PR)'} "
+            f"(threshold={threshold}). Builder respawn halted; "
+            f"Linear moved to Triage. Human review required."
+        )
+        try:
+            await self.cadence.post(msg)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "cadence.post(triage_needed) failed for %s; continuing",
+                ticket.identifier,
+            )
 
     @staticmethod
     def _extract_review_body(result: Dict[str, Any]) -> str:
