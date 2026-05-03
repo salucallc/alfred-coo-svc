@@ -423,6 +423,17 @@ _TARGET_KV_RE = re.compile(
 # a save-load cycle through the web UI, so we accept either marker.
 _TARGET_LIST_ITEM_RE = re.compile(r"^\s*[-*]\s+(?P<item>.+?)\s*$")
 
+# SAL-4100 (2026-05-03): Tiptap (Linear's editor) auto-linkifies bare
+# strings that look like URLs. A bullet ``- README.md`` POSTed via API
+# may come back as ``- [README.md](<http://README.md>)`` after a
+# save-load cycle through the web UI, breaking path resolution. Unwrap
+# the markdown-link syntax to recover the link TEXT (which is the
+# original bullet content). Reproduced 2026-05-03 on SAL-3975 [MC-AIO-W1-D]
+# tiresias-platform Dockerfile + GHCR multi-arch — paths block lifted
+# back as ``[README.md](<http://README.md>)``, builder dispatched
+# against a literal ``[README.md](<http://README.md>)`` filename.
+_MARKDOWN_LINK_RE = re.compile(r"^\[(?P<text>[^\]]+)\]\(<?[^>)]+>?\)$")
+
 # Codes that should NEVER come back from a parsed body (they're sentinel
 # placeholders the planner sub may emit for genuinely unresolved tickets).
 # The parser returns ``None`` when it sees them so the resolver falls
@@ -524,6 +535,10 @@ def _parse_target_from_ticket_body(body: Optional[str]) -> Optional[Dict[str, An
                     hash_match = re.search(r"\s+#", item)
                     if hash_match:
                         item = item[: hash_match.start()].rstrip()
+                # SAL-4100: unwrap Tiptap-autolinked markdown link syntax.
+                link_match = _MARKDOWN_LINK_RE.match(item)
+                if link_match:
+                    item = link_match.group("text").strip()
                 if item:
                     current_list.append(item)
                 continue

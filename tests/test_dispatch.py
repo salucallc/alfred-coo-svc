@@ -855,6 +855,113 @@ async def test_silent_with_tools_does_not_fire_for_non_loop_risk_tool(
     assert result.get("truncated") is True
 
 
+# ── SAL-4100: silent_no_tools detection ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_silent_no_tools_flagged_when_model_returns_chatty_content_no_tool_calls(
+    monkeypatch, dispatcher, ctx,
+):
+    """Reproduces SAL-3971 2026-05-03 03:18:10–03:18:17 failure mode:
+    gpt-oss:120b-cloud claimed the task, returned ~7s later with chatty
+    `content` text but ZERO tool_calls. Without the silent_no_tools flag,
+    the orchestrator's `_envelope_is_silent_complete` check passes the
+    text.strip() guard and the fallback-chain rotation never fires — the
+    next dispatch attempt re-uses the same failing model.
+    """
+    from alfred_coo.tools import ToolSpec
+
+    chatty_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "I'll work on this ticket. Let me start by ...",
+                "tool_calls": [],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 50},
+    }
+    transport = _RecordingTransport(responses=[chatty_response])
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _http_get_handler(**kwargs) -> dict:
+        return {"status": 200, "body": "..."}
+
+    tool = ToolSpec(
+        name="http_get", description="fetch URL",
+        parameters={"type": "object", "properties": {}},
+        handler=_http_get_handler,
+    )
+
+    result = await dispatcher.call_with_tools(
+        "gpt-oss:120b-cloud", "sys", "prompt",
+        tools=[tool], context=ctx, max_iterations=12,
+    )
+
+    assert result.get("silent_no_tools") is True
+    assert result["iterations"] == 1
+    assert result["tool_calls"] == []
+    assert "I'll work on this" in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_silent_no_tools_not_flagged_when_terminal_tool_already_called(
+    monkeypatch, dispatcher, ctx,
+):
+    """If a terminal tool (propose_pr) fired in an earlier iteration,
+    a subsequent no-tool-calls return is the model's normal "I'm done
+    summarising" exit, NOT silent-complete. The flag must not fire.
+    """
+    from alfred_coo.tools import ToolSpec
+
+    propose_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_p",
+                    "function": {
+                        "name": "propose_pr",
+                        "arguments": "{\"title\": \"x\"}",
+                    },
+                }],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    summary_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "PR opened at https://github.com/o/r/pull/1",
+                "tool_calls": [],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 10},
+    }
+    transport = _RecordingTransport(responses=[propose_response, summary_response])
+    _install_mock_transport(monkeypatch, transport)
+
+    async def _propose_handler(**kwargs) -> dict:
+        return {"pr_url": "https://github.com/o/r/pull/1"}
+
+    tool = ToolSpec(
+        name="propose_pr", description="open PR",
+        parameters={"type": "object", "properties": {}},
+        handler=_propose_handler,
+    )
+
+    result = await dispatcher.call_with_tools(
+        "qwen3-coder:480b-cloud", "sys", "prompt",
+        tools=[tool], context=ctx, max_iterations=12,
+    )
+
+    assert result.get("silent_no_tools") is not True
+    assert result["iterations"] == 2
+    assert len(result["tool_calls"]) == 1
+
+
 # ── main._peek_size_label + _builder_iteration_cap ──────────────────────
 
 

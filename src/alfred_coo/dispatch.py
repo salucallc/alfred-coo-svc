@@ -1124,7 +1124,20 @@ class Dispatcher:
 
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
-                return {
+                # SAL-4100: silent_no_tools detection. Model returned content
+                # without tool_calls AND no terminal tool (propose_pr /
+                # update_pr / pr_review / github_merge_pr) ever fired across
+                # the dispatch. Reproduced 2026-05-03: gpt-oss:120b-cloud
+                # silent-completed SAL-3971 in 7s with chatty content but
+                # zero tool calls; orchestrator's _envelope_is_silent_complete
+                # passed because content text was non-empty, fallback chain
+                # never rotated, ticket burned its retry budget on the same
+                # failing model. The flag triggers _envelope_is_silent_complete
+                # in the orchestrator regardless of content text, which then
+                # rotates the builder.fallback_chain to the next model.
+                # Distinct from `silent_with_tools` (looping http_get past
+                # threshold) — same recovery semantics, different signature.
+                envelope: dict[str, Any] = {
                     "content": msg.get("content", "") or "",
                     "tokens_in": total_in,
                     "tokens_out": total_out,
@@ -1132,6 +1145,9 @@ class Dispatcher:
                     "tool_calls": tool_call_log,
                     "iterations": iteration + 1,
                 }
+                if not terminal_tool_called:
+                    envelope["silent_no_tools"] = True
+                return envelope
 
             messages.append(msg)
             iteration_tool_names: list[str] = []
