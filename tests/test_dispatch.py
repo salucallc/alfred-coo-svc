@@ -988,6 +988,34 @@ def test_peek_size_label_from_label_tag_in_title():
 def test_peek_size_label_missing_returns_none():
     from alfred_coo.main import _peek_size_label
     assert _peek_size_label({"title": "", "description": ""}) is None
+
+
+def test_peek_size_label_accepts_colon_separator_form():
+    """SAL-4101: `size:M` (colon, not dash) must parse same as `size-M`.
+    Reproduced 2026-05-03 on SAL-2740: a planner sub authored the colon form,
+    the strict dash-only `_SIZE_LABEL_RE` rejected it, and the ticket was
+    eligibility-gated out of dispatch indefinitely. The orchestrator continues
+    to emit only the dash form on its own writes; this is read-side leniency.
+    """
+    from alfred_coo.main import _peek_size_label
+    task = {
+        "title": "[persona:alfred-coo-a] [size:M] SAL-2740 - FastAPI app + routes + middleware",
+        "description": "no Size: line here either",
+    }
+    assert _peek_size_label(task) == "size-m"
+
+
+def test_peek_size_label_colon_form_in_body_falls_through_to_label_regex():
+    """SAL-4101: when `Size:` line is absent but body contains `size:L` token,
+    the label-regex fallback should still match (because there's nothing for
+    `_SIZE_LINE_RE` to find — the colon-form is a different token entirely).
+    """
+    from alfred_coo.main import _peek_size_label
+    task = {
+        "title": "[persona:alfred-coo-a] SAL-9999 - thing",
+        "description": "Wave: 2\nLabels: [size:L, persona:alfred-coo-a]\n",
+    }
+    assert _peek_size_label(task) == "size-l"
     assert _peek_size_label({"title": "no size info anywhere"}) is None
 
 
