@@ -141,28 +141,68 @@ def decode_opus_buffer(opus_frames: list[bytes]) -> bytes:
     """
     if not opus_frames:
         return b""
+    # Use pyav (FFmpeg) for Opus decode; bundles libopus on Windows so we
+    # don't need a separate libopus.dll install. The opuslib pure-Python
+    # binding requires libopus.dll on PATH, which Windows dev boxes lack.
     try:
-        import opuslib  # type: ignore[import-not-found]
+        import av
+        import numpy as np
     except Exception as exc:  # pragma: no cover - exercised only on bare boxes
         raise RuntimeError(
-            "opuslib unavailable (install libopus on Linux: "
-            "`apt-get install libopus0`; on Windows: opuslib needs "
-            "libopus.dll on PATH). Original error: {}".format(exc)
+            "pyav unavailable; pip install av (bundles ffmpeg + libopus). "
+            "Original error: {}".format(exc)
         ) from exc
 
-    decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
-    frame_samples = SAMPLE_RATE * FRAME_MS // 1000
+    # PyAV's Opus decoder always emits 48 kHz output regardless of the
+    # encoder's internal rate (libopus decoder design). We use pyav's
+    # AudioResampler (ffmpeg swresample) to land directly at SAMPLE_RATE
+    # mono int16, so downstream sees a clean 16 kHz PCM blob with no
+    # audioop intermediate. One library, one resampler.
+    codec = av.CodecContext.create("opus", "r")
+    codec.layout = "mono" if CHANNELS == 1 else "stereo"
+
+    target_layout = "mono" if CHANNELS == 1 else "stereo"
+    resampler = av.AudioResampler(
+        format="s16",
+        layout=target_layout,
+        rate=SAMPLE_RATE,
+    )
+
     out: list[bytes] = []
+    detected_sr = None
     for frame in opus_frames:
         if not frame:
             continue
-        # decode() returns raw int16 little-endian PCM bytes for `frame_samples`.
         try:
-            pcm = decoder.decode(frame, frame_samples)
+            packet = av.Packet(frame)
+            for decoded in codec.decode(packet):
+                if detected_sr is None:
+                    detected_sr = decoded.sample_rate
+                    if detected_sr != SAMPLE_RATE:
+                        logger.info(
+                            "fleet_voice STT: pyav decoded Opus at sr=%d, "
+                            "resampling to %d via swresample",
+                            detected_sr, SAMPLE_RATE,
+                        )
+                for resampled in resampler.resample(decoded):
+                    arr = resampled.to_ndarray()
+                    if arr.ndim > 1:
+                        arr = arr[0] if arr.shape[0] == 1 else arr.mean(axis=0).astype(np.int16)
+                    out.append(arr.tobytes())
         except Exception as exc:
             logger.warning("opus decode failed on %d-byte frame: %s", len(frame), exc)
             continue
-        out.append(pcm)
+
+    # Drain any samples held in the resampler buffer.
+    try:
+        for resampled in resampler.resample(None):
+            arr = resampled.to_ndarray()
+            if arr.ndim > 1:
+                arr = arr[0] if arr.shape[0] == 1 else arr.mean(axis=0).astype(np.int16)
+            out.append(arr.tobytes())
+    except Exception:
+        pass
+
     return b"".join(out)
 
 
@@ -312,20 +352,124 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return header + fmt + data
 
 
+# SAL-4006 smoke: env-selectable STT backend. Default is faster-whisper local
+# because saluca-deploy/.env ships an OpenRouter key (no Whisper proxy).
+# Set FLEET_VOICE_STT_BACKEND=openai to restore the cloud path once a real
+# OpenAI key (or Groq via OPENAI_STT_URL override) is in env.
+STT_BACKEND = os.getenv("FLEET_VOICE_STT_BACKEND", "faster_whisper").lower()
+LOCAL_WHISPER_MODEL = os.getenv("FLEET_VOICE_LOCAL_MODEL", "base.en")
+LOCAL_WHISPER_DEVICE = os.getenv("FLEET_VOICE_LOCAL_DEVICE", "cpu")
+LOCAL_WHISPER_COMPUTE = os.getenv("FLEET_VOICE_LOCAL_COMPUTE", "int8")
+
+_local_model = None
+
+
+def _get_local_model():
+    """Lazy-load the faster-whisper model on first use."""
+    global _local_model
+    if _local_model is None:
+        from faster_whisper import WhisperModel
+        logger.info(
+            "fleet_voice STT: loading faster-whisper model=%s device=%s compute=%s",
+            LOCAL_WHISPER_MODEL, LOCAL_WHISPER_DEVICE, LOCAL_WHISPER_COMPUTE,
+        )
+        _local_model = WhisperModel(
+            LOCAL_WHISPER_MODEL,
+            device=LOCAL_WHISPER_DEVICE,
+            compute_type=LOCAL_WHISPER_COMPUTE,
+        )
+    return _local_model
+
+
 async def transcribe(pcm: bytes) -> str:
-    """Send a PCM utterance to OpenAI Whisper-1 and return the transcript.
+    """Transcribe a PCM utterance.
 
-    Pure async for symmetry with the rest of fleet_voice (everything
-    else awaits). Returns `""` on empty input or empty transcript so
-    the caller can no-op without exception handling.
-
-    Tests mock this whole function or the underlying httpx call.
+    Backend selected by FLEET_VOICE_STT_BACKEND env (default `faster_whisper`).
+    Returns `""` on empty input or empty transcript so the caller can no-op.
     """
     if not pcm:
         return ""
+
+    if STT_BACKEND == "faster_whisper":
+        import numpy as np
+        import asyncio
+        # int16 LE -> float32 in [-1, 1]
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # SAL-4006 band-aid: puck-side encoder appears to attenuate audio by
+        # ~24 dB (suspect: right-shift 16 instead of 8 on 24-bit-in-32-bit
+        # I2S samples). Until SAL-4001 firmware fix lands, normalize gateway-
+        # side so Whisper sees a usable level. Target peak ~0.7 with a hard
+        # cap so we don't amplify pure noise.
+        peak_amp_pre = float(np.max(np.abs(audio))) if audio.size else 0.0
+        gain_db_applied = 0.0
+        if peak_amp_pre > 0.005 and peak_amp_pre < 0.7:
+            target_peak = float(os.getenv("FLEET_VOICE_TARGET_PEAK", "0.7"))
+            max_gain = float(os.getenv("FLEET_VOICE_MAX_GAIN", "32.0"))  # ~30 dB
+            gain = min(target_peak / peak_amp_pre, max_gain)
+            audio = np.clip(audio * gain, -1.0, 1.0)
+            gain_db_applied = 20.0 * np.log10(gain) if gain > 0 else 0.0
+            logger.info(
+                "fleet_voice STT normalize: peak %.4f -> %.4f gain=%.1f dB",
+                peak_amp_pre, float(np.max(np.abs(audio))), gain_db_applied,
+            )
+
+        loop = asyncio.get_event_loop()
+
+        # SAL-4006 hallucination debug: dump the PCM Whisper sees so we can
+        # listen to it and decide if garbage-in or garbage-config.
+        if os.getenv("FLEET_VOICE_DEBUG_DUMP", "0") == "1":
+            import time, wave, pathlib
+            dump_dir = pathlib.Path(os.getenv("FLEET_VOICE_DEBUG_DUMP_DIR",
+                "Z:/_planning/respeaker-xvf3800-alfred/debug_pcm"))
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time() * 1000)
+            wav_path = dump_dir / f"utt_{ts}.wav"
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(pcm)
+            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+            peak = float(np.max(np.abs(audio)))
+            dur_s = len(audio) / SAMPLE_RATE
+            logger.warning(
+                "fleet_voice STT debug: dumped %s bytes=%d dur=%.2fs rms=%.4f peak=%.4f sr=%d",
+                wav_path.name, len(pcm), dur_s, rms, peak, SAMPLE_RATE,
+            )
+
+        def _do_transcribe():
+            model = _get_local_model()
+            # Pre-gate: skip Whisper entirely if peak audio is below noise
+            # floor; nothing useful to transcribe and avoids hallucinations.
+            peak_amp = float(np.max(np.abs(audio))) if audio.size else 0.0
+            min_peak = float(os.getenv("FLEET_VOICE_MIN_PEAK", "0.05"))
+            if peak_amp < min_peak:
+                logger.info(
+                    "fleet_voice STT: skip silent buffer peak=%.4f < %.4f",
+                    peak_amp, min_peak,
+                )
+                return ""
+            segments, _info = model.transcribe(
+                audio,
+                language=WHISPER_LANGUAGE or None,
+                beam_size=1,
+                # Peak gate above already culls silence; trust Whisper defaults
+                # otherwise. Aggressive log_prob/vad_filter/no_speech tweaks
+                # rejected real speech (peak=1.0 buffers returning empty).
+                vad_filter=False,
+                # condition_on_previous_text causes context-bleed across drains.
+                condition_on_previous_text=False,
+            )
+            return "".join(seg.text for seg in segments).strip()
+
+        text = await loop.run_in_executor(None, _do_transcribe)
+        # WARNING level so it shows in default uvicorn log streams.
+        logger.warning("fleet_voice STT transcript (local): %r", text)
+        return text
+
+    # backend == "openai" (or anything else); fall through to cloud path
     if not OPENAI_API_KEY:
-        # We don't raise — empty transcript is a survivable degraded mode
-        # (the gateway still records the audio frame, ops sees the gap).
         logger.warning(
             "fleet_voice STT: OPENAI_API_KEY unset; skipping transcription"
         )
@@ -341,7 +485,7 @@ async def transcribe(pcm: bytes) -> str:
         resp.raise_for_status()
         body = resp.json()
     text = (body.get("text") or "").strip()
-    logger.info("fleet_voice STT transcript: %r", text)
+    logger.info("fleet_voice STT transcript (openai): %r", text)
     return text
 
 
