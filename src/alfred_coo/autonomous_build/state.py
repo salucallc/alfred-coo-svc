@@ -173,6 +173,20 @@ class OrchestratorState:
     # the orchestrator coerce immediately on restart). ``None`` means no
     # active no-progress streak.
     no_progress_since: Optional[float] = None
+    # SAL-4101 retry-loop coercion bookkeeping. Maps the composite key
+    # ``f"{ticket_uuid}|{pr_url}|{qa_persona}"`` -> ``{"gate": "<token>",
+    # "count": <int>}``. Tracks the most recent recurring gate-failure
+    # citation across consecutive REQUEST_CHANGES reviews. When ``count``
+    # crosses ``TRIAGE_NEEDED_GATE_REPEAT_THRESHOLD`` the ticket is moved
+    # to TRIAGE_NEEDED (orchestrator state machine; Linear ``Triage``
+    # workflow state) and the wave-retry loop exits without consuming
+    # further budget. Reset on a non-overlapping citation set, on
+    # APPROVE, or when the PR URL changes (different PR = different review
+    # session). Persisted across daemon restarts so a kickoff-bounce
+    # mid-loop does not reset the counter.
+    consecutive_same_gate_skips: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )
     # Free-form event log — capped to keep memory writes bounded.
     events: List[Dict[str, Any]] = field(default_factory=list)
 
