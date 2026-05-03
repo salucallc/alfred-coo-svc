@@ -522,6 +522,91 @@ void setup() {
   printBanner();
   runI2cSmokeTest();
 
+  // SAL-4007: enable the carrier's external class-D speaker amp.
+  //
+  // The TLV320AIC3104 codec on the XVF3800 carrier has only HP and line-out
+  // stages -- the loud "5 W" speaker is driven by an external class-D amp.
+  // The amp's enable pin is wired to XMOS GPO X0D31 ("Amplifier enable, low
+  // = enabled" per Seeed wiki). On the i2s_master test5 firmware, X0D31
+  // boots HIGH (amp disabled). We drive it LOW via the XVF control servicer
+  // I2C protocol (XMOS at 0x2C, GPO_SERVICER_RESID=20, GPO_WRITE_VALUE=1).
+  //
+  // Wire format: [RESID, CMDID, PAYLOAD_LEN, PIN_INDEX, VALUE]
+  // See formatBCE/Respeaker-XVF3800-ESPHome-integration:
+  //   esphome/components/respeaker_xvf3800/respeaker_xvf3800.cpp:390.
+  {
+    constexpr uint8_t kAddrXmosCtrl       = 0x2C;
+    constexpr uint8_t kGpoServicerResid   = 20;
+    constexpr uint8_t kGpoWriteValueCmd   = 1;
+    constexpr uint8_t kAmpEnablePin       = 31;  // X0D31, active LOW
+    delay(50);  // breathing room after smoke probe
+    // Drive X0D31 LOW (amp enable) AND X0D33 LOW (likely mute, since on
+    // boot it's the only GPO HIGH on the test5 firmware). Best-guess unmute.
+    auto write_gpo = [](uint8_t pin, uint8_t val) {
+      uint8_t pl[] = {kGpoServicerResid, kGpoWriteValueCmd, 2, pin, val};
+      Wire.beginTransmission(kAddrXmosCtrl);
+      Wire.write(pl, sizeof(pl));
+      uint8_t e = Wire.endTransmission();
+      Serial.printf("[xvf] GPO write pin=%u value=%u rc=%u\r\n",
+                    (unsigned)pin, (unsigned)val, (unsigned)e);
+      delay(20);
+    };
+    write_gpo(kAmpEnablePin, 0);  // X0D31 LOW = amp ENABLED
+    write_gpo(33, 0);             // X0D33 LOW = best-guess UNMUTE
+    delay(20);
+
+    // Bump TLV320AIC3104 DAC + LEFT_LOP/RIGHT_LOP output to 0 dB unmuted.
+    // Per the codec-init research (CODEC_INIT_RESEARCH.md), if XMOS already
+    // inits the codec it likely leaves the line-out at default (often muted
+    // or heavily attenuated). Override here to ensure full signal to amp.
+    //   Reg 43 (Left DAC vol)        = 0x00 -> 0 dB
+    //   Reg 44 (Right DAC vol)       = 0x00 -> 0 dB
+    //   Reg 86 (LEFT_LOP/M output)   = 0x09 -> 0 dB, unmute, power on
+    //   Reg 93 (RIGHT_LOP/M output)  = 0x09 -> 0 dB, unmute, power on
+    //   Reg 51 (HPLOUT level)        = 0x09 -> 0 dB, unmute, power on
+    //   Reg 65 (HPROUT level)        = 0x09 -> 0 dB, unmute, power on
+    constexpr uint8_t kAddrCodec = 0x18;
+    auto codec_write = [](uint8_t reg, uint8_t val) {
+      Wire.beginTransmission(kAddrCodec);
+      Wire.write(reg);
+      Wire.write(val);
+      uint8_t e = Wire.endTransmission();
+      Serial.printf("[codec] write reg=0x%02X val=0x%02X rc=%u\r\n",
+                    (unsigned)reg, (unsigned)val, (unsigned)e);
+    };
+    // Page select 0 first (defensive).
+    codec_write(0x00, 0x00);
+    codec_write(0x2B, 0x00);  // Left DAC vol 0 dB
+    codec_write(0x2C, 0x00);  // Right DAC vol 0 dB
+    codec_write(0x56, 0x09);  // LEFT_LOP/M  0 dB, unmute, power on
+    codec_write(0x5D, 0x09);  // RIGHT_LOP/M 0 dB, unmute, power on
+    codec_write(0x33, 0x09);  // HPLOUT       0 dB, unmute, power on
+    codec_write(0x41, 0x09);  // HPROUT       0 dB, unmute, power on
+    delay(50);
+    // Read all 5 GPO statuses so we can see what XMOS thinks the world looks
+    // like. Order returned: status, X0D11, X0D30, X0D31, X0D33, X0D39.
+    constexpr uint8_t kGpoReadValuesCmd  = 0;
+    constexpr uint8_t kGpoReadCount      = 5;
+    constexpr uint8_t kGpoReadRespBytes  = kGpoReadCount + 1;  // status byte + 5 pins
+    uint8_t read_req[] = {kGpoServicerResid,
+                          (uint8_t)(kGpoReadValuesCmd | 0x80),  // read bit
+                          kGpoReadRespBytes};
+    Wire.beginTransmission(kAddrXmosCtrl);
+    Wire.write(read_req, sizeof(read_req));
+    uint8_t err_w = Wire.endTransmission(false);  // repeated start
+    uint8_t resp[kGpoReadRespBytes] = {0};
+    uint8_t got = Wire.requestFrom((uint8_t)kAddrXmosCtrl,
+                                   (uint8_t)kGpoReadRespBytes, (uint8_t)true);
+    for (uint8_t i = 0; i < got && i < sizeof(resp); ++i) {
+      resp[i] = Wire.read();
+    }
+    Serial.printf("[xvf] GPO read: write_rc=%u got=%u status=0x%02X "
+                  "X0D11=%u X0D30=%u X0D31=%u X0D33=%u X0D39=%u\r\n",
+                  (unsigned)err_w, (unsigned)got,
+                  (unsigned)resp[0], (unsigned)resp[1], (unsigned)resp[2],
+                  (unsigned)resp[3], (unsigned)resp[4], (unsigned)resp[5]);
+  }
+
   // Bring up I2S RX. If this fails, we still want the heartbeat loop running
   // so the bench can see the firmware is alive and trigger a re-flash; just
   // skip spawning the audio + encoder tasks in that case.
@@ -547,6 +632,33 @@ void setup() {
     Serial.println(F("[i2s_tx] FAIL: i2s_tx_init returned false; playback degraded."));
   } else {
     Serial.println(F("[i2s_tx] i2s_tx_init OK (duplex slave RX+TX on I2S0)."));
+#ifdef ALFRED_BOOT_TEST_TONE_HZ
+    // Boot-time speaker check: synthesize a 1-second sine wave through the
+    // I2S TX path. Validates GPIO44 -> codec -> speaker electrical chain
+    // without needing WiFi / WS / gateway. Only compiled in if
+    // ALFRED_BOOT_TEST_TONE_HZ is defined in secrets.ini build_flags.
+    {
+      const float freq_hz = (float)(ALFRED_BOOT_TEST_TONE_HZ);
+      const int kSampleRate = 48000;
+      const int kBlockFrames = 480;       // 10 ms blocks
+      const int kTotalFrames = kSampleRate * 2;  // 2 seconds
+      const float two_pi_f_over_sr = 2.0f * 3.14159265358979f * freq_hz / (float)kSampleRate;
+      const int16_t amp = 15000;          // ~-7 dBFS, audible-not-painful
+      static int32_t block[480 * 2];      // stereo
+      Serial.printf("[boot_tone] playing %.0f Hz for 1 s through I2S TX...\r\n", freq_hz);
+      for (int frame_off = 0; frame_off < kTotalFrames; frame_off += kBlockFrames) {
+        for (int i = 0; i < kBlockFrames; ++i) {
+          float phase = two_pi_f_over_sr * (float)(frame_off + i);
+          int16_t s = (int16_t)(amp * sinf(phase));
+          int32_t s32 = ((int32_t)s) << 16;
+          block[i * 2 + 0] = s32;
+          block[i * 2 + 1] = s32;
+        }
+        alfred::audio::i2s_tx_write_block(block, kBlockFrames, /*timeout_ms=*/100);
+      }
+      Serial.println(F("[boot_tone] done."));
+    }
+#endif
   }
 
   const bool codec_ok = alfred::codec::voice_codec_init();

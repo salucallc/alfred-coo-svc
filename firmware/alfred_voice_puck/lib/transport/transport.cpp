@@ -324,6 +324,30 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
 // ---------------------------------------------------------------------------
 
 bool wifiAssociate() {
+  // Locally-administered random MAC at first call. Bypasses any AP-side
+  // per-MAC handshake penalty / PMK-cache poisoning that may have built
+  // up over many reflash cycles. First byte 0x02 = locally administered,
+  // unicast. Must run before WiFi.mode(STA) starts the driver, so we cycle
+  // OFF -> set_mac -> STA. Persists until next chip reset, which we want.
+  static bool mac_overridden = false;
+  if (!mac_overridden) {
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+    WiFi.mode(WIFI_STA);  // init driver but don't connect yet
+    delay(50);
+    uint8_t mac[6];
+    mac[0] = 0x02;
+    for (int i = 1; i < 6; ++i) mac[i] = (uint8_t)(esp_random() & 0xFF);
+    esp_err_t mac_err = esp_wifi_set_mac(WIFI_IF_STA, mac);
+    Serial.printf("[wifi] STA MAC override %02x:%02x:%02x:%02x:%02x:%02x rc=%d\r\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (int)mac_err);
+    uint8_t verify[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, verify);
+    Serial.printf("[wifi] STA MAC readback %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                  verify[0], verify[1], verify[2], verify[3], verify[4], verify[5]);
+    mac_overridden = true;
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.disconnect(true, true);  // Drop any stale state from a previous attempt.
