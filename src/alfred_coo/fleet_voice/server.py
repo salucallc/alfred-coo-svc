@@ -505,6 +505,51 @@ async def list_sessions(request: Request) -> dict[str, Any]:
     }
 
 
+@app.post("/v1/fleet/voice/say-test")
+async def say_test(request: Request) -> dict[str, Any]:
+    """SAL-4007 bench helper: synthesize text on the server and push the
+    audio_start / opus / audio_end envelope down a chosen device's WS.
+
+    Body: ``{"session_id": "<hex>", "text": "..."}``. ``session_id`` may
+    also be ``"first_active"`` (resolved to the most recently-connected
+    active session) so a one-line curl is enough to drive the puck on
+    the bench.
+
+    Bearer-auth via `FLEET_VOICE_ADMIN_KEY`. Reuses the existing
+    ``_speak_reply`` path so the wire shape is identical to the real
+    end-utterance TTS reply that SAL-4005 ships.
+    """
+    if not _check_admin_auth(request):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="json_object_required")
+    session_id = body.get("session_id")
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="text_required")
+    target: VoiceSession | None = None
+    if session_id == "first_active":
+        actives = [s for s in SESSIONS.values() if s.disconnect_at is None]
+        if actives:
+            actives.sort(key=lambda s: s.connect_at, reverse=True)
+            target = actives[0]
+    elif isinstance(session_id, str):
+        target = SESSIONS.get(session_id)
+    if target is None or target.disconnect_at is not None:
+        raise HTTPException(status_code=404, detail="session_not_found_or_inactive")
+    await _speak_reply(target, text)
+    return {
+        "ok": True,
+        "session_id": target.session_id,
+        "device_id": target.device_id,
+        "tts_seq": target.tts_seq,
+        "tts_frames_out": target.tts_frames_out,
+        "tts_bytes_out": target.tts_bytes_out,
+        "tts_synth_latency_ms": target.tts_synth_latency_ms,
+    }
+
+
 @app.websocket("/v1/fleet/voice")
 async def fleet_voice(ws: WebSocket) -> None:
     """Voice gateway WebSocket entry point.
