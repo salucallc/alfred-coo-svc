@@ -13,8 +13,14 @@ gateway, and protocol can evolve in lockstep on a single PR.
 * Ticket SAL-3999 (P1.1, project skeleton): boot banner, I2C smoke, heartbeat.
 * Ticket SAL-4000 (P1.2, I2S slave RX): live capture from XVF3800,
   channel-0 RMS log on UART, dedicated FreeRTOS task on core 1.
-* Opus encode (SAL-4001), WebSocket client (SAL-4003), TLS, and Wi-Fi
-  provisioning land in later Phase 1 tickets.
+* Ticket SAL-4001 (P1.3, Opus voice encode): 16 kHz mono / 20 ms / 24 kbps
+  VBR; outbound EncodedFrame queue.
+* Ticket SAL-4006 (P1.6, end-to-end voice-in): Wi-Fi STA + WebSocket
+  client to fleet_voice gateway. Encoded Opus frames now ship out as
+  binary WS messages; inbound JSON control + binary TTS frames are
+  logged. TLS + per-device JWT land in later phases.
+* Opus decode + I2S TX (SAL-4007) and music downlink (SAL-4014+) land
+  in Phase 2 / Phase 3.
 
 ## Hardware
 
@@ -309,17 +315,112 @@ Acceptance run also showed: free heap 297624 B / 320 KB internal,
 free PSRAM 8326071 B / 8 MB Octal, both stable over 60+ s with
 zero `audio_io.underruns`, `enc_overruns`, or `enc_errors`.
 
+## Wi-Fi + WebSocket transport (SAL-4006)
+
+The encoder pipeline above (audio_io -> voice_codec -> outbound queue)
+is now drained by `lib/transport/transport.cpp` instead of the SAL-4001
+log-and-drop drain task. Transport responsibilities:
+
+1. Bring up Wi-Fi STA using SSID + password from `secrets.ini`.
+   Retries with exponential backoff on disconnect.
+2. Open a WebSocket to `ws://<ALFRED_GATEWAY_HOST>:<PORT><PATH>` with
+   `Authorization: Bearer <ALFRED_GATEWAY_BEARER>` header.
+3. On WS open: send the `hello` JSON control frame so the gateway
+   registers the session.
+4. Pump: pop `EncodedFrame` from the outbound queue and ship
+   `frame.data[0..length]` as a binary WS message. While the WS is
+   down, frames are dropped (drop-oldest in the encoder + drop-on-
+   offline in the pump keeps audio fresh on reconnect; we never block
+   audio capture).
+5. Inbound: log every server text frame (welcome, ping, transcript,
+   assistant_text), auto-pong, and log the byte length of binary TTS
+   frames. Full Opus decode + I2S TX is SAL-4007.
+6. Reconnect with exponential backoff if WS drops; ditto for Wi-Fi.
+
+### Library choice
+
+`links2004/WebSockets` (a.k.a. `arduinoWebSockets`) pinned to `^2.4.1`
+in `platformio.ini`. This is the maintained arduino-esp32 standard
+that ships ws + wss in one client. We use plain `ws://` for the
+SAL-4006 smoke; TLS lands when the gateway gets a real cert.
+
+### Threading
+
+The transport task `voice_ws` runs on core 0 at priority 3 (below the
+encoder's 5 and the FreeRTOS Wi-Fi stack's 23). It is the SOLE owner
+of the WebSocket client, so all socket access is single-threaded; the
+links2004 library is not thread-safe. Encoder runs on core 1 and
+keeps producing into the queue regardless of network state.
+
+### Heartbeat fields
+
+The 5 s heartbeat now includes transport stats so ops can see Wi-Fi +
+WS health from the same one-line view:
+
+```
+[heartbeat seq=12 uptime=60s heap=294060 psram=8326071
+ audio_frames=288000 under=0 opus_frames=3000 opus_bytes=180000
+ max_enc_us=8626 over=0 wifi=1 rssi=42 ws=1
+ tx_frames=2998 tx_bytes=179840 rx_text=10 rx_bin=0 drop_off=2]
+```
+
+* `wifi=0|1` Wi-Fi STA connected
+* `rssi=N`   absolute value of last measured RSSI (dBm)
+* `ws=0|1`   WebSocket open
+* `tx_frames` / `tx_bytes` outbound binary (Opus) accounting
+* `rx_text`  inbound JSON control frame count
+* `rx_bin`   inbound binary frame count (TTS Opus, SAL-4007)
+* `drop_off` frames dropped because WS was offline at pump time
+
+### secrets.ini schema
+
+Local `secrets.ini` in this directory (gitignored) populates Wi-Fi +
+gateway settings via build_flags. Schema is in `secrets.ini.example`;
+copy to `secrets.ini` and fill:
+
+| Key | Meaning |
+|-----|---------|
+| `ALFRED_WIFI_SSID` | Wi-Fi SSID the puck should join |
+| `ALFRED_WIFI_PASSWORD` | Wi-Fi password for that SSID |
+| `ALFRED_GATEWAY_HOST` | minipc LAN IP for the SAL-4006 smoke (e.g. `192.168.12.134`) |
+| `ALFRED_GATEWAY_PORT` | TCP port (default `8091`) |
+| `ALFRED_GATEWAY_PATH` | WS path (default `/v1/fleet/voice`) |
+| `ALFRED_GATEWAY_BEARER` | bearer token, must match gateway's `FLEET_VOICE_KEY` env |
+| `ALFRED_GATEWAY_TLS` | `0` for `ws://`, `1` for `wss://` |
+
+### Expected log lines on a healthy boot
+
+Successful Wi-Fi + WS bring-up looks like:
+
+```
+[wifi] connecting to ssid="<your-ssid>"...
+[wifi] connected ip=192.168.12.180 rssi=-44 dBm channel=6
+[ws] bring-up target=ws://192.168.12.134:8091/v1/fleet/voice
+[ws] connected to ws://192.168.12.134:8091/v1/fleet/voice
+[ws] hello sent: {"type":"hello","seq":0,"device_id":"alfred-puck-...
+[ws] rx text len=... : {"type":"hello","seq":0,...}
+[ws] rx text len=... : {"type":"welcome","seq":0,...}
+```
+
+When you speak, the gateway buffers frames and (after `start_utterance`
+or natural silence) emits:
+
+```
+[ws] rx text len=... : {"type":"transcript","seq":1,"text":"hello alfred",...}
+[ws] rx text len=... : {"type":"assistant_text","seq":2,"text":"...reply..."}
+[ws] rx text len=... : {"type":"audio_start","seq":1,...}
+[ws] rx binary len=...   <-- TTS Opus frames; logged but not yet decoded
+[ws] rx text len=... : {"type":"audio_end","seq":1,"frames":...,"bytes":...}
+```
+
 ## Future hooks
 
-When SAL-4003 / SAL-4006 (WebSocket transport + end-to-end voice-in)
-lands, the drain task body is replaced with a WS sender: pop
-`EncodedFrame` from the same outbound queue, ship `frame.data[0..length]`
-as a binary WebSocket frame to `wss://gateway/v1/fleet/voice`. The
-queue's drop-oldest semantics already handle Wi-Fi back-pressure
-gracefully (latest audio wins).
+When SAL-4007 (Opus decode + I2S TX) lands, the transport's
+`WStype_BIN` log line is replaced with a push into an inbound jitter
+buffer, which feeds an Opus decoder on core 1, which writes decoded
+PCM into audio_io's TX path on GPIO44 sharing the same BCK/WS pins
+(full duplex on I2S0). The `audio_start` / `audio_end` JSON envelopes
+the gateway already sends are the prep + flush hooks for the decoder.
 
-When SAL-4014 (I2S TX to codec) lands, extend `audio_io` with a TX path
-on GPIO44 sharing the same BCK/WS pins (full duplex on I2S0). The Opus
-decoder for the downlink path lives in a sibling component
-(`lib/voice_codec/decode_*` or a new `lib/music_codec/` for the 48 kHz
-music path).
+The downlink music path (SAL-4014+) keeps native 48 kHz stereo and
+gets a separate codec instance.

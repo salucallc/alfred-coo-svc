@@ -5,6 +5,11 @@
 //   SAL-4000 (P1.2): I2S slave RX from XVF3800 + channel-0 RMS log.
 //   SAL-4001 (P1.3): Opus voice encode (16 kHz mono 20 ms 24 kbps VBR) +
 //                    outbound EncodedFrame queue + drain logger task.
+//   SAL-4006 (P1.6): Wi-Fi STA + WebSocket client to fleet_voice gateway;
+//                    encoded Opus frames are now shipped over the wire
+//                    instead of being logged + dropped. The drain task
+//                    is replaced by lib/transport/transport.cpp which
+//                    owns the WS connection + outbound pump.
 //
 // Hardware: Seeed XIAO ESP32-S3 mounted on Seeed ReSpeaker XVF3800 carrier.
 // Toolchain: PlatformIO + arduino-esp32 framework (see platformio.ini).
@@ -24,14 +29,20 @@
 //      on core 0 logs queue stats so we can see encoding is staying ahead
 //      of audio capture.
 //
-// Task topology (as of SAL-4001):
-//   * loopTask (Arduino, core 0)        : heartbeats every 5 s.
+// Task topology (as of SAL-4006):
+//   * loopTask (Arduino, core 0)        : heartbeats every 5 s; now also
+//                                          dumps transport stats so ops
+//                                          can see Wi-Fi + WS health from
+//                                          the same one-line view.
 //   * encoderTask (core 1, prio 5)      : drains audio_io blocks, encodes,
 //                                          pushes EncodedFrame to outbound q.
-//   * drainTask (core 0, prio 4)        : pops EncodedFrame from outbound q,
-//                                          logs rolling stats every 1 s.
-//                                          Will be replaced by the WS sender
-//                                          in SAL-4006 (see README).
+//   * voice_ws (core 0, prio 3)         : owns Wi-Fi STA + WebSocket
+//                                          client; pumps EncodedFrame
+//                                          out as binary WS messages,
+//                                          handles inbound JSON control
+//                                          + binary TTS frames. See
+//                                          lib/transport/transport.cpp.
+//                                          Replaces SAL-4001's drainTask.
 //
 // Why these pinnings: PLAN.md risk #1 says Opus on ESP32-S3 may starve I2S
 // DMA. We pin both the I2S DMA reader and the encoder to core 1 so they
@@ -39,9 +50,11 @@
 // always runs on core 0. The drain logger lives on core 0 because it does
 // nearly no work and is naturally where the WS client will land.
 //
-// Future Phase 1 / Phase 2 tickets plug in here:
-//   * SAL-4002/4003 (WS client to gateway) -> swap drainTask for WS sender
-//   * SAL-4014 (I2S TX + Opus decode)      -> add a second I2S DMA + decoder
+// Future tickets plug in here:
+//   * SAL-4007 (Opus decode + I2S TX)      -> add an inbound Opus decoder
+//                                              fed by transport's WStype_BIN
+//                                              frames, write decoded PCM to
+//                                              audio_io's TX path on GPIO44.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -55,6 +68,7 @@
 #include <freertos/task.h>
 
 #include "audio_io.h"
+#include "transport.h"
 #include "voice_codec.h"
 
 namespace {
@@ -70,9 +84,6 @@ constexpr uint8_t kAddrXvf3800Ctl  = 0x2C;
 
 // Heartbeat cadence; matches the SAL-3999 acceptance criterion.
 constexpr uint32_t kHeartbeatIntervalMs = 5000;
-
-// Drain logger cadence: one summary line per second (50 frames/s expected).
-constexpr uint32_t kDrainLogIntervalMs = 1000;
 
 // Audio block size in stereo frames at 48 kHz: 20 ms * 48 = 960. Matches
 // alfred::codec::kInputBlockFrames so the encoder can consume one block
@@ -166,9 +177,12 @@ void printHeartbeat() {
   ++g_heartbeat_seq;
   alfred::audio::AudioStats a = alfred::audio::audio_io_get_stats();
   alfred::codec::CodecStats c = alfred::codec::voice_codec_get_stats();
+  alfred::transport::TransportStats t = alfred::transport::transport_get_stats();
   Serial.printf("[heartbeat seq=%lu uptime=%lus heap=%lu psram=%lu "
                 "audio_frames=%llu under=%lu opus_frames=%llu opus_bytes=%llu "
-                "max_enc_us=%lu over=%lu]\r\n",
+                "max_enc_us=%lu over=%lu wifi=%d rssi=%lu ws=%d "
+                "tx_frames=%llu tx_bytes=%llu rx_text=%llu rx_bin=%llu "
+                "drop_off=%llu]\r\n",
                 (unsigned long)g_heartbeat_seq,
                 (unsigned long)(millis() / 1000UL),
                 (unsigned long)ESP.getFreeHeap(),
@@ -178,7 +192,15 @@ void printHeartbeat() {
                 (unsigned long long)c.frames_out,
                 (unsigned long long)c.bytes_out,
                 (unsigned long)c.max_encode_us,
-                (unsigned long)c.encode_overruns);
+                (unsigned long)c.encode_overruns,
+                (int)t.wifi_connected,
+                (unsigned long)t.wifi_rssi_dbm,
+                (int)t.ws_connected,
+                (unsigned long long)t.frames_sent,
+                (unsigned long long)t.bytes_sent,
+                (unsigned long long)t.frames_recv_text,
+                (unsigned long long)t.frames_recv_binary,
+                (unsigned long long)t.frames_dropped_offline);
 }
 
 // FreeRTOS task: drain audio_io, encode, push EncodedFrame onto the
@@ -258,59 +280,6 @@ void encoderTask(void* /*arg*/) {
   }
 }
 
-// Drain the outbound queue, log a one-line summary every kDrainLogIntervalMs.
-// Pinned to core 0. SAL-4006 will replace the body with a WebSocket sender
-// (see README.md "Future hooks").
-void drainTask(void* /*arg*/) {
-  alfred::codec::EncodedFrame frame;
-  uint32_t window_start_ms = millis();
-  uint32_t window_frames = 0;
-  uint32_t window_bytes = 0;
-  uint16_t window_min_bytes = 0xFFFF;
-  uint16_t window_max_bytes = 0;
-
-  Serial.println(F("[drain] task running; will log Opus frame stats every 1 s."));
-
-  for (;;) {
-    if (xQueueReceive(g_outbound_q, &frame, pdMS_TO_TICKS(kDrainLogIntervalMs))
-        == pdTRUE) {
-      ++window_frames;
-      window_bytes += frame.length;
-      if (frame.length < window_min_bytes) window_min_bytes = frame.length;
-      if (frame.length > window_max_bytes) window_max_bytes = frame.length;
-    }
-
-    const uint32_t now = millis();
-    if (now - window_start_ms >= kDrainLogIntervalMs) {
-      alfred::codec::CodecStats c = alfred::codec::voice_codec_get_stats();
-      const uint32_t elapsed = now - window_start_ms;
-      const float fps = (1000.0f * window_frames) / elapsed;
-      const float bps = (8000.0f * window_bytes) / elapsed;  // bits/sec
-      const float avg = window_frames > 0
-                            ? (1.0f * window_bytes) / window_frames
-                            : 0.0f;
-      const uint16_t lo = (window_min_bytes == 0xFFFF) ? 0 : window_min_bytes;
-      Serial.printf("[opus seq=%lu fps=%.1f avg=%.1f min=%u max=%u bps=%.0f "
-                    "qd=%u/%u tot_frames=%llu tot_bytes=%llu enc_us_max=%lu "
-                    "enc_overruns=%lu enc_errors=%lu]\r\n",
-                    (unsigned long)frame.seq, fps, avg, lo, window_max_bytes,
-                    bps,
-                    (unsigned int)uxQueueMessagesWaiting(g_outbound_q),
-                    (unsigned int)kOutboundQueueDepth,
-                    (unsigned long long)c.frames_out,
-                    (unsigned long long)c.bytes_out,
-                    (unsigned long)c.max_encode_us,
-                    (unsigned long)c.encode_overruns,
-                    (unsigned long)c.encode_errors);
-      window_start_ms = now;
-      window_frames = 0;
-      window_bytes = 0;
-      window_min_bytes = 0xFFFF;
-      window_max_bytes = 0;
-    }
-  }
-}
-
 }  // namespace
 
 void setup() {
@@ -383,15 +352,16 @@ void setup() {
   if (rc != pdPASS) {
     Serial.println(F("[encoder] FAIL: xTaskCreatePinnedToCore returned !pdPASS."));
   }
-  rc = xTaskCreatePinnedToCore(
-      drainTask, "voice_drain",
-      /*stack=*/4 * 1024,
-      /*arg=*/nullptr,
-      /*priority=*/4,            // Below the encoder so encoder always wins on contention.
-      /*handle=*/nullptr,
-      /*core=*/0);
-  if (rc != pdPASS) {
-    Serial.println(F("[drain] FAIL: xTaskCreatePinnedToCore returned !pdPASS."));
+  // SAL-4006: bring up Wi-Fi STA + WebSocket client. The transport
+  // module owns its own task (voice_ws on core 0) and pulls
+  // EncodedFrame items out of g_outbound_q. The setup is fire-and-
+  // forget; Wi-Fi association and WS connect happen asynchronously,
+  // and the encoder task keeps producing into the queue regardless of
+  // network state. If transport_init returns false the firmware still
+  // boots and the heartbeat keeps running so the bench can see what
+  // went wrong.
+  if (!alfred::transport::transport_init(g_outbound_q)) {
+    Serial.println(F("[transport] FAIL: transport_init returned false; running offline."));
   }
 
   g_last_heartbeat_ms = millis();

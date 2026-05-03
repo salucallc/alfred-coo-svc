@@ -8,3 +8,8 @@ build/
 *.elf
 *.bin
 *.map
+
+# Local Wi-Fi + gateway secrets (SAL-4006). Schema lives in
+# secrets.ini.example; the real secrets.ini is populated on the bench
+# and never committed.
+secrets.ini
