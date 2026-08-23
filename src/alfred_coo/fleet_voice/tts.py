@@ -103,9 +103,13 @@ HTTP_TIMEOUT_S = float(os.getenv("FLEET_VOICE_TTS_HTTP_TIMEOUT_S", "30"))
 # ---------------------------------------------------------------------------
 
 TTS_BACKEND = os.getenv("FLEET_VOICE_TTS_BACKEND", "openai").lower()
-"""Which TTS service to call. Values: ``openai`` (default), ``elevenlabs``.
+"""Which TTS service to call. Values: ``openai`` (default), ``elevenlabs``,
+``chatterbox``.
 Switch to ``elevenlabs`` when the ``OPENAI_API_KEY`` is OpenRouter (no
-``/v1/audio/speech`` proxy) or when better voice quality is wanted."""
+``/v1/audio/speech`` proxy) or when better voice quality is wanted.
+Switch to ``chatterbox`` to speak in Alfred's own cloned voice via the local
+GPU voicebox service — same voice as the alfred-voice desktop loop, MIT-licensed,
+no per-character API cost. See the chatterbox config block below."""
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
@@ -127,6 +131,67 @@ ELEVENLABS_TTS_URL = (
 )
 """ElevenLabs streaming endpoint. ``pcm_16000`` = 16 kHz mono int16 LE,
 matches OUTPUT_SAMPLE_RATE so no resample needed."""
+
+# ---------------------------------------------------------------------------
+# Chatterbox TTS config (local GPU voicebox — Alfred's own cloned voice)
+# ---------------------------------------------------------------------------
+
+CHATTERBOX_TTS_URL = os.getenv(
+    "FLEET_VOICE_CHATTERBOX_URL", "http://localhost:8791/v1/audio/speech"
+)
+"""OpenAI-compatible speech endpoint of the chatterbox GPU voicebox service.
+Mirrors ``tts_cascade.CHATTERBOX_URL`` from the alfred-voice desktop loop."""
+
+CHATTERBOX_VOICE = os.getenv("FLEET_VOICE_CHATTERBOX_VOICE", "alfred-35s")
+"""The cloned-Alfred reference voice registered in the voicebox."""
+
+CHATTERBOX_TIMEOUT_S = float(os.getenv("FLEET_VOICE_CHATTERBOX_TIMEOUT_S", "120"))
+"""Chatterbox is non-streaming and GPU-bound; the first call after a cold model
+load can take tens of seconds, hence a generous default."""
+
+VOICEBOX_API_KEY = os.getenv("VOICEBOX_API_KEY", "")
+"""Bearer token for the voicebox service. Falls back to C:\\dev\\voicebox\\.env
+(same resolution as tts_cascade._voicebox_key) when the env var is unset."""
+
+
+def _voicebox_api_key() -> str:
+    """Resolve the voicebox bearer key: env first, then the voicebox .env file."""
+    if VOICEBOX_API_KEY:
+        return VOICEBOX_API_KEY
+    env_path = os.getenv("VOICEBOX_ENV_FILE", r"C:\dev\voicebox\.env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VOICEBOX_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
+def _wav_to_pcm16k_mono(wav_bytes: bytes) -> bytes:
+    """Decode a WAV blob to 16 kHz mono int16 LE PCM.
+
+    Chatterbox returns a full WAV (not a stream) at whatever rate the model
+    emits (commonly 24 kHz). Normalise sample width -> int16, downmix stereo,
+    and resample to OUTPUT_SAMPLE_RATE so the shared Opus encoder can consume it.
+    """
+    import io
+    import wave
+
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        rate = wf.getframerate()
+        pcm = wf.readframes(wf.getnframes())
+
+    if width != 2:
+        pcm = audioop.lin2lin(pcm, width, 2)
+    if channels == 2:
+        pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
+    if rate != OUTPUT_SAMPLE_RATE:
+        pcm, _ = audioop.ratecv(pcm, 2, 1, rate, OUTPUT_SAMPLE_RATE, None)
+    return pcm
 
 # Opus frame bookkeeping derived from the codec params above.
 SAMPLES_PER_FRAME = OUTPUT_SAMPLE_RATE * OUTPUT_FRAME_MS // 1000
@@ -251,6 +316,10 @@ async def synthesize_to_opus_frames(
     if not text or not text.strip():
         return
     backend = TTS_BACKEND
+    if backend == "chatterbox":
+        async for pkt in _synthesize_chatterbox_to_opus_frames(text, voice=voice):
+            yield pkt
+        return
     if backend == "elevenlabs":
         async for pkt in _synthesize_elevenlabs_to_opus_frames(text, voice=voice, model=model):
             yield pkt
@@ -521,4 +590,70 @@ async def _synthesize_elevenlabs_to_opus_frames(
         "fleet_voice TTS (elevenlabs) synthesis complete chars=%d elapsed_ms=%d "
         "voice=%s model=%s",
         len(text), elapsed_ms, voice_id, payload["model_id"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chatterbox TTS (local GPU voicebox, Alfred's cloned voice)
+# ---------------------------------------------------------------------------
+
+
+async def _synthesize_chatterbox_to_opus_frames(
+    text: str,
+    *,
+    voice: str | None = None,
+) -> AsyncIterator[bytes]:
+    """Synthesize ``text`` in Alfred's cloned voice via the chatterbox voicebox
+    and yield 16 kHz mono Opus frames.
+
+    Unlike the OpenAI / ElevenLabs paths this backend is **non-streaming**: the
+    voicebox returns a complete WAV in one response, so we decode it to 16 kHz
+    mono PCM (`_wav_to_pcm16k_mono`) and hand the whole blob to the shared
+    `_pcm_to_opus_frames` generator. First-frame latency is therefore the full
+    synthesis time; acceptable for a personal device and simpler than teaching
+    the encoder to span streamed chunks. Streaming can be added later if the
+    voicebox grows a chunked endpoint.
+
+    Missing key or an empty body yields nothing and logs a warning — the same
+    survivable-degraded mode as the other backends (caller already sent
+    ``audio_start`` and will follow with ``audio_end`` frames=0).
+    """
+    key = _voicebox_api_key()
+    if not key:
+        logger.warning(
+            "fleet_voice TTS: VOICEBOX_API_KEY unset; skipping chatterbox synthesis"
+        )
+        return
+
+    payload = {
+        "input": text,
+        "voice": voice or CHATTERBOX_VOICE,
+        "response_format": "wav",
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    started = time.monotonic()
+    async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT_S) as client:
+        resp = await client.post(CHATTERBOX_TTS_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        ctype = resp.headers.get("content-type", "")
+        body = resp.content
+        if "audio" not in ctype and not body[:4] == b"RIFF":
+            raise RuntimeError(
+                f"chatterbox returned non-audio (content-type={ctype!r}): "
+                f"{body[:120]!r}"
+            )
+
+    pcm_16k = _wav_to_pcm16k_mono(body)
+    for pkt in _pcm_to_opus_frames(pcm_16k):
+        yield pkt
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    logger.info(
+        "fleet_voice TTS (chatterbox) synthesis complete chars=%d elapsed_ms=%d "
+        "voice=%s pcm_bytes=%d",
+        len(text), elapsed_ms, payload["voice"], len(pcm_16k),
     )
