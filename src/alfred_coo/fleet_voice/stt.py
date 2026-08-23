@@ -55,8 +55,10 @@ Design notes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import subprocess
 import struct
 from dataclasses import dataclass
 from typing import Any
@@ -119,6 +121,29 @@ SOUL_SESSION_ID = os.getenv("FLEET_VOICE_SOUL_SESSION_ID", "alfred-main")
 """Single shared session across all pucks until per-device sessions land."""
 
 HTTP_TIMEOUT_S = float(os.getenv("FLEET_VOICE_HTTP_TIMEOUT_S", "30"))
+
+# ---------------------------------------------------------------------------
+# Brain backend: soul-svc chat (default) or the local Hermes agent
+# ---------------------------------------------------------------------------
+
+BRAIN_BACKEND = os.getenv("FLEET_VOICE_BRAIN", "soul").lower()
+"""Where the transcript goes to become a reply. Values:
+
+  * ``soul`` (default) — POST to soul-svc ``/v1/overview/chat`` (chat-over-
+    memory). Simple, but only as capable as that endpoint.
+  * ``hermes`` — run the real Alfred agent locally (``hermes -z ... --continue``),
+    the same brain as the alfred-voice desktop loop: full soul memory, mesh
+    tools, and guardrails, so a spoken request becomes real fleet work. Use
+    this when the gateway runs on a box that has the Hermes CLI (e.g. waynemanor)."""
+
+HERMES_BIN = os.getenv("HERMES_BIN", r"C:\dev\hermes-agent\.venv\Scripts\hermes.exe")
+"""Hermes CLI path; only used when FLEET_VOICE_BRAIN=hermes."""
+
+HERMES_SESSION = os.getenv("FLEET_VOICE_HERMES_SESSION", "alfred-voice")
+"""Resumed Hermes session — shared with the desktop voice loop by default so
+the puck and the desktop share one continuous conversation + memory."""
+
+HERMES_TIMEOUT_S = float(os.getenv("FLEET_VOICE_HERMES_TIMEOUT_S", "300"))
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +519,34 @@ async def transcribe(pcm: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def _ask_hermes(transcript: str, *, session_id: str | None = None) -> str:
+    """Run the real Alfred agent for one turn and return its reply text.
+
+    Mirrors alfred-voice/alfred_voice.py::ask_alfred. Blocking subprocess is
+    pushed to a worker thread so the gateway event loop keeps serving other
+    sessions. Fails soft (returns "") like the soul-svc path so a brain error
+    never tears down the WebSocket.
+    """
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    cmd = [HERMES_BIN, "-z", transcript, "--continue", HERMES_SESSION, "--yolo"]
+
+    def _run() -> str:
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", env=env, timeout=HERMES_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fleet_voice brain: hermes run failed: %s", exc)
+            return ""
+        return (r.stdout or "").strip()
+
+    reply = await asyncio.to_thread(_run)
+    if not reply:
+        logger.warning("fleet_voice brain: hermes returned empty reply")
+    return reply
+
+
 async def post_to_soul(transcript: str, *, session_id: str | None = None) -> str:
     """Send a transcript to soul-svc `/v1/overview/chat` and return the reply.
 
@@ -505,6 +558,8 @@ async def post_to_soul(transcript: str, *, session_id: str | None = None) -> str
     """
     if not transcript:
         return ""
+    if BRAIN_BACKEND == "hermes":
+        return await _ask_hermes(transcript, session_id=session_id)
     if not SOUL_API_KEY:
         logger.warning(
             "fleet_voice STT: SOUL_API_KEY unset; skipping soul-svc relay"
